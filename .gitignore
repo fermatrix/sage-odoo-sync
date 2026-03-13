@@ -1,0 +1,15 @@
+# Data folders mirrored via Dropbox
+/ENZO-Sage50/_tests/
+/ENZO-Sage50/13_2026/
+/ENZO-Sage50/autoexec/
+/ENZO-Sage50/autoexec_output/
+/ENZO-Sage50/autoexec/output/
+
+# Data files
+*.xls
+*.xlsx
+*.pdf
+*.csv
+
+# Environment
+.env
