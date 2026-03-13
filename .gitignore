@@ -8,6 +8,10 @@
 /ENZO-Sage50/_master_sage/
 /ENZO-Sage50/_master_odoo/
 
+# Remote build artifacts
+/remote/build/
+/remote/dist/
+
 # Data files
 *.xls
 *.xlsx
