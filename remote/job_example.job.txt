@@ -1,0 +1,3 @@
+odbc_schema_probe.exe
+--password
+S@g31879
