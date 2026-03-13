@@ -4,6 +4,9 @@
 /ENZO-Sage50/autoexec/
 /ENZO-Sage50/autoexec_output/
 /ENZO-Sage50/autoexec/output/
+/ENZO-Sage50/_master/
+/ENZO-Sage50/_master_sage/
+/ENZO-Sage50/_master_odoo/
 
 # Data files
 *.xls
