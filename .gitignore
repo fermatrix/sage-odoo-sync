@@ -20,3 +20,6 @@
 
 # Environment
 .env
+build/
+dist/
+remote/__pycache__/
