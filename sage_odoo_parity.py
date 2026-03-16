@@ -33,6 +33,31 @@ def normalize_name(value: str) -> str:
     return v
 
 
+def parse_date(value: str):
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    # Strip common time suffixes if present.
+    if " " in raw:
+        raw = raw.split(" ", 1)[0].strip()
+    formats = [
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%d/%m/%Y",
+        "%Y/%m/%d",
+        "%m-%d-%Y",
+        "%d-%m-%Y",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 
 
 def read_csv(path: str) -> Tuple[List[str], List[Dict[str, str]]]:
@@ -71,6 +96,12 @@ def get_env_value(env: Dict[str, str], key: str, fallback: str = "") -> str:
 
 
 def refresh_sage(args: argparse.Namespace) -> int:
+    env = load_env_file(".env")
+    min_customer_since = get_env_value(env, "CUSTOMER_SINCE_MIN")
+    min_last_invoice = get_env_value(env, "LAST_INVOICE_MIN")
+    min_customer_since_date = parse_date(min_customer_since)
+    min_last_invoice_date = parse_date(min_last_invoice)
+
     customers_master = args.customers_master
     items_master = args.items_master
 
@@ -180,19 +211,38 @@ def refresh_sage(args: argparse.Namespace) -> int:
     odoo_imports = os.path.join(master_root, "odoo_imports")
     os.makedirs(odoo_imports, exist_ok=True)
 
-    customers_new_xlsx = os.path.join(odoo_imports, "customers_NEW.xlsx")
+    stamp = datetime.now().strftime("%Y%m%d")
+    customers_new_xlsx = os.path.join(odoo_imports, f"{stamp}_customers_NEW.xlsx")
     customers_new_min_xlsx = os.path.join(master_root, "customers_NEW.xlsx")
     template_path = os.path.join(master_root, "odoo_templates", "customers.xlsx")
 
-    # Filter: active in Sage + no OdooId
+    # Filter: active in Sage + no OdooId + optional date thresholds
     new_customers = [
         c for c in out_customers
-        if (c.get("CustomerIsInactive") or "").strip() != "1" and not c.get("OdooId")
+        if (c.get("CustomerIsInactive") or "").strip() != "1"
+        and not c.get("OdooId")
+        and (
+            not min_customer_since_date
+            or (parse_date(c.get("CustomerSince")) or datetime.min.date()) >= min_customer_since_date
+        )
+        and (
+            not min_last_invoice_date
+            or (parse_date(c.get("LastInvoiceDate")) or datetime.min.date()) >= min_last_invoice_date
+        )
     ]
 
     if load_workbook and os.path.exists(template_path):
         wb = load_workbook(template_path)
         ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
+        header_map = {}
+        for col_idx in range(1, ws.max_column + 1):
+            header = ws.cell(row=1, column=col_idx).value
+            if header:
+                header_map[str(header).strip()] = col_idx
+        def set_cell(col_name: str, value: str) -> None:
+            col_idx = header_map.get(col_name)
+            if col_idx:
+                ws.cell(row=row_idx, column=col_idx, value=value)
         ws.delete_rows(2, ws.max_row)
         row_idx = 2
         # Load Sage master for address details
@@ -204,26 +254,111 @@ def refresh_sage(args: argparse.Namespace) -> int:
                 cid = (r.get("CustomerID") or "").strip()
                 if cid:
                     sage_by_id[cid] = r
+        # Load Address master (preferred over Cardholder_* when available)
+        address_master_path = os.path.join(os.path.dirname(customers_master), "address.csv")
+        address_by_customer_record = {}
+        if os.path.exists(address_master_path):
+            _, address_rows = read_csv(address_master_path)
+            for r in address_rows:
+                crn = (r.get("CustomerRecordNumber") or "").strip()
+                if not crn:
+                    continue
+                addr_type = (r.get("AddressTypeNumber") or "").strip()
+                if addr_type != "0":
+                    continue
+                existing = address_by_customer_record.get(crn)
+                if not existing:
+                    address_by_customer_record[crn] = r
+                    continue
+                # If multiple type-0 addresses exist, keep the lowest AddressRecordNumber
+                try:
+                    new_num = int((r.get("AddressRecordNumber") or "0").strip() or 0)
+                except ValueError:
+                    new_num = 0
+                try:
+                    old_num = int((existing.get("AddressRecordNumber") or "0").strip() or 0)
+                except ValueError:
+                    old_num = 0
+                if new_num and (old_num == 0 or new_num < old_num):
+                    address_by_customer_record[crn] = r
+        # Load Contacts master to attach primary contact (child) rows
+        contacts_master_path = os.path.join(os.path.dirname(customers_master), "contacts.csv")
+        primary_contact_by_customer_record = {}
+        if os.path.exists(contacts_master_path):
+            _, contact_rows = read_csv(contacts_master_path)
+            for r in contact_rows:
+                crn = (r.get("CustomerRecord") or "").strip()
+                if not crn:
+                    continue
+                if (r.get("IsPrimaryContact") or "").strip() != "1":
+                    continue
+                existing = primary_contact_by_customer_record.get(crn)
+                if not existing:
+                    primary_contact_by_customer_record[crn] = r
+                    continue
+                try:
+                    new_num = int((r.get("RecordNumber") or "0").strip() or 0)
+                except ValueError:
+                    new_num = 0
+                try:
+                    old_num = int((existing.get("RecordNumber") or "0").strip() or 0)
+                except ValueError:
+                    old_num = 0
+                if new_num and (old_num == 0 or new_num < old_num):
+                    primary_contact_by_customer_record[crn] = r
 
         for c in new_customers:
             cid = c.get("CustomerID", "")
             name = c.get("Customer_Bill_Name", "")
             sage = sage_by_id.get(cid, {})
-            ws.cell(row=row_idx, column=1, value=cid)
-            ws.cell(row=row_idx, column=2, value=name)
-            ws.cell(row=row_idx, column=3, value=1)
-            ws.cell(row=row_idx, column=4, value=name)
-            ws.cell(row=row_idx, column=5, value=(sage.get("Cardholder_Country") or "").strip())
-            ws.cell(row=row_idx, column=6, value=(sage.get("Cardholder_State") or "").strip())
-            ws.cell(row=row_idx, column=7, value=(sage.get("Cardholder_ZIP") or "").strip())
-            ws.cell(row=row_idx, column=8, value=(sage.get("Cardholder_City") or "").strip())
-            ws.cell(row=row_idx, column=9, value=(sage.get("Cardholder_Address1") or "").strip())
-            ws.cell(row=row_idx, column=10, value=(sage.get("Cardholder_Address2") or "").strip())
-            ws.cell(row=row_idx, column=11, value=(sage.get("Phone_Number") or "").strip())
-            ws.cell(row=row_idx, column=12, value=(sage.get("eMail_Address") or "").strip())
-            ws.cell(row=row_idx, column=13, value=cid)
-            ws.cell(row=row_idx, column=14, value="English (US)")
+            crn = (c.get("CustomerRecordNumber") or "").strip()
+            addr = address_by_customer_record.get(crn, {})
+            def pick_addr(addr_key: str, sage_key: str) -> str:
+                val = (addr.get(addr_key) or "").strip()
+                if val:
+                    return val
+                return (sage.get(sage_key) or "").strip()
+            set_cell("External_ID", cid)
+            set_cell("name", name)
+            set_cell("is_company", 1)
+            set_cell("company_name", name)
+            set_cell("country_id", pick_addr("Country", "Cardholder_Country"))
+            set_cell("state_id", pick_addr("State", "Cardholder_State"))
+            set_cell("zip", pick_addr("Zip", "Cardholder_ZIP"))
+            set_cell("city", pick_addr("City", "Cardholder_City"))
+            set_cell("street", pick_addr("AddressLine1", "Cardholder_Address1"))
+            set_cell("street2", pick_addr("AddressLine2", "Cardholder_Address2"))
+            set_cell("phone", (sage.get("Phone_Number") or "").strip())
+            set_cell("email", (sage.get("eMail_Address") or "").strip())
+            set_cell("CustomerRef", cid)
+            set_cell("Language", "English (US)")
             row_idx += 1
+            # Add primary contact as child (no address; include email)
+            primary = primary_contact_by_customer_record.get(crn)
+            if primary:
+                first = (primary.get("FirstName") or "").strip()
+                last = (primary.get("LastName") or "").strip()
+                contact_name = " ".join([p for p in [first, last] if p]).strip()
+                if not contact_name:
+                    contact_name = (primary.get("CompanyName") or "").strip()
+                if not contact_name:
+                    contact_name = f"{name} Contact"
+                contact_rec = (primary.get("RecordNumber") or "").strip()
+                set_cell("External_ID", f"{cid}_{contact_rec}" if contact_rec else f"{cid}_contact")
+                set_cell("name", contact_name)
+                set_cell("is_company", 0)
+                # Leave company_name empty for child contact (per request)
+                contact_phone = (primary.get("Telephone1") or "").strip()
+                contact_email = (primary.get("Email") or "").strip()
+                set_cell("phone", contact_phone)
+                set_cell("email", contact_email)
+                set_cell("ContactName", contact_name)
+                set_cell("ContactEmail", contact_email)
+                set_cell("ContactPhone", contact_phone)
+                set_cell("ContactJobTitle", (primary.get("Title") or "").strip())
+                set_cell("ContactNotes", (primary.get("Notes") or "").strip())
+                set_cell("Language", "English (US)")
+                row_idx += 1
         wb.save(customers_new_xlsx)
 
     # Minimal XLSX in _master
