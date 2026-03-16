@@ -119,6 +119,8 @@ C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage
 - Child contact does carry `email` and `phone` (if present in `contacts.csv`).
 - `External_ID` for child contact: `CustomerID_ContactRecordNumber` (fallback to `CustomerID_contact` if missing).
 - `CustomerRef` is filled **only on the company row**, **left empty on child**.
+- `ParentId` is set to the company `External_ID` in the child row; **this may not be accepted by Odoo**.
+  - We might need to import companies first to get their Odoo IDs, then import children using those IDs.
 
 ### Template headers (customers.xlsx)
 - Added fields now used: `CustomerRef`, `ContactName`, `ContactEmail`, `ContactPhone`, `ContactJobTitle`, `ContactNotes`.
