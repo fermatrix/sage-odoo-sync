@@ -33,6 +33,17 @@ def normalize_name(value: str) -> str:
     return v
 
 
+def sanitize_external_id(value: str) -> str:
+    if not value:
+        return ""
+    v = str(value).strip()
+    if not v:
+        return ""
+    # Odoo XML IDs cannot contain spaces.
+    v = re.sub(r"\s+", "_", v)
+    return v
+
+
 def parse_date(value: str):
     if not value:
         return None
@@ -307,60 +318,103 @@ def refresh_sage(args: argparse.Namespace) -> int:
                 if new_num and (old_num == 0 or new_num < old_num):
                     primary_contact_by_customer_record[crn] = r
 
+        # Optional country parity for Odoo import (applied only to customers_NEW)
+        parity_path = os.path.join(master_root, "country_parity.csv")
+        country_parity = {}
+        country_name_to_code = {}
+        if os.path.exists(parity_path):
+            with open(parity_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter=DELIMITER)
+                for row in reader:
+                    raw = (row.get("sage_country_raw") or "").strip()
+                    if not raw:
+                        continue
+                    odoo_code = (row.get("odoo_country_code") or "").strip()
+                    if odoo_code:
+                        country_parity[raw] = odoo_code
+                    odoo_name = (row.get("odoo_country_name") or "").strip()
+                    if odoo_name and odoo_code:
+                        country_name_to_code[odoo_name] = odoo_code
+
+        # Fallback: load Odoo country list for name->code mapping
+        master_base = os.path.dirname(master_root)
+        countries_export = os.path.join(master_base, "_master_odoo", "countries_odoo.csv")
+        if os.path.exists(countries_export):
+            with open(countries_export, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter=DELIMITER)
+                for row in reader:
+                    name = (row.get("OdooName") or "").strip()
+                    code = (row.get("OdooCode") or "").strip()
+                    if name and code:
+                        country_name_to_code.setdefault(name, code)
+
+        # Optional state parity (state code -> full name + implied country)
+        state_parity_path = os.path.join(master_root, "state_parity.csv")
+        state_parity = {}
+        if os.path.exists(state_parity_path):
+            with open(state_parity_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter=DELIMITER)
+                for row in reader:
+                    raw = (row.get("sage_state_raw") or "").strip()
+                    if not raw:
+                        continue
+                    state_name = (row.get("odoo_state_name") or "").strip()
+                    country_name = (row.get("odoo_country_name") or "").strip()
+                    state_parity[raw] = {
+                        "state_name": state_name,
+                        "country_name": country_name,
+                    }
+
         for c in new_customers:
             cid = c.get("CustomerID", "")
             name = c.get("Customer_Bill_Name", "")
             sage = sage_by_id.get(cid, {})
             crn = (c.get("CustomerRecordNumber") or "").strip()
             addr = address_by_customer_record.get(crn, {})
-            def pick_addr(addr_key: str, sage_key: str) -> str:
-                val = (addr.get(addr_key) or "").strip()
-                if val:
-                    return val
-                return (sage.get(sage_key) or "").strip()
-            set_cell("External_ID", cid)
-            set_cell("ParentId", "")
+            def pick_addr(addr_key: str) -> str:
+                return (addr.get(addr_key) or "").strip()
+            ext_id = sanitize_external_id(cid)
+            if not ext_id:
+                ext_id = sanitize_external_id(crn)
+            set_cell("External_ID", ext_id)
             set_cell("name", name)
             set_cell("is_company", 1)
             set_cell("company_name", name)
-            set_cell("country_id", pick_addr("Country", "Cardholder_Country"))
-            set_cell("state_id", pick_addr("State", "Cardholder_State"))
-            set_cell("zip", pick_addr("Zip", "Cardholder_ZIP"))
-            set_cell("city", pick_addr("City", "Cardholder_City"))
-            set_cell("street", pick_addr("AddressLine1", "Cardholder_Address1"))
-            set_cell("street2", pick_addr("AddressLine2", "Cardholder_Address2"))
+            raw_country = pick_addr("Country")
+            mapped_country = country_parity.get(raw_country, "")
+            if not mapped_country and raw_country:
+                mapped_country = country_name_to_code.get(raw_country, "")
+            if not mapped_country:
+                mapped_country = raw_country
+            raw_state = pick_addr("State")
+            state_info = state_parity.get(raw_state, {})
+            mapped_state = state_info.get("state_name") or raw_state
+            if mapped_state and state_info.get("country_name"):
+                country_code = country_name_to_code.get(state_info.get("country_name", ""), "")
+                if country_code:
+                    mapped_state = f"{mapped_state} ({country_code})"
+            set_cell("country_id", mapped_country)
+            # If country missing, infer from state (US/Canada/known from Odoo)
+            if not mapped_country:
+                country_name = (state_info.get("country_name") or "").strip()
+                if country_name:
+                    # Map country name to Odoo ISO code; do not fall back to Sage names
+                    mapped_country = country_name_to_code.get(country_name, "")
+                    if mapped_country:
+                        set_cell("country_id", mapped_country)
+            set_cell("state_id", mapped_state)
+            set_cell("zip", pick_addr("Zip"))
+            set_cell("city", pick_addr("City"))
+            set_cell("street", pick_addr("AddressLine1"))
+            set_cell("street2", pick_addr("AddressLine2"))
             set_cell("phone", (sage.get("Phone_Number") or "").strip())
             set_cell("email", (sage.get("eMail_Address") or "").strip())
-            set_cell("CustomerRef", cid)
+            credit_msg = (sage.get("CreditStatusMsg") or "").strip()
+            if credit_msg and credit_msg != "You have requested to be notified when a transaction is created for this customer.":
+                set_cell("Notes", credit_msg)
+            set_cell("Reference", cid)
             set_cell("Language", "English (US)")
             row_idx += 1
-            # Add primary contact as child (no address; include email)
-            primary = primary_contact_by_customer_record.get(crn)
-            if primary:
-                first = (primary.get("FirstName") or "").strip()
-                last = (primary.get("LastName") or "").strip()
-                contact_name = " ".join([p for p in [first, last] if p]).strip()
-                if not contact_name:
-                    contact_name = (primary.get("CompanyName") or "").strip()
-                if not contact_name:
-                    contact_name = f"{name} Contact"
-                contact_rec = (primary.get("RecordNumber") or "").strip()
-                set_cell("External_ID", f"{cid}_{contact_rec}" if contact_rec else f"{cid}_contact")
-                set_cell("ParentId", cid)
-                set_cell("name", contact_name)
-                set_cell("is_company", 0)
-                # Leave company_name empty for child contact (per request)
-                contact_phone = (primary.get("Telephone1") or "").strip()
-                contact_email = (primary.get("Email") or "").strip()
-                set_cell("phone", "")
-                set_cell("email", "")
-                set_cell("ContactName", contact_name)
-                set_cell("ContactEmail", contact_email)
-                set_cell("ContactPhone", contact_phone)
-                set_cell("ContactJobTitle", (primary.get("Title") or "").strip())
-                set_cell("ContactNotes", (primary.get("Notes") or "").strip())
-                set_cell("Language", "English (US)")
-                row_idx += 1
         wb.save(customers_new_xlsx)
 
     # Minimal XLSX in _master
@@ -387,6 +441,211 @@ def refresh_sage(args: argparse.Namespace) -> int:
 
     print(f"OK: customers sync rows: {len(out_customers)} -> {customer_out}")
     print(f"OK: items sync rows: {len(out_items)} -> {items_out}")
+    return 0
+
+
+def build_contacts_import(args: argparse.Namespace) -> int:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        load_workbook = None
+
+    if load_workbook is None:
+        print("ERROR: openpyxl not available for XLSX export")
+        return 2
+
+    env = load_env_file(args.env_file)
+    url = get_env_value(env, "ODOO_STUDIOOPTYX_URL")
+    db = get_env_value(env, "ODOO_STUDIOOPTYX_DB")
+    user = get_env_value(env, "ODOO_STUDIOOPTYX_USER")
+    apikey = get_env_value(env, "ODOO_STUDIOOPTYX_APIKEY")
+
+    customers_sync = args.customers_sync
+    customers_master = args.customers_master
+    template_path = args.template_path
+
+    if not os.path.exists(customers_sync):
+        print(f"ERROR: customers sync file not found: {customers_sync}")
+        return 2
+    if not os.path.exists(customers_master):
+        print(f"ERROR: customers master not found: {customers_master}")
+        return 2
+    if not os.path.exists(template_path):
+        print(f"ERROR: template not found: {template_path}")
+        return 2
+
+    master_root = os.path.dirname(customers_sync)
+    odoo_imports = os.path.join(master_root, "odoo_imports")
+    os.makedirs(odoo_imports, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    contacts_out_xlsx = os.path.join(odoo_imports, f"{stamp}_contacts_NEW.xlsx")
+
+    # Load customers sync (needs OdooId to reference parent_id)
+    _, sync_rows = read_csv(customers_sync)
+    customers_by_record = {}
+    for r in sync_rows:
+        crn = (r.get("CustomerRecordNumber") or "").strip()
+        if not crn:
+            continue
+        customers_by_record[crn] = r
+
+    # Load Contacts master to attach primary contact (child) rows
+    contacts_master_path = os.path.join(os.path.dirname(customers_master), "contacts.csv")
+    primary_contact_by_customer_record = {}
+    if os.path.exists(contacts_master_path):
+        _, contact_rows = read_csv(contacts_master_path)
+        for r in contact_rows:
+            crn = (r.get("CustomerRecord") or "").strip()
+            if not crn:
+                continue
+            if (r.get("IsPrimaryContact") or "").strip() != "1":
+                continue
+            existing = primary_contact_by_customer_record.get(crn)
+            if not existing:
+                primary_contact_by_customer_record[crn] = r
+                continue
+            try:
+                new_num = int((r.get("RecordNumber") or "0").strip() or 0)
+            except ValueError:
+                new_num = 0
+            try:
+                old_num = int((existing.get("RecordNumber") or "0").strip() or 0)
+            except ValueError:
+                old_num = 0
+            if new_num and (old_num == 0 or new_num < old_num):
+                primary_contact_by_customer_record[crn] = r
+
+    # Optionally load existing contacts from Odoo to avoid duplicates
+    existing_by_parent = {}
+    if args.skip_existing and (url and db and user and apikey):
+        try:
+            client = OdooClient(url, db, user, apikey)
+            parent_ids = []
+            for row in customers_by_record.values():
+                oid = (row.get("OdooId") or "").strip()
+                if oid:
+                    try:
+                        parent_ids.append(int(oid))
+                    except ValueError:
+                        continue
+            chunk_size = 1000
+            for i in range(0, len(parent_ids), chunk_size):
+                chunk = parent_ids[i:i + chunk_size]
+                offset = 0
+                while True:
+                    rows = client.search_read(
+                        "res.partner",
+                        [["parent_id", "in", chunk]],
+                        ["id", "parent_id", "name", "email", "phone"],
+                        limit=args.batch_size,
+                        offset=offset,
+                    )
+                    if not rows:
+                        break
+                    for r in rows:
+                        parent = r.get("parent_id") or []
+                        pid = parent[0] if isinstance(parent, list) and parent else None
+                        if not pid:
+                            continue
+                        existing_by_parent.setdefault(pid, []).append({
+                            "name": (r.get("name") or "").strip(),
+                            "email": (r.get("email") or "").strip(),
+                            "phone": (r.get("phone") or "").strip(),
+                        })
+                    offset += len(rows)
+        except Exception as exc:
+            print(f"WARNING: failed to load Odoo contacts ({exc}); proceeding without de-dup")
+    elif args.skip_existing:
+        print("WARNING: missing Odoo credentials; proceeding without de-dup")
+
+    def norm_email(value: str) -> str:
+        return (value or "").strip().lower()
+
+    def norm_phone(value: str) -> str:
+        return re.sub(r"\\D+", "", (value or ""))
+
+    def contact_exists(parent_id: int, name: str, email: str, phone: str) -> bool:
+        existing = existing_by_parent.get(parent_id, [])
+        if not existing:
+            return False
+        n_name = normalize_name(name)
+        n_email = norm_email(email)
+        n_phone = norm_phone(phone)
+        for r in existing:
+            r_email = norm_email(r.get("email", ""))
+            r_phone = norm_phone(r.get("phone", ""))
+            r_name = normalize_name(r.get("name", ""))
+            if n_email and r_email and n_email == r_email:
+                return True
+            if n_name and r_name and n_name == r_name:
+                if n_phone and r_phone and n_phone == r_phone:
+                    return True
+                if not n_email and not r_email:
+                    return True
+        return False
+
+    wb = load_workbook(template_path)
+    ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
+    header_map = {}
+    for col_idx in range(1, ws.max_column + 1):
+        header = ws.cell(row=1, column=col_idx).value
+        if header:
+            header_map[str(header).strip()] = col_idx
+
+    def set_cell(col_name: str, value: str) -> None:
+        col_idx = header_map.get(col_name)
+        if col_idx:
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    ws.delete_rows(2, ws.max_row)
+    row_idx = 2
+    emitted = 0
+    for crn, customer in customers_by_record.items():
+        if (customer.get("CustomerIsInactive") or "").strip() == "1":
+            continue
+        odoo_id = (customer.get("OdooId") or "").strip()
+        if not odoo_id:
+            continue
+        primary = primary_contact_by_customer_record.get(crn)
+        if not primary:
+            continue
+
+        try:
+            parent_id_int = int(odoo_id)
+        except ValueError:
+            continue
+
+        cid = (customer.get("CustomerID") or "").strip()
+        name = (customer.get("Customer_Bill_Name") or "").strip()
+        first = (primary.get("FirstName") or "").strip()
+        last = (primary.get("LastName") or "").strip()
+        contact_name = " ".join([p for p in [first, last] if p]).strip()
+        if not contact_name:
+            contact_name = (primary.get("CompanyName") or "").strip()
+        if not contact_name:
+            contact_name = f"{name} Contact" if name else "Contact"
+        contact_rec = (primary.get("RecordNumber") or "").strip()
+
+        contact_phone = (primary.get("Telephone1") or "").strip()
+        contact_email = (primary.get("Email") or "").strip()
+        if args.skip_existing and contact_exists(parent_id_int, contact_name, contact_email, contact_phone):
+            continue
+
+        raw_ext = f"{cid}_{contact_rec}" if contact_rec and cid else (f"{cid}_contact" if cid else "")
+        set_cell("External_ID", sanitize_external_id(raw_ext))
+        set_cell("ParentId", odoo_id)
+        set_cell("ContactName", contact_name)
+        set_cell("ContactEmail", contact_email)
+        set_cell("ContactPhone", contact_phone)
+        set_cell("ContactJobTitle", (primary.get("Title") or "").strip())
+        set_cell("ContactNotes", (primary.get("Notes") or "").strip())
+        set_cell("Language", "English (US)")
+        row_idx += 1
+        emitted += 1
+
+    wb.save(contacts_out_xlsx)
+    print(f"OK: contacts new rows: {emitted} -> {contacts_out_xlsx}")
     return 0
 
 
@@ -526,6 +785,216 @@ def refresh_odoo(args: argparse.Namespace) -> int:
 
     print(f"OK: odoo customers exported -> {customers_out}")
     print(f"OK: odoo items exported -> {items_out}")
+    return 0
+
+
+def export_countries(args: argparse.Namespace) -> int:
+    env = load_env_file(args.env_file)
+    url = get_env_value(env, "ODOO_STUDIOOPTYX_URL")
+    db = get_env_value(env, "ODOO_STUDIOOPTYX_DB")
+    user = get_env_value(env, "ODOO_STUDIOOPTYX_USER")
+    apikey = get_env_value(env, "ODOO_STUDIOOPTYX_APIKEY")
+
+    if not (url and db and user and apikey):
+        print("ERROR: missing Odoo credentials (URL/DB/USER/APIKEY)")
+        return 2
+
+    client = OdooClient(url, db, user, apikey)
+
+    customers_master = args.customers_master
+    if not os.path.exists(customers_master):
+        print(f"ERROR: customers master not found: {customers_master}")
+        return 2
+
+    master_root = os.path.dirname(args.customers_sync)
+    master_odoo_root = os.path.dirname(args.odoo_customers)
+    os.makedirs(master_odoo_root, exist_ok=True)
+
+    countries_out = os.path.join(master_odoo_root, "countries_odoo.csv")
+    states_out = os.path.join(master_odoo_root, "states_odoo.csv")
+    parity_out = os.path.join(master_root, "country_parity.csv")
+    state_parity_out = os.path.join(master_root, "state_parity.csv")
+
+    # Export Odoo countries (id, name, code)
+    fields = ["id", "name", "code"]
+    offset = 0
+    batch = args.batch_size
+    countries = []
+    while True:
+        rows = client.search_read("res.country", [], fields, limit=batch, offset=offset)
+        if not rows:
+            break
+        countries.extend(rows)
+        offset += len(rows)
+
+    countries.sort(key=lambda r: (r.get("name") or ""))
+    with open(countries_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["OdooId", "OdooName", "OdooCode"], delimiter=DELIMITER)
+        writer.writeheader()
+        for r in countries:
+            writer.writerow({
+                "OdooId": r.get("id", ""),
+                "OdooName": r.get("name", "") or "",
+                "OdooCode": r.get("code", "") or "",
+            })
+
+    # Build parity from Sage Address.Country (AddressTypeNumber = 0 only)
+    address_master_path = os.path.join(os.path.dirname(customers_master), "address.csv")
+    if not os.path.exists(address_master_path):
+        print(f"ERROR: address master not found: {address_master_path}")
+        return 2
+
+    _, address_rows = read_csv(address_master_path)
+    sage_counts: Dict[str, int] = {}
+    for r in address_rows:
+        addr_type = (r.get("AddressTypeNumber") or "").strip()
+        if addr_type != "0":
+            continue
+        raw = (r.get("Country") or "").strip()
+        if not raw:
+            continue
+        sage_counts[raw] = sage_counts.get(raw, 0) + 1
+
+    # Build quick match suggestions (exact match on ISO2 code or country name)
+    by_code = {}
+    by_name = {}
+    for r in countries:
+        code = (r.get("code") or "").strip().upper()
+        name = (r.get("name") or "").strip().upper()
+        if code:
+            by_code[code] = r
+        if name:
+            by_name[name] = r
+
+    def suggest(raw: str):
+        key = raw.strip().upper()
+        if key in by_code:
+            return by_code[key], "code"
+        if key in by_name:
+            return by_name[key], "name"
+        return None, ""
+
+    with open(parity_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "sage_country_raw",
+                "count_address",
+                "odoo_country_name",
+                "odoo_country_code",
+                "match_type",
+            ],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        for raw in sorted(sage_counts.keys(), key=lambda k: sage_counts[k], reverse=True):
+            match, match_type = suggest(raw)
+            writer.writerow({
+                "sage_country_raw": raw,
+                "count_address": sage_counts[raw],
+                "odoo_country_name": (match.get("name") if match else "") or "",
+                "odoo_country_code": (match.get("code") if match else "") or "",
+                "match_type": match_type,
+            })
+
+    print(f"OK: odoo countries exported -> {countries_out}")
+    print(f"OK: country parity (address only) -> {parity_out}")
+
+    # Export Odoo states (id, name, code, country)
+    state_fields = ["id", "name", "code", "country_id"]
+    offset = 0
+    states = []
+    while True:
+        rows = client.search_read("res.country.state", [], state_fields, limit=batch, offset=offset)
+        if not rows:
+            break
+        states.extend(rows)
+        offset += len(rows)
+
+    with open(states_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["OdooId", "OdooName", "OdooCode", "OdooCountryId", "OdooCountryName"],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        for r in states:
+            country = r.get("country_id") or []
+            writer.writerow({
+                "OdooId": r.get("id", ""),
+                "OdooName": r.get("name", "") or "",
+                "OdooCode": r.get("code", "") or "",
+                "OdooCountryId": country[0] if isinstance(country, list) and country else "",
+                "OdooCountryName": country[1] if isinstance(country, list) and len(country) > 1 else "",
+            })
+
+    # Build state parity from Sage Address.State (AddressTypeNumber = 0 only)
+    sage_state_counts: Dict[str, int] = {}
+    for r in address_rows:
+        addr_type = (r.get("AddressTypeNumber") or "").strip()
+        if addr_type != "0":
+            continue
+        raw = (r.get("State") or "").strip()
+        if not raw:
+            continue
+        sage_state_counts[raw] = sage_state_counts.get(raw, 0) + 1
+
+    by_state_code = {}
+    for r in states:
+        code = (r.get("code") or "").strip().upper()
+        if not code:
+            continue
+        by_state_code.setdefault(code, []).append(r)
+
+    def suggest_state(raw: str):
+        key = raw.strip().upper()
+        options = by_state_code.get(key, [])
+        if not options:
+            return None, ""
+        # Prefer US/CA if multiple matches
+        preferred = None
+        for r in options:
+            country = r.get("country_id") or []
+            cname = country[1] if isinstance(country, list) and len(country) > 1 else ""
+            ccode = ""
+            if cname:
+                if cname.lower() in {"united states", "united states of america"}:
+                    preferred = (r, "code:US")
+                    break
+                if cname.lower() == "canada":
+                    preferred = (r, "code:CA")
+        if preferred:
+            return preferred
+        return options[0], "code"
+
+    with open(state_parity_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "sage_state_raw",
+                "count_address",
+                "odoo_state_name",
+                "odoo_state_code",
+                "odoo_country_name",
+                "match_type",
+            ],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        for raw in sorted(sage_state_counts.keys(), key=lambda k: sage_state_counts[k], reverse=True):
+            match, match_type = suggest_state(raw)
+            country = match.get("country_id") if match else []
+            writer.writerow({
+                "sage_state_raw": raw,
+                "count_address": sage_state_counts[raw],
+                "odoo_state_name": (match.get("name") if match else "") or "",
+                "odoo_state_code": (match.get("code") if match else "") or "",
+                "odoo_country_name": (country[1] if isinstance(country, list) and len(country) > 1 else "") or "",
+                "match_type": match_type,
+            })
+
+    print(f"OK: odoo states exported -> {states_out}")
+    print(f"OK: state parity (address only) -> {state_parity_out}")
     return 0
 
 
@@ -845,6 +1314,61 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow exact name match if ref match fails",
     )
     p3.set_defaults(func=sync_local)
+
+    p4 = sub.add_parser("build_contacts", help="Build contacts import file using Odoo parent IDs")
+    p4.add_argument(
+        "--customers-sync",
+        default=r"ENZO-Sage50\_master\customers_sync.csv",
+    )
+    p4.add_argument(
+        "--customers-master",
+        default=r"ENZO-Sage50\_master_sage\customers.csv",
+    )
+    p4.add_argument(
+        "--env-file",
+        default=".env",
+    )
+    p4.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Batch size for Odoo contact lookup",
+    )
+    p4.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip contacts that already exist in Odoo under the same parent",
+    )
+    p4.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\contacts.xlsx",
+    )
+    p4.set_defaults(func=build_contacts_import)
+
+    p5 = sub.add_parser("export_countries", help="Export Odoo countries + build Sage parity table (address only)")
+    p5.add_argument(
+        "--customers-sync",
+        default=r"ENZO-Sage50\_master\customers_sync.csv",
+    )
+    p5.add_argument(
+        "--customers-master",
+        default=r"ENZO-Sage50\_master_sage\customers.csv",
+    )
+    p5.add_argument(
+        "--odoo-customers",
+        default=r"ENZO-Sage50\_master_odoo\customers_odoo.csv",
+    )
+    p5.add_argument(
+        "--env-file",
+        default=".env",
+    )
+    p5.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Batch size for Odoo export",
+    )
+    p5.set_defaults(func=export_countries)
 
     return parser
 

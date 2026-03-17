@@ -7,6 +7,8 @@ Primary commands (run from repo root):
 python sage_odoo_parity.py refresh_sage
 python sage_odoo_parity.py refresh_odoo
 python sage_odoo_parity.py sync
+python sage_odoo_parity.py build_contacts
+python sage_odoo_parity.py export_countries
 ```
 
 Folder layout:
@@ -25,6 +27,20 @@ Key outputs:
 Odoo import files:
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_NEW.xlsx`
   - Active Sage customers without Odoo match, formatted for import
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_contacts_CHILDREN.xlsx`
+  - Child contact rows for customers that already have `OdooId` (after import + refresh/sync)
+- `ENZO-Sage50/_master/customers_NEW.xlsx`
+  - Same as above, without timestamp (working copy)
+
+Odoo reference exports:
+- `ENZO-Sage50/_master_odoo/countries_odoo.csv`
+- `ENZO-Sage50/_master_odoo/states_odoo.csv`
+
+Parity tables (generated from Sage Address + Odoo reference lists):
+- `ENZO-Sage50/_master/country_parity.csv`
+  - `sage_country_raw` → `odoo_country_code` suggestions (ISO2)
+- `ENZO-Sage50/_master/state_parity.csv`
+  - `sage_state_raw` → `odoo_state_name` (full state) + implied country
 - `ENZO-Sage50/_master/customers_NEW.xlsx`
   - Minimal tracking list (same customers, fewer columns)
 
@@ -111,16 +127,25 @@ C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage
 ### Address logic
 - Join key: `Customers.CustomerRecordNumber` ↔ `Address.CustomerRecordNumber`.
 - Only **AddressTypeNumber = 0** is used (single address per customer).
-- If no Address row exists, fallback to `Cardholder_*` fields in `customers.csv`.
+- If no Address row exists, **leave address fields empty** (no fallback to `Cardholder_*`).
+- Country/state mapping is applied **only when generating `customers_NEW.xlsx`**:
+  - Country uses `country_parity.csv` (ISO2). If no match, keep the Sage value.
+  - State uses `state_parity.csv` to map code → full name.
+  - If country is missing but the state matches, infer country from state (US/Canada, etc.).
 
 ### Contact logic (primary contact)
-- For each customer, add a child contact row **only if** there is an `IsPrimaryContact=1`.
+- Child contacts are now exported in a **separate import file** after parent companies exist in Odoo.
+- Each child row is included **only if** there is an `IsPrimaryContact=1` and the parent has an `OdooId`.
 - Child contact has **no address** and **no `company_name`**.
 - Child contact does carry `email` and `phone` (if present in `contacts.csv`).
 - `External_ID` for child contact: `CustomerID_ContactRecordNumber` (fallback to `CustomerID_contact` if missing).
 - `CustomerRef` is filled **only on the company row**, **left empty on child**.
-- `ParentId` is set to the company `External_ID` in the child row; **this may not be accepted by Odoo**.
-  - We might need to import companies first to get their Odoo IDs, then import children using those IDs.
+- `ParentId` is set to the **OdooId** of the parent record in the child row.
+
+### Countries & states export
+- `python sage_odoo_parity.py export_countries` fetches Odoo reference data and builds parity:
+  - Exports: `countries_odoo.csv`, `states_odoo.csv`
+  - Parity tables: `country_parity.csv`, `state_parity.csv`
 
 ### Template headers (customers.xlsx)
 - Added fields now used: `CustomerRef`, `ContactName`, `ContactEmail`, `ContactPhone`, `ContactJobTitle`, `ContactNotes`.
