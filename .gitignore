@@ -18,6 +18,7 @@
 *.pdf
 *.csv
 desktop.ini
+Thumbs.db
 
 # Environment
 .env
