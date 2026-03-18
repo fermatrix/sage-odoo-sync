@@ -17,6 +17,7 @@
 *.xlsx
 *.pdf
 *.csv
+desktop.ini
 
 # Environment
 .env
