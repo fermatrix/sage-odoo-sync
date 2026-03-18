@@ -7,7 +7,10 @@ Primary commands (run from repo root):
 python sage_odoo_parity.py refresh_sage
 python sage_odoo_parity.py refresh_odoo
 python sage_odoo_parity.py sync
+python sage_odoo_parity.py build_contacts_sync
 python sage_odoo_parity.py build_contacts
+python sage_odoo_parity.py build_product_sync --year-month 2026_02
+python sage_odoo_parity.py build_items_sync_new
 python sage_odoo_parity.py export_countries
 ```
 
@@ -20,7 +23,11 @@ Key outputs:
 - `ENZO-Sage50/_master/customers_sync.csv`
   - Includes `CustomerIsInactive`, `CustomerSince`, `LastInvoiceDate`
 - `ENZO-Sage50/_master/items_sync.csv`
-  - Includes `ItemIsInactive`, `OdooColor`
+  - Includes `ItemIsInactive`, `OdooColor`, `Barcode` (from `UPC_SKU`), `ItemDescriptionForSale`
+- `ENZO-Sage50/_master/items_sync_NEW.csv`
+  - Items without Odoo match, barcode present (default >=12 digits)
+- `ENZO-Sage50/_master/YYYY_MM_product_sync.csv`
+  - Items present in that month's invoice + credit note lines that are missing in Odoo
 - `ENZO-Sage50/_master/_customer_FAILS.csv`
 - `ENZO-Sage50/_master/_item_FAILS.csv`
 
@@ -29,12 +36,15 @@ Odoo import files:
   - Active Sage customers without Odoo match, formatted for import
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_contacts_CHILDREN.xlsx`
   - Child contact rows for customers that already have `OdooId` (after import + refresh/sync)
+- `ENZO-Sage50/_master/odoo_templates/customer_contacts.xlsx`
+  - Template used for contact imports
 - `ENZO-Sage50/_master/customers_NEW.xlsx`
   - Same as above, without timestamp (working copy)
 
 Odoo reference exports:
 - `ENZO-Sage50/_master_odoo/countries_odoo.csv`
 - `ENZO-Sage50/_master_odoo/states_odoo.csv`
+- `ENZO-Sage50/_master_odoo/customers_contacts.csv` (Odoo contacts with `ParentId`)
 
 Parity tables (generated from Sage Address + Odoo reference lists):
 - `ENZO-Sage50/_master/country_parity.csv`
@@ -46,6 +56,26 @@ Parity tables (generated from Sage Address + Odoo reference lists):
 
 Data hygiene:
 - All customer and invoice data files are excluded by `.gitignore` (CSV/XLS/XLSX/PDF and Sage output folders).
+
+## Sage ODBC Tables (Known Names)
+
+Confirmed in this DSN/catalog (`STUDIOOPTYXINC`):
+- `Customers` (master customers)
+- `Address` (customer address master)
+- `Contacts` (customer contacts master)
+- `LineItem` (product/master item table used for items export)
+- `JrnlHdr` (invoice/transaction headers)
+- `JrnlRow` (invoice/transaction lines)
+- `StoredTransHeaders`
+- `StoredTransRows`
+- `Tax_Code`
+- `Tax_Authority`
+- `PaymentMethod`
+
+Other item-related tables present (not used for master export yet):
+- `BOMItems`
+- `InventoryChains`
+- `InventoryCosts`
 
 ## Discovery Summary (March 12, 2026)
 
@@ -141,6 +171,39 @@ C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage
 - `External_ID` for child contact: `CustomerID_ContactRecordNumber` (fallback to `CustomerID_contact` if missing).
 - `CustomerRef` is filled **only on the company row**, **left empty on child**.
 - `ParentId` is set to the **OdooId** of the parent record in the child row.
+- Contacts are only emitted into the NEW file if:
+  - They do **not** already exist in Odoo (matched by name/email/phone under the same parent), and
+  - The parent company exists in Odoo (valid `ParentId`).
+
+### Contacts sync (new)
+- `python sage_odoo_parity.py build_contacts_sync` builds:
+  - `ENZO-Sage50/_master/customer_contacts_sync.csv`
+  - This matches Sage primary contacts to existing Odoo contacts from:
+    - `ENZO-Sage50/_master_odoo/customers_contacts.csv` (exported by `refresh_odoo`)
+
+### Product sync (new)
+- `python sage_odoo_parity.py build_product_sync --year-month YYYY_MM`
+  - Scans:
+    - `ENZO-Sage50/**/YYYY_MM_invoice_lines.csv`
+    - `ENZO-Sage50/**/YYYY_MM_credit_note_lines.csv`
+  - Joins with:
+    - `ENZO-Sage50/_master_sage/items.csv` (barcode in `UPC_SKU`)
+    - `ENZO-Sage50/_master/items_sync.csv`
+  - Outputs:
+    - `ENZO-Sage50/_master/YYYY_MM_product_sync.csv`
+
+### Items sync NEW (new)
+- `python sage_odoo_parity.py build_items_sync_new`
+  - Filters `ENZO-Sage50/_master/items_sync.csv`:
+    - No `OdooVariantId`
+    - `Barcode` has >= 12 digits (default)
+    - Includes inactive items (no `ItemIsInactive` filter)
+  - Output:
+    - `ENZO-Sage50/_master/items_sync_NEW.csv`
+  - Options:
+    - `--barcode-digits 0` disables barcode-length filtering
+  - Adds `Invoiced2026` column (X) if item appears in 2026_02 or 2026_03 invoice lines
+
 
 ### Countries & states export
 - `python sage_odoo_parity.py export_countries` fetches Odoo reference data and builds parity:

@@ -1,6 +1,7 @@
 import argparse
 import csv
 import os
+import glob
 from datetime import datetime
 from typing import Dict, List, Tuple
 import html
@@ -161,6 +162,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
         "ItemRecordNumber",
         "ItemID",
         "ItemDescription",
+        "ItemDescriptionForSale",
+        "Barcode",
         "ItemIsInactive",
         "OdooVariantId",
         "OdooName",
@@ -198,6 +201,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
             "ItemRecordNumber": key,
             "ItemID": (row.get("ItemID") or "").strip(),
             "ItemDescription": (row.get("ItemDescription") or "").strip(),
+            "ItemDescriptionForSale": (row.get("SalesDescription") or "").strip(),
+            "Barcode": (row.get("UPC_SKU") or "").strip(),
             "ItemIsInactive": (row.get("ItemIsInactive") or "").strip(),
             "OdooColor": (existing.get("OdooColor") or "").strip(),
             "OdooVariantId": (existing.get("OdooVariantId") or "").strip(),
@@ -444,55 +449,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_contacts_import(args: argparse.Namespace) -> int:
-    try:
-        from openpyxl import load_workbook
-    except Exception:
-        load_workbook = None
-
-    if load_workbook is None:
-        print("ERROR: openpyxl not available for XLSX export")
-        return 2
-
-    env = load_env_file(args.env_file)
-    url = get_env_value(env, "ODOO_STUDIOOPTYX_URL")
-    db = get_env_value(env, "ODOO_STUDIOOPTYX_DB")
-    user = get_env_value(env, "ODOO_STUDIOOPTYX_USER")
-    apikey = get_env_value(env, "ODOO_STUDIOOPTYX_APIKEY")
-
-    customers_sync = args.customers_sync
-    customers_master = args.customers_master
-    template_path = args.template_path
-
-    if not os.path.exists(customers_sync):
-        print(f"ERROR: customers sync file not found: {customers_sync}")
-        return 2
-    if not os.path.exists(customers_master):
-        print(f"ERROR: customers master not found: {customers_master}")
-        return 2
-    if not os.path.exists(template_path):
-        print(f"ERROR: template not found: {template_path}")
-        return 2
-
-    master_root = os.path.dirname(customers_sync)
-    odoo_imports = os.path.join(master_root, "odoo_imports")
-    os.makedirs(odoo_imports, exist_ok=True)
-
-    stamp = datetime.now().strftime("%Y%m%d")
-    contacts_out_xlsx = os.path.join(odoo_imports, f"{stamp}_contacts_NEW.xlsx")
-
-    # Load customers sync (needs OdooId to reference parent_id)
-    _, sync_rows = read_csv(customers_sync)
-    customers_by_record = {}
-    for r in sync_rows:
-        crn = (r.get("CustomerRecordNumber") or "").strip()
-        if not crn:
-            continue
-        customers_by_record[crn] = r
-
-    # Load Contacts master to attach primary contact (child) rows
-    contacts_master_path = os.path.join(os.path.dirname(customers_master), "contacts.csv")
-    primary_contact_by_customer_record = {}
+def _load_primary_contacts(contacts_master_path: str) -> Dict[str, Dict[str, str]]:
+    primary_contact_by_customer_record: Dict[str, Dict[str, str]] = {}
     if os.path.exists(contacts_master_path):
         _, contact_rows = read_csv(contacts_master_path)
         for r in contact_rows:
@@ -515,75 +473,193 @@ def build_contacts_import(args: argparse.Namespace) -> int:
                 old_num = 0
             if new_num and (old_num == 0 or new_num < old_num):
                 primary_contact_by_customer_record[crn] = r
+    return primary_contact_by_customer_record
 
-    # Optionally load existing contacts from Odoo to avoid duplicates
-    existing_by_parent = {}
-    if args.skip_existing and (url and db and user and apikey):
+
+def _load_customers_by_record(customers_sync: str) -> Dict[str, Dict[str, str]]:
+    _, sync_rows = read_csv(customers_sync)
+    customers_by_record: Dict[str, Dict[str, str]] = {}
+    for r in sync_rows:
+        crn = (r.get("CustomerRecordNumber") or "").strip()
+        if not crn:
+            continue
+        customers_by_record[crn] = r
+    return customers_by_record
+
+
+def _load_existing_contacts_by_parent_csv(odoo_contacts_path: str) -> Dict[int, List[Dict[str, str]]]:
+    existing_by_parent: Dict[int, List[Dict[str, str]]] = {}
+    _, rows = read_csv(odoo_contacts_path)
+    for r in rows:
+        parent_id = (r.get("ParentId") or "").strip()
+        contact_id = (r.get("OdooId") or "").strip()
+        if not parent_id or not contact_id:
+            continue
         try:
-            client = OdooClient(url, db, user, apikey)
-            parent_ids = []
-            for row in customers_by_record.values():
-                oid = (row.get("OdooId") or "").strip()
-                if oid:
-                    try:
-                        parent_ids.append(int(oid))
-                    except ValueError:
-                        continue
-            chunk_size = 1000
-            for i in range(0, len(parent_ids), chunk_size):
-                chunk = parent_ids[i:i + chunk_size]
-                offset = 0
-                while True:
-                    rows = client.search_read(
-                        "res.partner",
-                        [["parent_id", "in", chunk]],
-                        ["id", "parent_id", "name", "email", "phone"],
-                        limit=args.batch_size,
-                        offset=offset,
-                    )
-                    if not rows:
-                        break
-                    for r in rows:
-                        parent = r.get("parent_id") or []
-                        pid = parent[0] if isinstance(parent, list) and parent else None
-                        if not pid:
-                            continue
-                        existing_by_parent.setdefault(pid, []).append({
-                            "name": (r.get("name") or "").strip(),
-                            "email": (r.get("email") or "").strip(),
-                            "phone": (r.get("phone") or "").strip(),
-                        })
-                    offset += len(rows)
-        except Exception as exc:
-            print(f"WARNING: failed to load Odoo contacts ({exc}); proceeding without de-dup")
-    elif args.skip_existing:
-        print("WARNING: missing Odoo credentials; proceeding without de-dup")
+            pid = int(parent_id)
+        except ValueError:
+            continue
+        existing_by_parent.setdefault(pid, []).append({
+            "id": contact_id,
+            "name": (r.get("OdooName") or "").strip(),
+            "email": (r.get("OdooEmail") or "").strip(),
+            "phone": (r.get("OdooPhone") or "").strip(),
+        })
+    return existing_by_parent
 
-    def norm_email(value: str) -> str:
-        return (value or "").strip().lower()
 
-    def norm_phone(value: str) -> str:
-        return re.sub(r"\\D+", "", (value or ""))
+def _norm_email(value: str) -> str:
+    return (value or "").strip().lower()
 
-    def contact_exists(parent_id: int, name: str, email: str, phone: str) -> bool:
-        existing = existing_by_parent.get(parent_id, [])
-        if not existing:
-            return False
-        n_name = normalize_name(name)
-        n_email = norm_email(email)
-        n_phone = norm_phone(phone)
-        for r in existing:
-            r_email = norm_email(r.get("email", ""))
-            r_phone = norm_phone(r.get("phone", ""))
-            r_name = normalize_name(r.get("name", ""))
-            if n_email and r_email and n_email == r_email:
-                return True
-            if n_name and r_name and n_name == r_name:
-                if n_phone and r_phone and n_phone == r_phone:
-                    return True
-                if not n_email and not r_email:
-                    return True
-        return False
+
+def _norm_phone(value: str) -> str:
+    return re.sub(r"\\D+", "", (value or ""))
+
+
+def _match_contact(parent_rows: List[Dict[str, str]], name: str, email: str, phone: str):
+    if not parent_rows:
+        return None
+    n_name = normalize_name(name)
+    n_email = _norm_email(email)
+    n_phone = _norm_phone(phone)
+    for r in parent_rows:
+        r_email = _norm_email(r.get("email", ""))
+        r_phone = _norm_phone(r.get("phone", ""))
+        r_name = normalize_name(r.get("name", ""))
+        if n_email and r_email and n_email == r_email:
+            return r.get("id")
+        if n_name and r_name and n_name == r_name:
+            if n_phone and r_phone and n_phone == r_phone:
+                return r.get("id")
+            if not n_email and not r_email:
+                return r.get("id")
+    return None
+
+
+def build_contacts_sync(args: argparse.Namespace) -> int:
+    customers_sync = args.customers_sync
+    customers_master = args.customers_master
+    contacts_sync = args.contacts_sync
+    odoo_contacts = args.odoo_contacts
+
+    if not os.path.exists(customers_sync):
+        print(f"ERROR: customers sync file not found: {customers_sync}")
+        return 2
+    if not os.path.exists(customers_master):
+        print(f"ERROR: customers master not found: {customers_master}")
+        return 2
+    if not os.path.exists(odoo_contacts):
+        print(f"ERROR: odoo contacts file not found: {odoo_contacts}")
+        print("Run: python sage_odoo_parity.py refresh_odoo")
+        return 2
+
+    customers_by_record = _load_customers_by_record(customers_sync)
+    contacts_master_path = os.path.join(os.path.dirname(customers_master), "contacts.csv")
+    primary_contact_by_customer_record = _load_primary_contacts(contacts_master_path)
+    existing_by_parent = _load_existing_contacts_by_parent_csv(odoo_contacts)
+
+    fieldnames = [
+        "ContactId",
+        "FirstName",
+        "LastName",
+        "CustomerRecordNumber",
+        "CustomerId",
+        "ContactExternalId",
+        "OdooContactId",
+        "OdooParentId",
+        "LastLookupAt",
+    ]
+    rows_out: List[Dict[str, str]] = []
+    now_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for crn, customer in customers_by_record.items():
+        primary = primary_contact_by_customer_record.get(crn)
+        if not primary:
+            continue
+        odoo_id = (customer.get("OdooId") or "").strip()
+        parent_id_int = None
+        if odoo_id:
+            try:
+                parent_id_int = int(odoo_id)
+            except ValueError:
+                parent_id_int = None
+
+        cid = (customer.get("CustomerID") or "").strip()
+        first = (primary.get("FirstName") or "").strip()
+        last = (primary.get("LastName") or "").strip()
+        contact_name = " ".join([p for p in [first, last] if p]).strip()
+        if not contact_name:
+            contact_name = (primary.get("CompanyName") or "").strip()
+        contact_rec = (primary.get("RecordNumber") or "").strip()
+        contact_phone = (primary.get("Telephone1") or "").strip()
+        contact_email = (primary.get("Email") or "").strip()
+
+        raw_ext = f"{cid}_{contact_rec}" if contact_rec and cid else (f"{cid}_contact" if cid else "")
+        ext_id = sanitize_external_id(raw_ext)
+
+        match_id = None
+        if parent_id_int:
+            match_id = _match_contact(existing_by_parent.get(parent_id_int, []), contact_name, contact_email, contact_phone)
+
+        rows_out.append({
+            "ContactId": contact_rec,
+            "FirstName": first,
+            "LastName": last,
+            "CustomerRecordNumber": crn,
+            "CustomerId": cid,
+            "ContactExternalId": ext_id,
+            "OdooContactId": str(match_id or ""),
+            "OdooParentId": odoo_id,
+            "LastLookupAt": now_stamp,
+        })
+
+    write_csv(contacts_sync, fieldnames, rows_out)
+    print(f"OK: contacts sync rows: {len(rows_out)} -> {contacts_sync}")
+    return 0
+
+
+def build_contacts_import(args: argparse.Namespace) -> int:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        load_workbook = None
+
+    if load_workbook is None:
+        print("ERROR: openpyxl not available for XLSX export")
+        return 2
+
+    contacts_sync = args.contacts_sync
+    template_path = args.template_path
+
+    if not os.path.exists(contacts_sync):
+        print(f"ERROR: contacts sync file not found: {contacts_sync}")
+        print("Run: python sage_odoo_parity.py build_contacts_sync")
+        return 2
+    if not os.path.exists(template_path):
+        print(f"ERROR: template not found: {template_path}")
+        return 2
+
+    master_root = os.path.dirname(contacts_sync)
+    odoo_imports = os.path.join(master_root, "odoo_imports")
+    os.makedirs(odoo_imports, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    contacts_out_xlsx = os.path.join(odoo_imports, f"{stamp}_customers_contacts_NEW.xlsx")
+
+    sync_fields, sync_rows = read_csv(contacts_sync)
+    # Load Sage contacts master to enrich email/phone/title/notes
+    master_root = os.path.dirname(contacts_sync)
+    contacts_master_path = os.path.join(os.path.dirname(master_root), "_master_sage", "contacts.csv")
+    contacts_by_key = {}
+    contacts_by_customer = {}
+    if os.path.exists(contacts_master_path):
+        _, contact_rows = read_csv(contacts_master_path)
+        for r in contact_rows:
+            crn = (r.get("CustomerRecord") or "").strip()
+            rec = (r.get("RecordNumber") or "").strip()
+            if crn and rec:
+                contacts_by_key[(crn, rec)] = r
+            if crn:
+                contacts_by_customer.setdefault(crn, []).append(r)
 
     wb = load_workbook(template_path)
     ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
@@ -601,51 +677,219 @@ def build_contacts_import(args: argparse.Namespace) -> int:
     ws.delete_rows(2, ws.max_row)
     row_idx = 2
     emitted = 0
-    for crn, customer in customers_by_record.items():
-        if (customer.get("CustomerIsInactive") or "").strip() == "1":
+    new_rows: List[Dict[str, str]] = []
+    for r in sync_rows:
+        if (r.get("OdooContactId") or "").strip():
             continue
-        odoo_id = (customer.get("OdooId") or "").strip()
-        if not odoo_id:
+        parent_id = (r.get("OdooParentId") or "").strip()
+        if not parent_id:
             continue
-        primary = primary_contact_by_customer_record.get(crn)
-        if not primary:
-            continue
-
-        try:
-            parent_id_int = int(odoo_id)
-        except ValueError:
-            continue
-
-        cid = (customer.get("CustomerID") or "").strip()
-        name = (customer.get("Customer_Bill_Name") or "").strip()
-        first = (primary.get("FirstName") or "").strip()
-        last = (primary.get("LastName") or "").strip()
+        new_rows.append(r)
+        first = (r.get("FirstName") or "").strip()
+        last = (r.get("LastName") or "").strip()
         contact_name = " ".join([p for p in [first, last] if p]).strip()
         if not contact_name:
-            contact_name = (primary.get("CompanyName") or "").strip()
-        if not contact_name:
-            contact_name = f"{name} Contact" if name else "Contact"
-        contact_rec = (primary.get("RecordNumber") or "").strip()
-
-        contact_phone = (primary.get("Telephone1") or "").strip()
-        contact_email = (primary.get("Email") or "").strip()
-        if args.skip_existing and contact_exists(parent_id_int, contact_name, contact_email, contact_phone):
+            # Skip contacts with no name to avoid generic placeholders
             continue
-
-        raw_ext = f"{cid}_{contact_rec}" if contact_rec and cid else (f"{cid}_contact" if cid else "")
-        set_cell("External_ID", sanitize_external_id(raw_ext))
-        set_cell("ParentId", odoo_id)
-        set_cell("ContactName", contact_name)
-        set_cell("ContactEmail", contact_email)
-        set_cell("ContactPhone", contact_phone)
-        set_cell("ContactJobTitle", (primary.get("Title") or "").strip())
-        set_cell("ContactNotes", (primary.get("Notes") or "").strip())
+        crn = (r.get("CustomerRecordNumber") or "").strip()
+        contact_id = (r.get("ContactId") or "").strip()
+        sage_row = None
+        if crn and contact_id:
+            sage_row = contacts_by_key.get((crn, contact_id))
+        if not sage_row and crn:
+            candidates = contacts_by_customer.get(crn, [])
+            if len(candidates) == 1:
+                sage_row = candidates[0]
+        email = (sage_row.get("Email") or "").strip() if sage_row else ""
+        phone = (sage_row.get("Telephone1") or "").strip() if sage_row else ""
+        job = (sage_row.get("Title") or "").strip() if sage_row else ""
+        notes = (sage_row.get("Notes") or "").strip() if sage_row else ""
+        set_cell("External_ID", (r.get("ContactExternalId") or "").strip())
+        set_cell("Parent/Database ID", parent_id)
+        set_cell("is_company", 0)
+        set_cell("Name", contact_name)
+        set_cell("Email", email)
+        set_cell("Phone", phone)
+        set_cell("Job Position", job)
+        set_cell("Notes", notes)
         set_cell("Language", "English (US)")
         row_idx += 1
         emitted += 1
 
     wb.save(contacts_out_xlsx)
+    if sync_fields:
+        master_root = os.path.dirname(contacts_sync)
+        new_csv = os.path.join(master_root, "customer_contacts_sync_NEW.csv")
+        write_csv(new_csv, sync_fields, new_rows)
     print(f"OK: contacts new rows: {emitted} -> {contacts_out_xlsx}")
+    return 0
+
+
+def _pick_latest(paths: List[str]) -> str:
+    if not paths:
+        return ""
+    return max(paths, key=lambda p: os.path.getmtime(p))
+
+
+def build_product_sync(args: argparse.Namespace) -> int:
+    year_month = args.year_month
+    base_dir = args.base_dir
+    items_master = args.items_master
+    items_sync = args.items_sync
+    out_path = args.out_path.replace("{year_month}", year_month)
+
+    if not os.path.exists(items_master):
+        print(f"ERROR: items master not found: {items_master}")
+        return 2
+    if not os.path.exists(items_sync):
+        print(f"ERROR: items sync not found: {items_sync}")
+        return 2
+
+    inv_glob = os.path.join(base_dir, "**", f"{year_month}_invoice_lines.csv")
+    cn_glob = os.path.join(base_dir, "**", f"{year_month}_credit_note_lines.csv")
+    inv_paths = glob.glob(inv_glob, recursive=True)
+    cn_paths = glob.glob(cn_glob, recursive=True)
+    if not inv_paths:
+        print(f"ERROR: invoice lines not found for {year_month} (search: {inv_glob})")
+        return 2
+    if not cn_paths:
+        print(f"ERROR: credit note lines not found for {year_month} (search: {cn_glob})")
+        return 2
+
+    invoice_lines = _pick_latest(inv_paths)
+    credit_lines = _pick_latest(cn_paths)
+    if len(inv_paths) > 1:
+        print(f"WARNING: multiple invoice_lines found, using latest: {invoice_lines}")
+    if len(cn_paths) > 1:
+        print(f"WARNING: multiple credit_note_lines found, using latest: {credit_lines}")
+
+    # Load invoice + credit note lines
+    _, inv_rows = read_csv(invoice_lines)
+    _, cn_rows = read_csv(credit_lines)
+    item_records = set()
+    for row in inv_rows + cn_rows:
+        rec = (row.get("ItemRecordNumber") or "").strip()
+        if rec:
+            item_records.add(rec)
+    item_records.discard("0")
+
+    # Load items master + sync
+    _, master_rows = read_csv(items_master)
+    master_by_record = { (r.get("ItemRecordNumber") or "").strip(): r for r in master_rows }
+
+    _, sync_rows = read_csv(items_sync)
+    sync_by_record = { (r.get("ItemRecordNumber") or "").strip(): r for r in sync_rows }
+
+    fieldnames = [
+        "ItemRecordNumber",
+        "ItemID",
+        "ItemDescription",
+        "SalesDescription",
+        "Barcode",
+        "OdooVariantId",
+        "OdooName",
+        "OdooVariantName",
+        "OdooItemCode",
+        "OdooColor",
+        "Reason",
+    ]
+    rows_out: List[Dict[str, str]] = []
+    for rec in sorted(item_records, key=lambda x: int(x) if x.isdigit() else x):
+        sync = sync_by_record.get(rec)
+        reason = ""
+        if not sync:
+            reason = "NO_SYNC"
+        else:
+            if not (sync.get("OdooVariantId") or "").strip():
+                reason = "NO_ODOO"
+        if not reason:
+            continue
+        master = master_by_record.get(rec, {})
+        rows_out.append({
+            "ItemRecordNumber": rec,
+            "ItemID": (sync.get("ItemID") or master.get("ItemID") or "").strip(),
+            "ItemDescription": (sync.get("ItemDescription") or master.get("ItemDescription") or "").strip(),
+            "SalesDescription": (master.get("SalesDescription") or "").strip(),
+            "Barcode": (master.get("UPC_SKU") or "").strip(),
+            "OdooVariantId": (sync.get("OdooVariantId") or "").strip(),
+            "OdooName": (sync.get("OdooName") or "").strip(),
+            "OdooVariantName": (sync.get("OdooVariantName") or "").strip(),
+            "OdooItemCode": (sync.get("OdooItemCode") or "").strip(),
+            "OdooColor": (sync.get("OdooColor") or "").strip(),
+            "Reason": reason,
+        })
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    write_csv(out_path, fieldnames, rows_out)
+    print(f"OK: product sync rows: {len(rows_out)} -> {out_path}")
+    return 0
+
+
+def build_items_sync_new(args: argparse.Namespace) -> int:
+    items_sync = args.items_sync
+    out_path = args.out_path
+    barcode_digits = None if args.barcode_digits == 0 else args.barcode_digits
+    invoice_base_dir = args.invoice_base_dir
+
+    if not os.path.exists(items_sync):
+        print(f"ERROR: items sync not found: {items_sync}")
+        return 2
+
+    fields, rows = read_csv(items_sync)
+    if not fields:
+        print(f"ERROR: items sync has no headers: {items_sync}")
+        return 2
+
+    # Build invoiced set for 2026 (Feb + Mar)
+    invoiced = set()
+    if invoice_base_dir:
+        targets = [
+            os.path.join(invoice_base_dir, "**", "2026_02_invoice_lines.csv"),
+            os.path.join(invoice_base_dir, "**", "2026_03_invoice_lines.csv"),
+        ]
+        matched = []
+        for pattern in targets:
+            matched.extend(glob.glob(pattern, recursive=True))
+        if not matched:
+            print("WARNING: no invoice_lines found for 2026_02 or 2026_03")
+        for path in matched:
+            try:
+                _, inv_rows = read_csv(path)
+            except Exception:
+                continue
+            for r in inv_rows:
+                rec = (r.get("ItemRecordNumber") or "").strip()
+                if rec:
+                    invoiced.add(rec)
+
+    def is_barcode_ok(value: str) -> bool:
+        v = (value or "").strip()
+        if not v:
+            return False
+        if barcode_digits is None:
+            return True
+        return v.isdigit() and len(v) >= barcode_digits
+
+    filtered = []
+    for r in rows:
+        if (r.get("OdooVariantId") or "").strip():
+            continue
+        if not is_barcode_ok(r.get("Barcode", "")):
+            continue
+        if invoiced:
+            r["Invoiced2026"] = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""
+        filtered.append(r)
+
+    out_fields = list(fields)
+    if "Invoiced2026" not in out_fields:
+        if "LastLookupAt" in out_fields:
+            idx = out_fields.index("LastLookupAt")
+            out_fields.insert(idx, "Invoiced2026")
+        else:
+            out_fields.append("Invoiced2026")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    write_csv(out_path, out_fields, filtered)
+    print(f"OK: items sync NEW rows: {len(filtered)} -> {out_path}")
     return 0
 
 
@@ -702,7 +946,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
 
     batch = args.batch_size
 
-    customer_fields = ["OdooId", "OdooName", "OdooRef", "Active"]
+    customer_fields = ["OdooId", "OdooName", "OdooRef", "Active", "ParentId", "OdooEmail", "OdooPhone"]
     with open(customers_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=customer_fields, delimiter=DELIMITER)
         writer.writeheader()
@@ -711,17 +955,52 @@ def refresh_odoo(args: argparse.Namespace) -> int:
             rows = client.search_read(
                 "res.partner",
                 [],
-                ["id", "name", "ref", "active"],
+                ["id", "name", "ref", "active", "parent_id", "email", "phone"],
                 limit=batch,
                 offset=offset,
             )
             if not rows:
                 break
             for r in rows:
+                parent = r.get("parent_id") or []
+                parent_id = parent[0] if isinstance(parent, list) and parent else ""
                 writer.writerow({
                     "OdooId": r.get("id", ""),
                     "OdooName": r.get("name", "") or "",
                     "OdooRef": r.get("ref", "") or "",
+                    "Active": r.get("active", ""),
+                    "ParentId": parent_id,
+                    "OdooEmail": r.get("email", "") or "",
+                    "OdooPhone": r.get("phone", "") or "",
+                })
+            offset += len(rows)
+
+    # Export Odoo contacts (res.partner with parent_id) for contact matching
+    contacts_out = os.path.join(os.path.dirname(customers_out), "customers_contacts.csv")
+    contact_fields = ["OdooId", "ParentId", "OdooName", "OdooEmail", "OdooPhone", "Active"]
+    with open(contacts_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=contact_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "res.partner",
+                [["parent_id", "!=", False]],
+                ["id", "parent_id", "name", "email", "phone", "active"],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                parent = r.get("parent_id") or []
+                parent_id = parent[0] if isinstance(parent, list) and parent else ""
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "ParentId": parent_id,
+                    "OdooName": r.get("name", "") or "",
+                    "OdooEmail": r.get("email", "") or "",
+                    "OdooPhone": r.get("phone", "") or "",
                     "Active": r.get("active", ""),
                 })
             offset += len(rows)
@@ -784,6 +1063,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
             offset += len(rows)
 
     print(f"OK: odoo customers exported -> {customers_out}")
+    print(f"OK: odoo contacts exported -> {contacts_out}")
     print(f"OK: odoo items exported -> {items_out}")
     return 0
 
@@ -1315,7 +1595,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p3.set_defaults(func=sync_local)
 
-    p4 = sub.add_parser("build_contacts", help="Build contacts import file using Odoo parent IDs")
+    p4 = sub.add_parser("build_contacts_sync", help="Build contacts sync file using Odoo data")
     p4.add_argument(
         "--customers-sync",
         default=r"ENZO-Sage50\_master\customers_sync.csv",
@@ -1325,50 +1605,98 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"ENZO-Sage50\_master_sage\customers.csv",
     )
     p4.add_argument(
-        "--env-file",
-        default=".env",
+        "--contacts-sync",
+        default=r"ENZO-Sage50\_master\customer_contacts_sync.csv",
     )
     p4.add_argument(
-        "--batch-size",
-        type=int,
-        default=1000,
-        help="Batch size for Odoo contact lookup",
+        "--odoo-contacts",
+        default=r"ENZO-Sage50\_master_odoo\customers_contacts.csv",
     )
-    p4.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip contacts that already exist in Odoo under the same parent",
-    )
-    p4.add_argument(
-        "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\contacts.xlsx",
-    )
-    p4.set_defaults(func=build_contacts_import)
+    p4.set_defaults(func=build_contacts_sync)
 
-    p5 = sub.add_parser("export_countries", help="Export Odoo countries + build Sage parity table (address only)")
+    p5 = sub.add_parser("build_contacts", help="Build contacts import file from contacts sync")
     p5.add_argument(
+        "--contacts-sync",
+        default=r"ENZO-Sage50\_master\customer_contacts_sync.csv",
+    )
+    p5.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\customer_contacts.xlsx",
+    )
+    p5.set_defaults(func=build_contacts_import)
+
+    p6 = sub.add_parser("build_product_sync", help="Build product sync for a given YYYY_MM using invoice + credit note lines")
+    p6.add_argument(
+        "--year-month",
+        required=True,
+        help="Year and month in YYYY_MM format (e.g. 2026_02)",
+    )
+    p6.add_argument(
+        "--base-dir",
+        default=r"ENZO-Sage50",
+        help="Base directory to search for invoice/credit note lines",
+    )
+    p6.add_argument(
+        "--items-master",
+        default=r"ENZO-Sage50\_master_sage\items.csv",
+    )
+    p6.add_argument(
+        "--items-sync",
+        default=r"ENZO-Sage50\_master\items_sync.csv",
+    )
+    p6.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\{year_month}_product_sync.csv",
+        help="Output path (supports {year_month} placeholder)",
+    )
+    p6.set_defaults(func=build_product_sync)
+
+    p7 = sub.add_parser("build_items_sync_new", help="Build items_sync_NEW with filters (no Odoo ID, active, barcode)")
+    p7.add_argument(
+        "--items-sync",
+        default=r"ENZO-Sage50\_master\items_sync.csv",
+    )
+    p7.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\items_sync_NEW.csv",
+    )
+    p7.add_argument(
+        "--invoice-base-dir",
+        default=r"ENZO-Sage50",
+        help="Base directory to search for 2026_02/2026_03 invoice lines",
+    )
+    p7.add_argument(
+        "--barcode-digits",
+        type=int,
+        default=12,
+        help="Require barcode to have exactly N digits (default: 12). Use 0 to disable.",
+    )
+    p7.set_defaults(func=build_items_sync_new)
+
+    p8 = sub.add_parser("export_countries", help="Export Odoo countries + build Sage parity table (address only)")
+    p8.add_argument(
         "--customers-sync",
         default=r"ENZO-Sage50\_master\customers_sync.csv",
     )
-    p5.add_argument(
+    p8.add_argument(
         "--customers-master",
         default=r"ENZO-Sage50\_master_sage\customers.csv",
     )
-    p5.add_argument(
+    p8.add_argument(
         "--odoo-customers",
         default=r"ENZO-Sage50\_master_odoo\customers_odoo.csv",
     )
-    p5.add_argument(
+    p8.add_argument(
         "--env-file",
         default=".env",
     )
-    p5.add_argument(
+    p8.add_argument(
         "--batch-size",
         type=int,
         default=1000,
         help="Batch size for Odoo export",
     )
-    p5.set_defaults(func=export_countries)
+    p8.set_defaults(func=export_countries)
 
     return parser
 
