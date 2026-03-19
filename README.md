@@ -9,10 +9,19 @@ python sage_odoo_parity.py refresh_odoo
 python sage_odoo_parity.py sync
 python sage_odoo_parity.py build_contacts_sync
 python sage_odoo_parity.py build_contacts
+python sage_odoo_parity.py build_addresses_sync
+python sage_odoo_parity.py build_delivery_addresses
 python sage_odoo_parity.py build_product_sync --year-month 2026_02
 python sage_odoo_parity.py build_items_sync_new
 python sage_odoo_parity.py export_countries
 ```
+
+Code layout (March 19, 2026):
+- `sage_odoo_parity.py` — CLI entrypoint (argparse) and core orchestration
+- `sync_customers.py` — shared helpers (CSV, env, normalization) used by flows
+- `sync_contacts.py` — contacts flow (build contacts sync + import XLSX)
+- `sync_products.py` — product sync + items_sync_NEW
+- `sync_parity.py` — countries/states export + parity tables
 
 Folder layout:
 - `ENZO-Sage50/_master_sage/` — Sage **general/master** exports (non-temporal tables like Customers, Items, Address, Contacts)
@@ -162,6 +171,8 @@ C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage
   - Country uses `country_parity.csv` (ISO2). If no match, keep the Sage value.
   - State uses `state_parity.csv` to map code → full name.
   - If country is missing but the state matches, infer country from state (US/Canada, etc.).
+Pending (stores / delivery addresses):
+We currently use the primary Address as the company address. Additional addresses (stores, delivery locations, or any AddressTypeNumber ≠ 0) will be handled later as a separate flow, likely as child delivery addresses similar to Contacts in Odoo.
 
 ### Contact logic (primary contact)
 - Child contacts are now exported in a **separate import file** after parent companies exist in Odoo.
@@ -180,6 +191,16 @@ C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage
   - `ENZO-Sage50/_master/customer_contacts_sync.csv`
   - This matches Sage primary contacts to existing Odoo contacts from:
     - `ENZO-Sage50/_master_odoo/customers_contacts.csv` (exported by `refresh_odoo`)
+
+### Addresses sync (new, draft)
+- `python sage_odoo_parity.py build_addresses_sync` builds:
+  - `ENZO-Sage50/_master/customer_delivery_addresses_sync.csv`
+- Current logic (draft):
+  - Source contacts are **non-primary** Sage contacts that have an `AddressRecordNumber`.
+  - Join is `contacts.AddressRecordNumber` ↔ `address.AddressRecordNumber`.
+  - Delivery name comes from `contacts.CompanyName`.
+  - Matches Odoo delivery addresses using `ParentId` + name or address fields.
+  - `Mail To` and other non-delivery address types are **not handled yet**.
 
 ### Product sync (new)
 - `python sage_odoo_parity.py build_product_sync --year-month YYYY_MM`

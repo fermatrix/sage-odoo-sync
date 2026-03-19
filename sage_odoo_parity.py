@@ -1,110 +1,28 @@
 import argparse
 import csv
 import os
-import glob
 from datetime import datetime
-from typing import Dict, List, Tuple
-import html
-import re
+from typing import Dict, List
 from difflib import SequenceMatcher
 from collections import defaultdict
 
-try:
-    import xmlrpc.client as xmlrpc_client
-except Exception:
-    xmlrpc_client = None
+from sync_customers import (
+    DELIMITER,
+    truthy,
+    normalize_name,
+    sanitize_external_id,
+    parse_date,
+    read_csv,
+    write_csv,
+    load_env_file,
+    get_env_value,
+)
+from sync_contacts import build_contacts_sync, build_contacts_import
+from sync_addresses import build_addresses_sync, build_delivery_import
+from sync_parity import OdooClient, export_countries
+from sync_products import build_product_sync, build_items_sync_new
 
 
-DELIMITER = ";"
-
-
-def truthy(value: str) -> bool:
-    if value is None:
-        return False
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "t"}
-
-
-def normalize_name(value: str) -> str:
-    if not value:
-        return ""
-    v = html.unescape(value).lower()
-    v = v.replace("&", " and ")
-    v = re.sub(r"[^a-z0-9]+", " ", v)
-    v = re.sub(r"\s+", " ", v).strip()
-    return v
-
-
-def sanitize_external_id(value: str) -> str:
-    if not value:
-        return ""
-    v = str(value).strip()
-    if not v:
-        return ""
-    # Odoo XML IDs cannot contain spaces.
-    v = re.sub(r"\s+", "_", v)
-    return v
-
-
-def parse_date(value: str):
-    if not value:
-        return None
-    raw = value.strip()
-    if not raw:
-        return None
-    # Strip common time suffixes if present.
-    if " " in raw:
-        raw = raw.split(" ", 1)[0].strip()
-    formats = [
-        "%Y-%m-%d",
-        "%m/%d/%Y",
-        "%d/%m/%Y",
-        "%Y/%m/%d",
-        "%m-%d-%Y",
-        "%d-%m-%Y",
-    ]
-    for fmt in formats:
-        try:
-            return datetime.strptime(raw, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
-
-
-def read_csv(path: str) -> Tuple[List[str], List[Dict[str, str]]]:
-    with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter=DELIMITER)
-        rows = [dict(r) for r in reader]
-        return reader.fieldnames or [], rows
-
-
-def write_csv(path: str, fieldnames: List[str], rows: List[Dict[str, str]]) -> None:
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter=DELIMITER)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
-
-
-def load_env_file(path: str) -> Dict[str, str]:
-    env: Dict[str, str] = {}
-    if not os.path.exists(path):
-        return env
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            env[key.strip()] = value.strip()
-    return env
-
-
-def get_env_value(env: Dict[str, str], key: str, fallback: str = "") -> str:
-    return os.environ.get(key) or env.get(key) or fallback
 
 
 def refresh_sage(args: argparse.Namespace) -> int:
@@ -449,483 +367,6 @@ def refresh_sage(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_primary_contacts(contacts_master_path: str) -> Dict[str, Dict[str, str]]:
-    primary_contact_by_customer_record: Dict[str, Dict[str, str]] = {}
-    if os.path.exists(contacts_master_path):
-        _, contact_rows = read_csv(contacts_master_path)
-        for r in contact_rows:
-            crn = (r.get("CustomerRecord") or "").strip()
-            if not crn:
-                continue
-            if (r.get("IsPrimaryContact") or "").strip() != "1":
-                continue
-            existing = primary_contact_by_customer_record.get(crn)
-            if not existing:
-                primary_contact_by_customer_record[crn] = r
-                continue
-            try:
-                new_num = int((r.get("RecordNumber") or "0").strip() or 0)
-            except ValueError:
-                new_num = 0
-            try:
-                old_num = int((existing.get("RecordNumber") or "0").strip() or 0)
-            except ValueError:
-                old_num = 0
-            if new_num and (old_num == 0 or new_num < old_num):
-                primary_contact_by_customer_record[crn] = r
-    return primary_contact_by_customer_record
-
-
-def _load_customers_by_record(customers_sync: str) -> Dict[str, Dict[str, str]]:
-    _, sync_rows = read_csv(customers_sync)
-    customers_by_record: Dict[str, Dict[str, str]] = {}
-    for r in sync_rows:
-        crn = (r.get("CustomerRecordNumber") or "").strip()
-        if not crn:
-            continue
-        customers_by_record[crn] = r
-    return customers_by_record
-
-
-def _load_existing_contacts_by_parent_csv(odoo_contacts_path: str) -> Dict[int, List[Dict[str, str]]]:
-    existing_by_parent: Dict[int, List[Dict[str, str]]] = {}
-    _, rows = read_csv(odoo_contacts_path)
-    for r in rows:
-        parent_id = (r.get("ParentId") or "").strip()
-        contact_id = (r.get("OdooId") or "").strip()
-        if not parent_id or not contact_id:
-            continue
-        try:
-            pid = int(parent_id)
-        except ValueError:
-            continue
-        existing_by_parent.setdefault(pid, []).append({
-            "id": contact_id,
-            "name": (r.get("OdooName") or "").strip(),
-            "email": (r.get("OdooEmail") or "").strip(),
-            "phone": (r.get("OdooPhone") or "").strip(),
-        })
-    return existing_by_parent
-
-
-def _norm_email(value: str) -> str:
-    return (value or "").strip().lower()
-
-
-def _norm_phone(value: str) -> str:
-    return re.sub(r"\\D+", "", (value or ""))
-
-
-def _match_contact(parent_rows: List[Dict[str, str]], name: str, email: str, phone: str):
-    if not parent_rows:
-        return None
-    n_name = normalize_name(name)
-    n_email = _norm_email(email)
-    n_phone = _norm_phone(phone)
-    for r in parent_rows:
-        r_email = _norm_email(r.get("email", ""))
-        r_phone = _norm_phone(r.get("phone", ""))
-        r_name = normalize_name(r.get("name", ""))
-        if n_email and r_email and n_email == r_email:
-            return r.get("id")
-        if n_name and r_name and n_name == r_name:
-            if n_phone and r_phone and n_phone == r_phone:
-                return r.get("id")
-            if not n_email and not r_email:
-                return r.get("id")
-    return None
-
-
-def build_contacts_sync(args: argparse.Namespace) -> int:
-    customers_sync = args.customers_sync
-    customers_master = args.customers_master
-    contacts_sync = args.contacts_sync
-    odoo_contacts = args.odoo_contacts
-
-    if not os.path.exists(customers_sync):
-        print(f"ERROR: customers sync file not found: {customers_sync}")
-        return 2
-    if not os.path.exists(customers_master):
-        print(f"ERROR: customers master not found: {customers_master}")
-        return 2
-    if not os.path.exists(odoo_contacts):
-        print(f"ERROR: odoo contacts file not found: {odoo_contacts}")
-        print("Run: python sage_odoo_parity.py refresh_odoo")
-        return 2
-
-    customers_by_record = _load_customers_by_record(customers_sync)
-    contacts_master_path = os.path.join(os.path.dirname(customers_master), "contacts.csv")
-    primary_contact_by_customer_record = _load_primary_contacts(contacts_master_path)
-    existing_by_parent = _load_existing_contacts_by_parent_csv(odoo_contacts)
-
-    fieldnames = [
-        "ContactId",
-        "FirstName",
-        "LastName",
-        "CustomerRecordNumber",
-        "CustomerId",
-        "ContactExternalId",
-        "OdooContactId",
-        "OdooParentId",
-        "LastLookupAt",
-    ]
-    rows_out: List[Dict[str, str]] = []
-    now_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for crn, customer in customers_by_record.items():
-        primary = primary_contact_by_customer_record.get(crn)
-        if not primary:
-            continue
-        odoo_id = (customer.get("OdooId") or "").strip()
-        parent_id_int = None
-        if odoo_id:
-            try:
-                parent_id_int = int(odoo_id)
-            except ValueError:
-                parent_id_int = None
-
-        cid = (customer.get("CustomerID") or "").strip()
-        first = (primary.get("FirstName") or "").strip()
-        last = (primary.get("LastName") or "").strip()
-        contact_name = " ".join([p for p in [first, last] if p]).strip()
-        if not contact_name:
-            contact_name = (primary.get("CompanyName") or "").strip()
-        contact_rec = (primary.get("RecordNumber") or "").strip()
-        contact_phone = (primary.get("Telephone1") or "").strip()
-        contact_email = (primary.get("Email") or "").strip()
-
-        raw_ext = f"{cid}_{contact_rec}" if contact_rec and cid else (f"{cid}_contact" if cid else "")
-        ext_id = sanitize_external_id(raw_ext)
-
-        match_id = None
-        if parent_id_int:
-            match_id = _match_contact(existing_by_parent.get(parent_id_int, []), contact_name, contact_email, contact_phone)
-
-        rows_out.append({
-            "ContactId": contact_rec,
-            "FirstName": first,
-            "LastName": last,
-            "CustomerRecordNumber": crn,
-            "CustomerId": cid,
-            "ContactExternalId": ext_id,
-            "OdooContactId": str(match_id or ""),
-            "OdooParentId": odoo_id,
-            "LastLookupAt": now_stamp,
-        })
-
-    write_csv(contacts_sync, fieldnames, rows_out)
-    print(f"OK: contacts sync rows: {len(rows_out)} -> {contacts_sync}")
-    return 0
-
-
-def build_contacts_import(args: argparse.Namespace) -> int:
-    try:
-        from openpyxl import load_workbook
-    except Exception:
-        load_workbook = None
-
-    if load_workbook is None:
-        print("ERROR: openpyxl not available for XLSX export")
-        return 2
-
-    contacts_sync = args.contacts_sync
-    template_path = args.template_path
-
-    if not os.path.exists(contacts_sync):
-        print(f"ERROR: contacts sync file not found: {contacts_sync}")
-        print("Run: python sage_odoo_parity.py build_contacts_sync")
-        return 2
-    if not os.path.exists(template_path):
-        print(f"ERROR: template not found: {template_path}")
-        return 2
-
-    master_root = os.path.dirname(contacts_sync)
-    odoo_imports = os.path.join(master_root, "odoo_imports")
-    os.makedirs(odoo_imports, exist_ok=True)
-
-    stamp = datetime.now().strftime("%Y%m%d")
-    contacts_out_xlsx = os.path.join(odoo_imports, f"{stamp}_customers_contacts_NEW.xlsx")
-
-    sync_fields, sync_rows = read_csv(contacts_sync)
-    # Load Sage contacts master to enrich email/phone/title/notes
-    master_root = os.path.dirname(contacts_sync)
-    contacts_master_path = os.path.join(os.path.dirname(master_root), "_master_sage", "contacts.csv")
-    contacts_by_key = {}
-    contacts_by_customer = {}
-    if os.path.exists(contacts_master_path):
-        _, contact_rows = read_csv(contacts_master_path)
-        for r in contact_rows:
-            crn = (r.get("CustomerRecord") or "").strip()
-            rec = (r.get("RecordNumber") or "").strip()
-            if crn and rec:
-                contacts_by_key[(crn, rec)] = r
-            if crn:
-                contacts_by_customer.setdefault(crn, []).append(r)
-
-    wb = load_workbook(template_path)
-    ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
-    header_map = {}
-    for col_idx in range(1, ws.max_column + 1):
-        header = ws.cell(row=1, column=col_idx).value
-        if header:
-            header_map[str(header).strip()] = col_idx
-
-    def set_cell(col_name: str, value: str) -> None:
-        col_idx = header_map.get(col_name)
-        if col_idx:
-            ws.cell(row=row_idx, column=col_idx, value=value)
-
-    ws.delete_rows(2, ws.max_row)
-    row_idx = 2
-    emitted = 0
-    new_rows: List[Dict[str, str]] = []
-    for r in sync_rows:
-        if (r.get("OdooContactId") or "").strip():
-            continue
-        parent_id = (r.get("OdooParentId") or "").strip()
-        if not parent_id:
-            continue
-        new_rows.append(r)
-        first = (r.get("FirstName") or "").strip()
-        last = (r.get("LastName") or "").strip()
-        contact_name = " ".join([p for p in [first, last] if p]).strip()
-        if not contact_name:
-            # Skip contacts with no name to avoid generic placeholders
-            continue
-        crn = (r.get("CustomerRecordNumber") or "").strip()
-        contact_id = (r.get("ContactId") or "").strip()
-        sage_row = None
-        if crn and contact_id:
-            sage_row = contacts_by_key.get((crn, contact_id))
-        if not sage_row and crn:
-            candidates = contacts_by_customer.get(crn, [])
-            if len(candidates) == 1:
-                sage_row = candidates[0]
-        email = (sage_row.get("Email") or "").strip() if sage_row else ""
-        phone = (sage_row.get("Telephone1") or "").strip() if sage_row else ""
-        job = (sage_row.get("Title") or "").strip() if sage_row else ""
-        notes = (sage_row.get("Notes") or "").strip() if sage_row else ""
-        set_cell("External_ID", (r.get("ContactExternalId") or "").strip())
-        set_cell("Parent/Database ID", parent_id)
-        set_cell("is_company", 0)
-        set_cell("Name", contact_name)
-        set_cell("Email", email)
-        set_cell("Phone", phone)
-        set_cell("Job Position", job)
-        set_cell("Notes", notes)
-        set_cell("Language", "English (US)")
-        row_idx += 1
-        emitted += 1
-
-    wb.save(contacts_out_xlsx)
-    if sync_fields:
-        master_root = os.path.dirname(contacts_sync)
-        new_csv = os.path.join(master_root, "customer_contacts_sync_NEW.csv")
-        write_csv(new_csv, sync_fields, new_rows)
-    print(f"OK: contacts new rows: {emitted} -> {contacts_out_xlsx}")
-    return 0
-
-
-def _pick_latest(paths: List[str]) -> str:
-    if not paths:
-        return ""
-    return max(paths, key=lambda p: os.path.getmtime(p))
-
-
-def build_product_sync(args: argparse.Namespace) -> int:
-    year_month = args.year_month
-    base_dir = args.base_dir
-    items_master = args.items_master
-    items_sync = args.items_sync
-    out_path = args.out_path.replace("{year_month}", year_month)
-
-    if not os.path.exists(items_master):
-        print(f"ERROR: items master not found: {items_master}")
-        return 2
-    if not os.path.exists(items_sync):
-        print(f"ERROR: items sync not found: {items_sync}")
-        return 2
-
-    inv_glob = os.path.join(base_dir, "**", f"{year_month}_invoice_lines.csv")
-    cn_glob = os.path.join(base_dir, "**", f"{year_month}_credit_note_lines.csv")
-    inv_paths = glob.glob(inv_glob, recursive=True)
-    cn_paths = glob.glob(cn_glob, recursive=True)
-    if not inv_paths:
-        print(f"ERROR: invoice lines not found for {year_month} (search: {inv_glob})")
-        return 2
-    if not cn_paths:
-        print(f"ERROR: credit note lines not found for {year_month} (search: {cn_glob})")
-        return 2
-
-    invoice_lines = _pick_latest(inv_paths)
-    credit_lines = _pick_latest(cn_paths)
-    if len(inv_paths) > 1:
-        print(f"WARNING: multiple invoice_lines found, using latest: {invoice_lines}")
-    if len(cn_paths) > 1:
-        print(f"WARNING: multiple credit_note_lines found, using latest: {credit_lines}")
-
-    # Load invoice + credit note lines
-    _, inv_rows = read_csv(invoice_lines)
-    _, cn_rows = read_csv(credit_lines)
-    item_records = set()
-    for row in inv_rows + cn_rows:
-        rec = (row.get("ItemRecordNumber") or "").strip()
-        if rec:
-            item_records.add(rec)
-    item_records.discard("0")
-
-    # Load items master + sync
-    _, master_rows = read_csv(items_master)
-    master_by_record = { (r.get("ItemRecordNumber") or "").strip(): r for r in master_rows }
-
-    _, sync_rows = read_csv(items_sync)
-    sync_by_record = { (r.get("ItemRecordNumber") or "").strip(): r for r in sync_rows }
-
-    fieldnames = [
-        "ItemRecordNumber",
-        "ItemID",
-        "ItemDescription",
-        "SalesDescription",
-        "Barcode",
-        "OdooVariantId",
-        "OdooName",
-        "OdooVariantName",
-        "OdooItemCode",
-        "OdooColor",
-        "Reason",
-    ]
-    rows_out: List[Dict[str, str]] = []
-    for rec in sorted(item_records, key=lambda x: int(x) if x.isdigit() else x):
-        sync = sync_by_record.get(rec)
-        reason = ""
-        if not sync:
-            reason = "NO_SYNC"
-        else:
-            if not (sync.get("OdooVariantId") or "").strip():
-                reason = "NO_ODOO"
-        if not reason:
-            continue
-        master = master_by_record.get(rec, {})
-        rows_out.append({
-            "ItemRecordNumber": rec,
-            "ItemID": (sync.get("ItemID") or master.get("ItemID") or "").strip(),
-            "ItemDescription": (sync.get("ItemDescription") or master.get("ItemDescription") or "").strip(),
-            "SalesDescription": (master.get("SalesDescription") or "").strip(),
-            "Barcode": (master.get("UPC_SKU") or "").strip(),
-            "OdooVariantId": (sync.get("OdooVariantId") or "").strip(),
-            "OdooName": (sync.get("OdooName") or "").strip(),
-            "OdooVariantName": (sync.get("OdooVariantName") or "").strip(),
-            "OdooItemCode": (sync.get("OdooItemCode") or "").strip(),
-            "OdooColor": (sync.get("OdooColor") or "").strip(),
-            "Reason": reason,
-        })
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    write_csv(out_path, fieldnames, rows_out)
-    print(f"OK: product sync rows: {len(rows_out)} -> {out_path}")
-    return 0
-
-
-def build_items_sync_new(args: argparse.Namespace) -> int:
-    items_sync = args.items_sync
-    out_path = args.out_path
-    barcode_digits = None if args.barcode_digits == 0 else args.barcode_digits
-    invoice_base_dir = args.invoice_base_dir
-
-    if not os.path.exists(items_sync):
-        print(f"ERROR: items sync not found: {items_sync}")
-        return 2
-
-    fields, rows = read_csv(items_sync)
-    if not fields:
-        print(f"ERROR: items sync has no headers: {items_sync}")
-        return 2
-
-    # Build invoiced set for 2026 (Feb + Mar)
-    invoiced = set()
-    if invoice_base_dir:
-        targets = [
-            os.path.join(invoice_base_dir, "**", "2026_02_invoice_lines.csv"),
-            os.path.join(invoice_base_dir, "**", "2026_03_invoice_lines.csv"),
-        ]
-        matched = []
-        for pattern in targets:
-            matched.extend(glob.glob(pattern, recursive=True))
-        if not matched:
-            print("WARNING: no invoice_lines found for 2026_02 or 2026_03")
-        for path in matched:
-            try:
-                _, inv_rows = read_csv(path)
-            except Exception:
-                continue
-            for r in inv_rows:
-                rec = (r.get("ItemRecordNumber") or "").strip()
-                if rec:
-                    invoiced.add(rec)
-
-    def is_barcode_ok(value: str) -> bool:
-        v = (value or "").strip()
-        if not v:
-            return False
-        if barcode_digits is None:
-            return True
-        return v.isdigit() and len(v) >= barcode_digits
-
-    filtered = []
-    for r in rows:
-        if (r.get("OdooVariantId") or "").strip():
-            continue
-        if not is_barcode_ok(r.get("Barcode", "")):
-            continue
-        if invoiced:
-            r["Invoiced2026"] = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""
-        filtered.append(r)
-
-    out_fields = list(fields)
-    if "Invoiced2026" not in out_fields:
-        if "LastLookupAt" in out_fields:
-            idx = out_fields.index("LastLookupAt")
-            out_fields.insert(idx, "Invoiced2026")
-        else:
-            out_fields.append("Invoiced2026")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    write_csv(out_path, out_fields, filtered)
-    print(f"OK: items sync NEW rows: {len(filtered)} -> {out_path}")
-    return 0
-
-
-class OdooClient:
-    def __init__(self, url: str, db: str, user: str, apikey: str):
-        if xmlrpc_client is None:
-            raise RuntimeError("xmlrpc.client unavailable")
-        self.url = url.rstrip("/")
-        self.db = db
-        self.user = user
-        self.apikey = apikey
-        self.common = xmlrpc_client.ServerProxy(f"{self.url}/xmlrpc/2/common")
-        self.models = xmlrpc_client.ServerProxy(f"{self.url}/xmlrpc/2/object")
-        self.uid = self.common.authenticate(self.db, self.user, self.apikey, {})
-        if not self.uid:
-            raise RuntimeError("Odoo authentication failed")
-
-    def search_read(
-        self,
-        model: str,
-        domain: List,
-        fields: List[str],
-        limit: int = 2,
-        offset: int = 0,
-    ):
-        return self.models.execute_kw(
-            self.db,
-            self.uid,
-            self.apikey,
-            model,
-            "search_read",
-            [domain],
-            {"fields": fields, "limit": limit, "offset": offset},
-        )
-
-
 def refresh_odoo(args: argparse.Namespace) -> int:
     env = load_env_file(args.env_file)
     url = get_env_value(env, "ODOO_STUDIOOPTYX_URL")
@@ -1005,6 +446,200 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 })
             offset += len(rows)
 
+    # Export child partners excluding delivery (contacts + other non-delivery child records)
+    children_out = os.path.join(os.path.dirname(customers_out), "customers_child_partners.csv")
+    children_fields = [
+        "OdooId",
+        "ParentId",
+        "ParentName",
+        "OdooName",
+        "Type",
+        "Street",
+        "Street2",
+        "City",
+        "Zip",
+        "State",
+        "Country",
+        "OdooEmail",
+        "OdooPhone",
+        "Active",
+    ]
+    with open(children_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=children_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "res.partner",
+                [["parent_id", "!=", False], ["type", "!=", "delivery"]],
+                [
+                    "id",
+                    "parent_id",
+                    "name",
+                    "type",
+                    "street",
+                    "street2",
+                    "city",
+                    "zip",
+                    "state_id",
+                    "country_id",
+                    "email",
+                    "phone",
+                    "active",
+                ],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                parent = r.get("parent_id") or []
+                parent_id = parent[0] if isinstance(parent, list) and parent else ""
+                parent_name = parent[1] if isinstance(parent, list) and len(parent) > 1 else ""
+                state = r.get("state_id") or []
+                country = r.get("country_id") or []
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "ParentId": parent_id,
+                    "ParentName": parent_name,
+                    "OdooName": r.get("name", "") or "",
+                    "Type": r.get("type", "") or "",
+                    "Street": r.get("street", "") or "",
+                    "Street2": r.get("street2", "") or "",
+                    "City": r.get("city", "") or "",
+                    "Zip": r.get("zip", "") or "",
+                    "State": state[1] if isinstance(state, list) and len(state) > 1 else "",
+                    "Country": country[1] if isinstance(country, list) and len(country) > 1 else "",
+                    "OdooEmail": r.get("email", "") or "",
+                    "OdooPhone": r.get("phone", "") or "",
+                    "Active": r.get("active", ""),
+                })
+            offset += len(rows)
+
+    # Export all child partners (no type filter) for inspection
+    children_all_out = os.path.join(os.path.dirname(customers_out), "customers_child_partners_all.csv")
+    with open(children_all_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=children_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "res.partner",
+                [["parent_id", "!=", False]],
+                [
+                    "id",
+                    "parent_id",
+                    "name",
+                    "type",
+                    "street",
+                    "street2",
+                    "city",
+                    "zip",
+                    "state_id",
+                    "country_id",
+                    "email",
+                    "phone",
+                    "active",
+                ],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                parent = r.get("parent_id") or []
+                parent_id = parent[0] if isinstance(parent, list) and parent else ""
+                parent_name = parent[1] if isinstance(parent, list) and len(parent) > 1 else ""
+                state = r.get("state_id") or []
+                country = r.get("country_id") or []
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "ParentId": parent_id,
+                    "ParentName": parent_name,
+                    "OdooName": r.get("name", "") or "",
+                    "Type": r.get("type", "") or "",
+                    "Street": r.get("street", "") or "",
+                    "Street2": r.get("street2", "") or "",
+                    "City": r.get("city", "") or "",
+                    "Zip": r.get("zip", "") or "",
+                    "State": state[1] if isinstance(state, list) and len(state) > 1 else "",
+                    "Country": country[1] if isinstance(country, list) and len(country) > 1 else "",
+                    "OdooEmail": r.get("email", "") or "",
+                    "OdooPhone": r.get("phone", "") or "",
+                    "Active": r.get("active", ""),
+                })
+            offset += len(rows)
+
+    # Export Odoo delivery addresses (res.partner type=delivery)
+    delivery_out = os.path.join(os.path.dirname(customers_out), "customers_delivery_addresses.csv")
+    delivery_fields = [
+        "OdooId",
+        "ParentId",
+        "ParentName",
+        "OdooName",
+        "Type",
+        "Street",
+        "Street2",
+        "City",
+        "Zip",
+        "State",
+        "Country",
+        "OdooEmail",
+        "OdooPhone",
+        "Active",
+    ]
+    with open(delivery_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=delivery_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "res.partner",
+                [["parent_id", "!=", False], ["type", "=", "delivery"]],
+                [
+                    "id",
+                    "parent_id",
+                    "name",
+                    "type",
+                    "street",
+                    "street2",
+                    "city",
+                    "zip",
+                    "state_id",
+                    "country_id",
+                    "email",
+                    "phone",
+                    "active",
+                ],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                parent = r.get("parent_id") or []
+                parent_id = parent[0] if isinstance(parent, list) and parent else ""
+                parent_name = parent[1] if isinstance(parent, list) and len(parent) > 1 else ""
+                state = r.get("state_id") or []
+                country = r.get("country_id") or []
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "ParentId": parent_id,
+                    "ParentName": parent_name,
+                    "OdooName": r.get("name", "") or "",
+                    "Type": r.get("type", "") or "",
+                    "Street": r.get("street", "") or "",
+                    "Street2": r.get("street2", "") or "",
+                    "City": r.get("city", "") or "",
+                    "Zip": r.get("zip", "") or "",
+                    "State": state[1] if isinstance(state, list) and len(state) > 1 else "",
+                    "Country": country[1] if isinstance(country, list) and len(country) > 1 else "",
+                    "OdooEmail": r.get("email", "") or "",
+                    "OdooPhone": r.get("phone", "") or "",
+                    "Active": r.get("active", ""),
+                })
+            offset += len(rows)
+
     item_fields = ["OdooVariantId", "OdooName", "OdooVariantName", "OdooItemCode", "OdooColor", "Active"]
     with open(items_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=item_fields, delimiter=DELIMITER)
@@ -1064,217 +699,10 @@ def refresh_odoo(args: argparse.Namespace) -> int:
 
     print(f"OK: odoo customers exported -> {customers_out}")
     print(f"OK: odoo contacts exported -> {contacts_out}")
+    print(f"OK: odoo child partners exported -> {children_out}")
+    print(f"OK: odoo child partners (all) exported -> {children_all_out}")
+    print(f"OK: odoo delivery addresses exported -> {delivery_out}")
     print(f"OK: odoo items exported -> {items_out}")
-    return 0
-
-
-def export_countries(args: argparse.Namespace) -> int:
-    env = load_env_file(args.env_file)
-    url = get_env_value(env, "ODOO_STUDIOOPTYX_URL")
-    db = get_env_value(env, "ODOO_STUDIOOPTYX_DB")
-    user = get_env_value(env, "ODOO_STUDIOOPTYX_USER")
-    apikey = get_env_value(env, "ODOO_STUDIOOPTYX_APIKEY")
-
-    if not (url and db and user and apikey):
-        print("ERROR: missing Odoo credentials (URL/DB/USER/APIKEY)")
-        return 2
-
-    client = OdooClient(url, db, user, apikey)
-
-    customers_master = args.customers_master
-    if not os.path.exists(customers_master):
-        print(f"ERROR: customers master not found: {customers_master}")
-        return 2
-
-    master_root = os.path.dirname(args.customers_sync)
-    master_odoo_root = os.path.dirname(args.odoo_customers)
-    os.makedirs(master_odoo_root, exist_ok=True)
-
-    countries_out = os.path.join(master_odoo_root, "countries_odoo.csv")
-    states_out = os.path.join(master_odoo_root, "states_odoo.csv")
-    parity_out = os.path.join(master_root, "country_parity.csv")
-    state_parity_out = os.path.join(master_root, "state_parity.csv")
-
-    # Export Odoo countries (id, name, code)
-    fields = ["id", "name", "code"]
-    offset = 0
-    batch = args.batch_size
-    countries = []
-    while True:
-        rows = client.search_read("res.country", [], fields, limit=batch, offset=offset)
-        if not rows:
-            break
-        countries.extend(rows)
-        offset += len(rows)
-
-    countries.sort(key=lambda r: (r.get("name") or ""))
-    with open(countries_out, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["OdooId", "OdooName", "OdooCode"], delimiter=DELIMITER)
-        writer.writeheader()
-        for r in countries:
-            writer.writerow({
-                "OdooId": r.get("id", ""),
-                "OdooName": r.get("name", "") or "",
-                "OdooCode": r.get("code", "") or "",
-            })
-
-    # Build parity from Sage Address.Country (AddressTypeNumber = 0 only)
-    address_master_path = os.path.join(os.path.dirname(customers_master), "address.csv")
-    if not os.path.exists(address_master_path):
-        print(f"ERROR: address master not found: {address_master_path}")
-        return 2
-
-    _, address_rows = read_csv(address_master_path)
-    sage_counts: Dict[str, int] = {}
-    for r in address_rows:
-        addr_type = (r.get("AddressTypeNumber") or "").strip()
-        if addr_type != "0":
-            continue
-        raw = (r.get("Country") or "").strip()
-        if not raw:
-            continue
-        sage_counts[raw] = sage_counts.get(raw, 0) + 1
-
-    # Build quick match suggestions (exact match on ISO2 code or country name)
-    by_code = {}
-    by_name = {}
-    for r in countries:
-        code = (r.get("code") or "").strip().upper()
-        name = (r.get("name") or "").strip().upper()
-        if code:
-            by_code[code] = r
-        if name:
-            by_name[name] = r
-
-    def suggest(raw: str):
-        key = raw.strip().upper()
-        if key in by_code:
-            return by_code[key], "code"
-        if key in by_name:
-            return by_name[key], "name"
-        return None, ""
-
-    with open(parity_out, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "sage_country_raw",
-                "count_address",
-                "odoo_country_name",
-                "odoo_country_code",
-                "match_type",
-            ],
-            delimiter=DELIMITER,
-        )
-        writer.writeheader()
-        for raw in sorted(sage_counts.keys(), key=lambda k: sage_counts[k], reverse=True):
-            match, match_type = suggest(raw)
-            writer.writerow({
-                "sage_country_raw": raw,
-                "count_address": sage_counts[raw],
-                "odoo_country_name": (match.get("name") if match else "") or "",
-                "odoo_country_code": (match.get("code") if match else "") or "",
-                "match_type": match_type,
-            })
-
-    print(f"OK: odoo countries exported -> {countries_out}")
-    print(f"OK: country parity (address only) -> {parity_out}")
-
-    # Export Odoo states (id, name, code, country)
-    state_fields = ["id", "name", "code", "country_id"]
-    offset = 0
-    states = []
-    while True:
-        rows = client.search_read("res.country.state", [], state_fields, limit=batch, offset=offset)
-        if not rows:
-            break
-        states.extend(rows)
-        offset += len(rows)
-
-    with open(states_out, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["OdooId", "OdooName", "OdooCode", "OdooCountryId", "OdooCountryName"],
-            delimiter=DELIMITER,
-        )
-        writer.writeheader()
-        for r in states:
-            country = r.get("country_id") or []
-            writer.writerow({
-                "OdooId": r.get("id", ""),
-                "OdooName": r.get("name", "") or "",
-                "OdooCode": r.get("code", "") or "",
-                "OdooCountryId": country[0] if isinstance(country, list) and country else "",
-                "OdooCountryName": country[1] if isinstance(country, list) and len(country) > 1 else "",
-            })
-
-    # Build state parity from Sage Address.State (AddressTypeNumber = 0 only)
-    sage_state_counts: Dict[str, int] = {}
-    for r in address_rows:
-        addr_type = (r.get("AddressTypeNumber") or "").strip()
-        if addr_type != "0":
-            continue
-        raw = (r.get("State") or "").strip()
-        if not raw:
-            continue
-        sage_state_counts[raw] = sage_state_counts.get(raw, 0) + 1
-
-    by_state_code = {}
-    for r in states:
-        code = (r.get("code") or "").strip().upper()
-        if not code:
-            continue
-        by_state_code.setdefault(code, []).append(r)
-
-    def suggest_state(raw: str):
-        key = raw.strip().upper()
-        options = by_state_code.get(key, [])
-        if not options:
-            return None, ""
-        # Prefer US/CA if multiple matches
-        preferred = None
-        for r in options:
-            country = r.get("country_id") or []
-            cname = country[1] if isinstance(country, list) and len(country) > 1 else ""
-            ccode = ""
-            if cname:
-                if cname.lower() in {"united states", "united states of america"}:
-                    preferred = (r, "code:US")
-                    break
-                if cname.lower() == "canada":
-                    preferred = (r, "code:CA")
-        if preferred:
-            return preferred
-        return options[0], "code"
-
-    with open(state_parity_out, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "sage_state_raw",
-                "count_address",
-                "odoo_state_name",
-                "odoo_state_code",
-                "odoo_country_name",
-                "match_type",
-            ],
-            delimiter=DELIMITER,
-        )
-        writer.writeheader()
-        for raw in sorted(sage_state_counts.keys(), key=lambda k: sage_state_counts[k], reverse=True):
-            match, match_type = suggest_state(raw)
-            country = match.get("country_id") if match else []
-            writer.writerow({
-                "sage_state_raw": raw,
-                "count_address": sage_state_counts[raw],
-                "odoo_state_name": (match.get("name") if match else "") or "",
-                "odoo_state_code": (match.get("code") if match else "") or "",
-                "odoo_country_name": (country[1] if isinstance(country, list) and len(country) > 1 else "") or "",
-                "match_type": match_type,
-            })
-
-    print(f"OK: odoo states exported -> {states_out}")
-    print(f"OK: state parity (address only) -> {state_parity_out}")
     return 0
 
 
@@ -1624,6 +1052,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"ENZO-Sage50\_master\odoo_templates\customer_contacts.xlsx",
     )
     p5.set_defaults(func=build_contacts_import)
+
+    p5b = sub.add_parser("build_addresses_sync", help="Build delivery addresses sync file from Sage contacts + addresses")
+    p5b.add_argument(
+        "--contacts-master",
+        default=r"ENZO-Sage50\_master_sage\contacts.csv",
+    )
+    p5b.add_argument(
+        "--address-master",
+        default=r"ENZO-Sage50\_master_sage\address.csv",
+    )
+    p5b.add_argument(
+        "--customers-sync",
+        default=r"ENZO-Sage50\_master\customers_sync.csv",
+    )
+    p5b.add_argument(
+        "--odoo-delivery",
+        default=r"ENZO-Sage50\_master_odoo\customers_delivery_addresses.csv",
+    )
+    p5b.add_argument(
+        "--country-parity",
+        default=r"ENZO-Sage50\_master\country_parity.csv",
+    )
+    p5b.add_argument(
+        "--state-parity",
+        default=r"ENZO-Sage50\_master\state_parity.csv",
+    )
+    p5b.add_argument(
+        "--countries-odoo",
+        default=r"ENZO-Sage50\_master_odoo\countries_odoo.csv",
+    )
+    p5b.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\customer_delivery_addresses_sync.csv",
+    )
+    p5b.set_defaults(func=build_addresses_sync)
+
+    p5c = sub.add_parser("build_delivery_addresses", help="Build delivery address import XLSX from sync file")
+    p5c.add_argument(
+        "--sync-path",
+        default=r"ENZO-Sage50\_master\customer_delivery_addresses_sync.csv",
+    )
+    p5c.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\customer_delivery_address.xlsx",
+    )
+    p5c.set_defaults(func=build_delivery_import)
 
     p6 = sub.add_parser("build_product_sync", help="Build product sync for a given YYYY_MM using invoice + credit note lines")
     p6.add_argument(
