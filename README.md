@@ -49,6 +49,7 @@ Odoo import files:
   - Template used for contact imports
 - `ENZO-Sage50/_master/customers_NEW.xlsx`
   - Same as above, without timestamp (working copy)
+Note on naming: use `IMPORTED` (not `INPORTED`) in filenames for files that were already imported into Odoo.
 
 Odoo reference exports:
 - `ENZO-Sage50/_master_odoo/countries_odoo.csv`
