@@ -3,7 +3,11 @@ import os
 from datetime import datetime
 from typing import Dict, List
 
-from sync_customers import normalize_name, read_csv, sanitize_external_id, write_csv
+from sync_customers import normalize_name, sanitize_external_id, read_csv, write_csv
+
+
+def _norm_text(value: str) -> str:
+    return normalize_name(value or "")
 
 
 def _norm_text(value: str) -> str:
@@ -15,10 +19,18 @@ def _norm_addr(street: str, street2: str, city: str, state: str, zip_code: str) 
     return " ".join([_norm_text(p) for p in parts if p]).strip()
 
 
-def _load_customers_by_record(customers_master: str) -> Dict[str, Dict[str, str]]:
-    if not os.path.exists(customers_master):
+def _norm_email(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def _norm_phone(value: str) -> str:
+    return "".join([c for c in (value or "") if c.isdigit()])
+
+
+def _load_customers_by_record(customers_sync: str) -> Dict[str, Dict[str, str]]:
+    if not os.path.exists(customers_sync):
         return {}
-    _, rows = read_csv(customers_master)
+    _, rows = read_csv(customers_sync)
     by_record: Dict[str, Dict[str, str]] = {}
     for r in rows:
         crn = (r.get("CustomerRecordNumber") or "").strip()
@@ -35,19 +47,6 @@ def _load_addresses_by_record(address_master: str) -> Dict[str, Dict[str, str]]:
         if arn:
             by_record[arn] = r
     return by_record
-
-
-def _load_odoo_delivery_by_parent(odoo_delivery_csv: str) -> Dict[str, List[Dict[str, str]]]:
-    existing: Dict[str, List[Dict[str, str]]] = {}
-    if not os.path.exists(odoo_delivery_csv):
-        return existing
-    _, rows = read_csv(odoo_delivery_csv)
-    for r in rows:
-        parent_id = (r.get("ParentId") or "").strip()
-        if not parent_id:
-            continue
-        existing.setdefault(parent_id, []).append(r)
-    return existing
 
 
 def _load_country_parity(parity_path: str) -> Dict[str, str]:
@@ -92,6 +91,34 @@ def _load_state_parity(state_parity_path: str) -> Dict[str, Dict[str, str]]:
     return mapping
 
 
+def _load_odoo_invoice_by_parent(odoo_children_csv: str) -> Dict[str, List[Dict[str, str]]]:
+    existing: Dict[str, List[Dict[str, str]]] = {}
+    if not os.path.exists(odoo_children_csv):
+        return existing
+    _, rows = read_csv(odoo_children_csv)
+    for r in rows:
+        if (r.get("Type") or "").strip().lower() != "invoice":
+            continue
+        parent_id = (r.get("ParentId") or "").strip()
+        if not parent_id:
+            continue
+        existing.setdefault(parent_id, []).append(r)
+    return existing
+
+
+def _match_invoice(existing_rows: List[Dict[str, str]], ref: str) -> str:
+    if not existing_rows:
+        return ""
+    n_ref = (ref or "").strip()
+    if not n_ref:
+        return ""
+    for r in existing_rows:
+        r_ref = (r.get("OdooRef", "") or "").strip()
+        if r_ref and r_ref == n_ref:
+            return str(r.get("OdooId", ""))
+    return ""
+
+
 def _normalize_country(
     raw_country: str,
     country_parity: Dict[str, str],
@@ -112,37 +139,15 @@ def _normalize_country(
     return raw
 
 
-def _match_delivery(existing_rows: List[Dict[str, str]], name: str, addr_key: str) -> str:
-    if not existing_rows:
-        return ""
-    n_name = _norm_text(name)
-    for r in existing_rows:
-        r_name = _norm_text(r.get("OdooName", ""))
-        if n_name and r_name and n_name == r_name:
-            return str(r.get("OdooId", ""))
-    if addr_key:
-        for r in existing_rows:
-            r_key = _norm_addr(
-                r.get("Street", ""),
-                r.get("Street2", ""),
-                r.get("City", ""),
-                r.get("State", ""),
-                r.get("Zip", ""),
-            )
-            if r_key and r_key == addr_key:
-                return str(r.get("OdooId", ""))
-    return ""
-
-
-def build_addresses_sync(args: argparse.Namespace) -> int:
+def build_billto_sync(args: argparse.Namespace) -> int:
     contacts_master = args.contacts_master
     address_master = args.address_master
     customers_sync = args.customers_sync
-    odoo_delivery = args.odoo_delivery
+    out_path = args.out_path
     country_parity_path = args.country_parity
     state_parity_path = args.state_parity
     countries_odoo_path = args.countries_odoo
-    out_path = args.out_path
+    odoo_children = args.odoo_children
 
     if not os.path.exists(contacts_master):
         print(f"ERROR: contacts master not found: {contacts_master}")
@@ -153,10 +158,10 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
 
     customers_by_record = _load_customers_by_record(customers_sync)
     addresses_by_record = _load_addresses_by_record(address_master)
-    existing_by_parent = _load_odoo_delivery_by_parent(odoo_delivery)
     country_parity = _load_country_parity(country_parity_path)
     country_name_to_code = _load_country_name_to_code(countries_odoo_path)
     state_parity = _load_state_parity(state_parity_path)
+    existing_by_parent = _load_odoo_invoice_by_parent(odoo_children)
 
     _, contact_rows = read_csv(contacts_master)
 
@@ -169,6 +174,9 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
         "DeliveryName",
         "AddressTypeNumber",
         "AddressTypeDesc",
+        "FirstName",
+        "LastName",
+        "Title",
         "Email",
         "Phone",
         "Street",
@@ -180,7 +188,7 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
         "OdooState",
         "OdooCountry",
         "Notes",
-        "OdooAddressId",
+        "OdooContactId",
         "OdooParentId",
         "LastLookupAt",
     ]
@@ -189,27 +197,23 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
     now_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for c in contact_rows:
+        if (c.get("IsPrimaryContact") or "").strip() != "1":
+            continue
         customer_record = (c.get("CustomerRecord") or "").strip()
         address_record = (c.get("AddressRecordNumber") or "").strip()
         if not customer_record or not address_record:
             continue
-        if (c.get("IsPrimaryContact") or "").strip() == "1":
-            # Skip primary contact (company main row)
-            continue
+
         delivery_name = (c.get("CompanyName") or "").strip()
         if not delivery_name:
-            continue
+            delivery_name = (customers_by_record.get(customer_record, {}).get("Customer_Bill_Name") or "").strip()
+        first_name = (c.get("FirstName") or "").strip()
+        last_name = (c.get("LastName") or "").strip()
+        full_name = " ".join([p for p in [first_name, last_name] if p]).strip()
+        match_name = full_name if full_name else delivery_name
 
         addr = addresses_by_record.get(address_record, {})
         cust = customers_by_record.get(customer_record, {})
-
-        addr_key = _norm_addr(
-            addr.get("AddressLine1", ""),
-            addr.get("AddressLine2", ""),
-            addr.get("City", ""),
-            addr.get("State", ""),
-            addr.get("Zip", ""),
-        )
 
         raw_country = (addr.get("Country") or "").strip()
         mapped_country = _normalize_country(raw_country, country_parity, country_name_to_code)
@@ -224,13 +228,13 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
                 if not mapped_country:
                     mapped_country = inferred
 
-        odoo_parent_id = ""
-        if cust:
-            odoo_parent_id = (cust.get("OdooId") or "").strip()
-
+        odoo_parent_id = (cust.get("OdooId") or "").strip() if cust else ""
         match_id = ""
         if odoo_parent_id:
-            match_id = _match_delivery(existing_by_parent.get(odoo_parent_id, []), delivery_name, addr_key)
+            match_id = _match_invoice(
+                existing_by_parent.get(odoo_parent_id, []),
+                (c.get("RecordNumber") or "").strip(),
+            )
 
         rows_out.append({
             "ContactRecordNumber": (c.get("RecordNumber") or "").strip(),
@@ -241,6 +245,9 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
             "DeliveryName": delivery_name,
             "AddressTypeNumber": (addr.get("AddressTypeNumber") or "").strip(),
             "AddressTypeDesc": (addr.get("AddressTypeDesc") or "").strip(),
+            "FirstName": first_name,
+            "LastName": last_name,
+            "Title": (c.get("Title") or "").strip(),
             "Email": (c.get("Email") or "").strip(),
             "Phone": (c.get("Telephone1") or "").strip(),
             "Street": (addr.get("AddressLine1") or "").strip(),
@@ -251,19 +258,19 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
             "Country": raw_country,
             "OdooState": mapped_state,
             "OdooCountry": mapped_country,
-            "Notes": f"{addr.get('AddressTypeNumber','')} | {addr.get('AddressTypeDesc','')}".strip(),
-            "OdooAddressId": match_id,
+            "Notes": (c.get("Notes") or "").strip(),
+            "OdooContactId": match_id,
             "OdooParentId": odoo_parent_id,
             "LastLookupAt": now_stamp,
         })
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     write_csv(out_path, fieldnames, rows_out)
-    print(f"OK: addresses sync rows: {len(rows_out)} -> {out_path}")
+    print(f"OK: billto sync rows: {len(rows_out)} -> {out_path}")
     return 0
 
 
-def build_delivery_import(args: argparse.Namespace) -> int:
+def build_billto_import(args: argparse.Namespace) -> int:
     try:
         from openpyxl import load_workbook
     except Exception:
@@ -277,7 +284,7 @@ def build_delivery_import(args: argparse.Namespace) -> int:
     template_path = args.template_path
 
     if not os.path.exists(sync_path):
-        print(f"ERROR: delivery sync file not found: {sync_path}")
+        print(f"ERROR: billto sync file not found: {sync_path}")
         return 2
     if not os.path.exists(template_path):
         print(f"ERROR: template not found: {template_path}")
@@ -288,8 +295,8 @@ def build_delivery_import(args: argparse.Namespace) -> int:
     os.makedirs(odoo_imports, exist_ok=True)
 
     stamp = datetime.now().strftime("%Y%m%d")
-    out_xlsx = os.path.join(odoo_imports, f"{stamp}_customers_delivery_NEW.xlsx")
-    out_csv = os.path.join(master_root, "customer_delivery_addresses_sync_NEW.csv")
+    out_xlsx = os.path.join(odoo_imports, f"{stamp}_customers_billto_NEW.xlsx")
+    out_csv = os.path.join(master_root, "customers_billto_sync_NEW.csv")
 
     _, sync_rows = read_csv(sync_path)
 
@@ -311,47 +318,48 @@ def build_delivery_import(args: argparse.Namespace) -> int:
     emitted = 0
     new_rows: List[Dict[str, str]] = []
     for r in sync_rows:
-        if (r.get("OdooAddressId") or "").strip():
-            continue
         parent_id = (r.get("OdooParentId") or "").strip()
         if not parent_id:
             continue
-        name = (r.get("DeliveryName") or "").strip()
-        if not name:
+        if (r.get("OdooContactId") or "").strip():
             continue
-        new_rows.append(r)
+
+        first = (r.get("FirstName") or "").strip()
+        last = (r.get("LastName") or "").strip()
+        full_name = " ".join([p for p in [first, last] if p]).strip()
+        company_name = (r.get("DeliveryName") or "").strip()
+        name = full_name if full_name else company_name
 
         customer_id = (r.get("CustomerID") or "").strip()
         contact_record = (r.get("ContactRecordNumber") or "").strip()
         raw_ext = f"{customer_id}_{contact_record}" if customer_id and contact_record else ""
         ext_id = sanitize_external_id(raw_ext)
 
-        state = (r.get("OdooState") or "").strip() or (r.get("State") or "").strip()
-        country = (r.get("OdooCountry") or "").strip() or (r.get("Country") or "").strip()
+        new_rows.append(r)
 
         set_cell("External_ID", ext_id)
         set_cell("Parent/Database ID", parent_id)
-        set_cell("Reference", (r.get("ContactRecordNumber") or "").strip())
+        set_cell("Reference", contact_record)
         set_cell("is_company", 0)
-        set_cell("type", "delivery")
+        set_cell("type", "invoice")
         set_cell("Name", name)
         set_cell("Email", (r.get("Email") or "").strip())
         set_cell("Phone", (r.get("Phone") or "").strip())
+        set_cell("Job Position", (r.get("Title") or "").strip())
         set_cell("Street", (r.get("Street") or "").strip())
         set_cell("Street2", (r.get("Street2") or "").strip())
         set_cell("City", (r.get("City") or "").strip())
-        set_cell("State", state)
+        set_cell("State", (r.get("OdooState") or "").strip() or (r.get("State") or "").strip())
         set_cell("ZIP", (r.get("Zip") or "").strip())
-        set_cell("Country", country)
+        set_cell("Country", (r.get("OdooCountry") or "").strip() or (r.get("Country") or "").strip())
         set_cell("Notes", (r.get("Notes") or "").strip())
+        set_cell("Language", "English (US)")
         row_idx += 1
         emitted += 1
 
     wb.save(out_xlsx)
-    fieldnames = []
-    if new_rows:
-        fieldnames = list(new_rows[0].keys())
+    fieldnames = list(new_rows[0].keys()) if new_rows else []
     write_csv(out_csv, fieldnames, new_rows)
-    print(f"OK: delivery new rows: {emitted} -> {out_xlsx}")
-    print(f"OK: delivery NEW sync -> {out_csv}")
+    print(f"OK: billto new rows: {emitted} -> {out_xlsx}")
+    print(f"OK: billto NEW sync -> {out_csv}")
     return 0

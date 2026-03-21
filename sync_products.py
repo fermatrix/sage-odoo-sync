@@ -23,7 +23,7 @@ def build_product_sync(args: argparse.Namespace) -> int:
         print(f"ERROR: items master not found: {items_master}")
         return 2
     if not os.path.exists(items_sync):
-        print(f"ERROR: items sync not found: {items_sync}")
+        print(f"ERROR: products sync not found: {items_sync}")
         return 2
 
     inv_glob = os.path.join(base_dir, "**", f"{year_month}_invoice_lines.csv")
@@ -113,12 +113,12 @@ def build_items_sync_new(args: argparse.Namespace) -> int:
     invoice_base_dir = args.invoice_base_dir
 
     if not os.path.exists(items_sync):
-        print(f"ERROR: items sync not found: {items_sync}")
+        print(f"ERROR: products sync not found: {items_sync}")
         return 2
 
     fields, rows = read_csv(items_sync)
     if not fields:
-        print(f"ERROR: items sync has no headers: {items_sync}")
+        print(f"ERROR: products sync has no headers: {items_sync}")
         return 2
 
     # Build invoiced set for 2026 (Feb + Mar)
@@ -151,11 +151,19 @@ def build_items_sync_new(args: argparse.Namespace) -> int:
             return True
         return v.isdigit() and len(v) >= barcode_digits
 
+    def is_excluded_sale_desc(value: str) -> bool:
+        v = (value or "").strip().upper()
+        if not v:
+            return False
+        return v.startswith("DERAPAGE") or v.startswith("ECLIPSE") or v.startswith("90 PIECE")
+
     filtered = []
     for r in rows:
         if (r.get("OdooVariantId") or "").strip():
             continue
         if not is_barcode_ok(r.get("Barcode", "")):
+            continue
+        if is_excluded_sale_desc(r.get("ItemDescriptionForSale", "")):
             continue
         if invoiced:
             r["Invoiced2026"] = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""

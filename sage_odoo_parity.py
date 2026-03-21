@@ -19,6 +19,7 @@ from sync_customers import (
 )
 from sync_contacts import build_contacts_sync, build_contacts_import
 from sync_addresses import build_addresses_sync, build_delivery_import
+from sync_billto import build_billto_sync, build_billto_import
 from sync_parity import OdooClient, export_countries
 from sync_products import build_product_sync, build_items_sync_new
 
@@ -242,7 +243,7 @@ def refresh_sage(args: argparse.Namespace) -> int:
                     primary_contact_by_customer_record[crn] = r
 
         # Optional country parity for Odoo import (applied only to customers_NEW)
-        parity_path = os.path.join(master_root, "country_parity.csv")
+        parity_path = os.path.join(master_root, "_parity_country.csv")
         country_parity = {}
         country_name_to_code = {}
         if os.path.exists(parity_path):
@@ -272,7 +273,7 @@ def refresh_sage(args: argparse.Namespace) -> int:
                         country_name_to_code.setdefault(name, code)
 
         # Optional state parity (state code -> full name + implied country)
-        state_parity_path = os.path.join(master_root, "state_parity.csv")
+        state_parity_path = os.path.join(master_root, "_parity_state.csv")
         state_parity = {}
         if os.path.exists(state_parity_path):
             with open(state_parity_path, "r", newline="", encoding="utf-8") as f:
@@ -363,7 +364,7 @@ def refresh_sage(args: argparse.Namespace) -> int:
         wb_min.save(customers_new_min_xlsx)
 
     print(f"OK: customers sync rows: {len(out_customers)} -> {customer_out}")
-    print(f"OK: items sync rows: {len(out_items)} -> {items_out}")
+    print(f"OK: products sync rows: {len(out_items)} -> {items_out}")
     return 0
 
 
@@ -453,6 +454,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
         "ParentId",
         "ParentName",
         "OdooName",
+        "OdooRef",
         "Type",
         "Street",
         "Street2",
@@ -476,6 +478,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "id",
                     "parent_id",
                     "name",
+                    "ref",
                     "type",
                     "street",
                     "street2",
@@ -503,6 +506,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "ParentId": parent_id,
                     "ParentName": parent_name,
                     "OdooName": r.get("name", "") or "",
+                    "OdooRef": r.get("ref", "") or "",
                     "Type": r.get("type", "") or "",
                     "Street": r.get("street", "") or "",
                     "Street2": r.get("street2", "") or "",
@@ -530,6 +534,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "id",
                     "parent_id",
                     "name",
+                    "ref",
                     "type",
                     "street",
                     "street2",
@@ -557,6 +562,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "ParentId": parent_id,
                     "ParentName": parent_name,
                     "OdooName": r.get("name", "") or "",
+                    "OdooRef": r.get("ref", "") or "",
                     "Type": r.get("type", "") or "",
                     "Street": r.get("street", "") or "",
                     "Street2": r.get("street2", "") or "",
@@ -718,7 +724,7 @@ def sync_local(args: argparse.Namespace) -> int:
         print(f"ERROR: customers sync file not found: {customer_sync}")
         return 2
     if not os.path.exists(item_sync):
-        print(f"ERROR: items sync file not found: {item_sync}")
+        print(f"ERROR: products sync file not found: {item_sync}")
         return 2
     if not os.path.exists(odoo_customers):
         print(f"ERROR: odoo customers file not found: {odoo_customers}")
@@ -812,11 +818,11 @@ def sync_local(args: argparse.Namespace) -> int:
     write_csv(item_sync, item_fields, item_rows)
 
     print(f"OK: customers updated with Odoo IDs: {updated_customers}")
-    print(f"OK: items updated with Odoo IDs: {updated_items}")
+    print(f"OK: products updated with Odoo IDs: {updated_items}")
 
     # Build FAILS for Odoo customers/items not found in Sage
     customer_fails_path = os.path.join(os.path.dirname(customer_sync), "_customer_FAILS.csv")
-    item_fails_path = os.path.join(os.path.dirname(item_sync), "_item_FAILS.csv")
+    item_fails_path = os.path.join(os.path.dirname(item_sync), "_product_FAILS.csv")
 
     sage_customer_ids = set()
     for r in customer_rows:
@@ -951,7 +957,7 @@ def sync_local(args: argparse.Namespace) -> int:
             writer.writerow({k: r.get(k, "") for k in item_fail_fields})
 
     print(f"OK: customer FAILS -> {customer_fails_path}")
-    print(f"OK: item FAILS -> {item_fails_path}")
+    print(f"OK: product FAILS -> {item_fails_path}")
     return 0
 
 
@@ -974,7 +980,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p1.add_argument(
         "--items-out",
-        default=r"ENZO-Sage50\_master\items_sync.csv",
+        default=r"ENZO-Sage50\_master\products_sync.csv",
     )
     p1.set_defaults(func=refresh_sage)
 
@@ -1006,7 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p3.add_argument(
         "--items-sync",
-        default=r"ENZO-Sage50\_master\items_sync.csv",
+        default=r"ENZO-Sage50\_master\products_sync.csv",
     )
     p3.add_argument(
         "--odoo-customers",
@@ -1072,11 +1078,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p5b.add_argument(
         "--country-parity",
-        default=r"ENZO-Sage50\_master\country_parity.csv",
+        default=r"ENZO-Sage50\_master\_parity_country.csv",
     )
     p5b.add_argument(
         "--state-parity",
-        default=r"ENZO-Sage50\_master\state_parity.csv",
+        default=r"ENZO-Sage50\_master\_parity_state.csv",
     )
     p5b.add_argument(
         "--countries-odoo",
@@ -1099,6 +1105,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p5c.set_defaults(func=build_delivery_import)
 
+    p5d = sub.add_parser("build_billto_sync", help="Build bill-to sync file from primary contacts + addresses")
+    p5d.add_argument(
+        "--contacts-master",
+        default=r"ENZO-Sage50\_master_sage\contacts.csv",
+    )
+    p5d.add_argument(
+        "--address-master",
+        default=r"ENZO-Sage50\_master_sage\address.csv",
+    )
+    p5d.add_argument(
+        "--customers-sync",
+        default=r"ENZO-Sage50\_master\customers_sync.csv",
+    )
+    p5d.add_argument(
+        "--country-parity",
+        default=r"ENZO-Sage50\_master\_parity_country.csv",
+    )
+    p5d.add_argument(
+        "--state-parity",
+        default=r"ENZO-Sage50\_master\_parity_state.csv",
+    )
+    p5d.add_argument(
+        "--countries-odoo",
+        default=r"ENZO-Sage50\_master_odoo\countries_odoo.csv",
+    )
+    p5d.add_argument(
+        "--odoo-children",
+        default=r"ENZO-Sage50\_master_odoo\customers_child_partners_all.csv",
+    )
+    p5d.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\customers_billto_sync.csv",
+    )
+    p5d.set_defaults(func=build_billto_sync)
+
+    p5e = sub.add_parser("build_billto", help="Build bill-to import XLSX from sync file")
+    p5e.add_argument(
+        "--sync-path",
+        default=r"ENZO-Sage50\_master\customers_billto_sync.csv",
+    )
+    p5e.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\customer_billto.xlsx",
+    )
+    p5e.set_defaults(func=build_billto_import)
+
     p6 = sub.add_parser("build_product_sync", help="Build product sync for a given YYYY_MM using invoice + credit note lines")
     p6.add_argument(
         "--year-month",
@@ -1116,23 +1168,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p6.add_argument(
         "--items-sync",
-        default=r"ENZO-Sage50\_master\items_sync.csv",
+        default=r"ENZO-Sage50\_master\products_sync.csv",
     )
     p6.add_argument(
         "--out-path",
-        default=r"ENZO-Sage50\_master\{year_month}_product_sync.csv",
+        default=r"ENZO-Sage50\_master\{year_month}_products_sync.csv",
         help="Output path (supports {year_month} placeholder)",
     )
     p6.set_defaults(func=build_product_sync)
 
-    p7 = sub.add_parser("build_items_sync_new", help="Build items_sync_NEW with filters (no Odoo ID, active, barcode)")
+    p7 = sub.add_parser("build_items_sync_new", help="Build products_sync_NEW with filters (no Odoo ID, active, barcode)")
     p7.add_argument(
         "--items-sync",
-        default=r"ENZO-Sage50\_master\items_sync.csv",
+        default=r"ENZO-Sage50\_master\products_sync.csv",
     )
     p7.add_argument(
         "--out-path",
-        default=r"ENZO-Sage50\_master\items_sync_NEW.csv",
+        default=r"ENZO-Sage50\_master\products_sync_NEW.csv",
     )
     p7.add_argument(
         "--invoice-base-dir",

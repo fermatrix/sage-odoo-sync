@@ -11,6 +11,8 @@ python sage_odoo_parity.py build_contacts_sync
 python sage_odoo_parity.py build_contacts
 python sage_odoo_parity.py build_addresses_sync
 python sage_odoo_parity.py build_delivery_addresses
+python sage_odoo_parity.py build_billto_sync
+python sage_odoo_parity.py build_billto
 python sage_odoo_parity.py build_product_sync --year-month 2026_02
 python sage_odoo_parity.py build_items_sync_new
 python sage_odoo_parity.py export_countries
@@ -20,8 +22,9 @@ Code layout (March 19, 2026):
 - `sage_odoo_parity.py` — CLI entrypoint (argparse) and core orchestration
 - `sync_customers.py` — shared helpers (CSV, env, normalization) used by flows
 - `sync_contacts.py` — contacts flow (build contacts sync + import XLSX)
-- `sync_products.py` — product sync + items_sync_NEW
+- `sync_products.py` — product sync + products_sync_NEW
 - `sync_parity.py` — countries/states export + parity tables
+- `sync_billto.py` — bill-to sync + import XLSX
 
 Folder layout:
 - `ENZO-Sage50/_master_sage/` — Sage **general/master** exports (non-temporal tables like Customers, Items, Address, Contacts)
@@ -31,14 +34,14 @@ Folder layout:
 Key outputs:
 - `ENZO-Sage50/_master/customers_sync.csv`
   - Includes `CustomerIsInactive`, `CustomerSince`, `LastInvoiceDate`
-- `ENZO-Sage50/_master/items_sync.csv`
+- `ENZO-Sage50/_master/products_sync.csv`
   - Includes `ItemIsInactive`, `OdooColor`, `Barcode` (from `UPC_SKU`), `ItemDescriptionForSale`
-- `ENZO-Sage50/_master/items_sync_NEW.csv`
+- `ENZO-Sage50/_master/products_sync_NEW.csv`
   - Items without Odoo match, barcode present (default >=12 digits)
 - `ENZO-Sage50/_master/YYYY_MM_product_sync.csv`
   - Items present in that month's invoice + credit note lines that are missing in Odoo
 - `ENZO-Sage50/_master/_customer_FAILS.csv`
-- `ENZO-Sage50/_master/_item_FAILS.csv`
+- `ENZO-Sage50/_master/_product_FAILS.csv`
 
 Odoo import files:
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_NEW.xlsx`
@@ -49,6 +52,8 @@ Odoo import files:
   - Template used for contact imports
 - `ENZO-Sage50/_master/customers_NEW.xlsx`
   - Same as above, without timestamp (working copy)
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_billto_NEW.xlsx`
+  - Bill-to invoice addresses (type=`invoice`) for existing customers
 Note on naming: use `IMPORTED` (not `INPORTED`) in filenames for files that were already imported into Odoo.
 
 Odoo reference exports:
@@ -57,9 +62,9 @@ Odoo reference exports:
 - `ENZO-Sage50/_master_odoo/customers_contacts.csv` (Odoo contacts with `ParentId`)
 
 Parity tables (generated from Sage Address + Odoo reference lists):
-- `ENZO-Sage50/_master/country_parity.csv`
+- `ENZO-Sage50/_master/_parity_country.csv`
   - `sage_country_raw` → `odoo_country_code` suggestions (ISO2)
-- `ENZO-Sage50/_master/state_parity.csv`
+- `ENZO-Sage50/_master/_parity_state.csv`
   - `sage_state_raw` → `odoo_state_name` (full state) + implied country
 - `ENZO-Sage50/_master/customers_NEW.xlsx`
   - Minimal tracking list (same customers, fewer columns)
@@ -169,8 +174,8 @@ C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage
 - Only **AddressTypeNumber = 0** is used (single address per customer).
 - If no Address row exists, **leave address fields empty** (no fallback to `Cardholder_*`).
 - Country/state mapping is applied **only when generating `customers_NEW.xlsx`**:
-  - Country uses `country_parity.csv` (ISO2). If no match, keep the Sage value.
-  - State uses `state_parity.csv` to map code → full name.
+  - Country uses `_parity_country.csv` (ISO2). If no match, keep the Sage value.
+  - State uses `_parity_state.csv` to map code → full name.
   - If country is missing but the state matches, infer country from state (US/Canada, etc.).
 Pending (stores / delivery addresses):
 We currently use the primary Address as the company address. Additional addresses (stores, delivery locations, or any AddressTypeNumber ≠ 0) will be handled later as a separate flow, likely as child delivery addresses similar to Contacts in Odoo.
@@ -203,6 +208,18 @@ We currently use the primary Address as the company address. Additional addresse
   - Matches Odoo delivery addresses using `ParentId` + name or address fields.
   - `Mail To` and other non-delivery address types are **not handled yet**.
 
+### Bill-to sync (new)
+- `python sage_odoo_parity.py build_billto_sync` builds:
+  - `ENZO-Sage50/_master/customers_billto_sync.csv`
+- `python sage_odoo_parity.py build_billto` builds:
+  - `ENZO-Sage50/_master/customers_billto_sync_NEW.csv`
+  - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_billto_NEW.xlsx`
+- Logic:
+  - Uses **primary contacts** (`IsPrimaryContact = 1`) as Bill To.
+  - Join via `contacts.AddressRecordNumber` ↔ `address.AddressRecordNumber`.
+  - Writes `type = invoice` in Odoo import.
+  - Matches by `ParentId` + `Reference` (`res.partner.ref`) to avoid duplicates.
+
 ### Product sync (new)
 - `python sage_odoo_parity.py build_product_sync --year-month YYYY_MM`
   - Scans:
@@ -210,18 +227,18 @@ We currently use the primary Address as the company address. Additional addresse
     - `ENZO-Sage50/**/YYYY_MM_credit_note_lines.csv`
   - Joins with:
     - `ENZO-Sage50/_master_sage/items.csv` (barcode in `UPC_SKU`)
-    - `ENZO-Sage50/_master/items_sync.csv`
+    - `ENZO-Sage50/_master/products_sync.csv`
   - Outputs:
     - `ENZO-Sage50/_master/YYYY_MM_product_sync.csv`
 
 ### Items sync NEW (new)
 - `python sage_odoo_parity.py build_items_sync_new`
-  - Filters `ENZO-Sage50/_master/items_sync.csv`:
+  - Filters `ENZO-Sage50/_master/products_sync.csv`:
     - No `OdooVariantId`
     - `Barcode` has >= 12 digits (default)
     - Includes inactive items (no `ItemIsInactive` filter)
   - Output:
-    - `ENZO-Sage50/_master/items_sync_NEW.csv`
+    - `ENZO-Sage50/_master/products_sync_NEW.csv`
   - Options:
     - `--barcode-digits 0` disables barcode-length filtering
   - Adds `Invoiced2026` column (X) if item appears in 2026_02 or 2026_03 invoice lines
@@ -230,7 +247,7 @@ We currently use the primary Address as the company address. Additional addresse
 ### Countries & states export
 - `python sage_odoo_parity.py export_countries` fetches Odoo reference data and builds parity:
   - Exports: `countries_odoo.csv`, `states_odoo.csv`
-  - Parity tables: `country_parity.csv`, `state_parity.csv`
+  - Parity tables: `_parity_country.csv`, `_parity_state.csv`
 
 ### Template headers (customers.xlsx)
 - Added fields now used: `CustomerRef`, `ContactName`, `ContactEmail`, `ContactPhone`, `ContactJobTitle`, `ContactNotes`.

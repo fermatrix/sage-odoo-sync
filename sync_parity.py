@@ -68,8 +68,8 @@ def export_countries(args: argparse.Namespace) -> int:
 
     countries_out = os.path.join(master_odoo_root, "countries_odoo.csv")
     states_out = os.path.join(master_odoo_root, "states_odoo.csv")
-    parity_out = os.path.join(master_root, "country_parity.csv")
-    state_parity_out = os.path.join(master_root, "state_parity.csv")
+    parity_out = os.path.join(master_root, "_parity_country.csv")
+    state_parity_out = os.path.join(master_root, "_parity_state.csv")
 
     # Export Odoo countries (id, name, code)
     fields = ["id", "name", "code"]
