@@ -180,3 +180,79 @@ def build_items_sync_new(args: argparse.Namespace) -> int:
     write_csv(out_path, out_fields, filtered)
     print(f"OK: items sync NEW rows: {len(filtered)} -> {out_path}")
     return 0
+
+
+def build_products_sync_nobarcode_new(args: argparse.Namespace) -> int:
+    items_sync = args.items_sync
+    out_path = args.out_path
+    barcode_digits = None if args.barcode_digits == 0 else args.barcode_digits
+    invoice_base_dir = args.invoice_base_dir
+
+    if not os.path.exists(items_sync):
+        print(f"ERROR: products sync not found: {items_sync}")
+        return 2
+
+    fields, rows = read_csv(items_sync)
+    if not fields:
+        print(f"ERROR: products sync has no headers: {items_sync}")
+        return 2
+
+    # Build invoiced set for 2026 (Feb + Mar)
+    invoiced = set()
+    if invoice_base_dir:
+        targets = [
+            os.path.join(invoice_base_dir, "**", "2026_02_invoice_lines.csv"),
+            os.path.join(invoice_base_dir, "**", "2026_03_invoice_lines.csv"),
+        ]
+        matched = []
+        for pattern in targets:
+            matched.extend(glob.glob(pattern, recursive=True))
+        if not matched:
+            print("WARNING: no invoice_lines found for 2026_02 or 2026_03")
+        for path in matched:
+            try:
+                _, inv_rows = read_csv(path)
+            except Exception:
+                continue
+            for r in inv_rows:
+                rec = (r.get("ItemRecordNumber") or "").strip()
+                if rec:
+                    invoiced.add(rec)
+
+    def is_barcode_bad(value: str) -> bool:
+        v = (value or "").strip()
+        if not v:
+            return True
+        if barcode_digits is None:
+            return False
+        return (not v.isdigit()) or len(v) < barcode_digits
+
+    def is_excluded_sale_desc(value: str) -> bool:
+        v = (value or "").strip().upper()
+        if not v:
+            return False
+        return v.startswith("DERAPAGE") or v.startswith("ECLIPSE") or v.startswith("90 PIECE")
+
+    filtered = []
+    for r in rows:
+        if (r.get("OdooVariantId") or "").strip():
+            continue
+        if not is_barcode_bad(r.get("Barcode", "")):
+            continue
+        if is_excluded_sale_desc(r.get("ItemDescriptionForSale", "")):
+            continue
+        if invoiced:
+            r["Invoiced2026"] = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""
+        filtered.append(r)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_fields = list(fields)
+    if "Invoiced2026" not in out_fields:
+        if "LastLookupAt" in out_fields:
+            idx = out_fields.index("LastLookupAt")
+            out_fields.insert(idx, "Invoiced2026")
+        else:
+            out_fields.append("Invoiced2026")
+    write_csv(out_path, out_fields, filtered)
+    print(f"OK: products sync nobarcode NEW rows: {len(filtered)} -> {out_path}")
+    return 0

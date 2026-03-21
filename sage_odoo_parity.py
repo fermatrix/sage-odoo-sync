@@ -21,7 +21,7 @@ from sync_contacts import build_contacts_sync, build_contacts_import
 from sync_addresses import build_addresses_sync, build_delivery_import
 from sync_billto import build_billto_sync, build_billto_import
 from sync_parity import OdooClient, export_countries
-from sync_products import build_product_sync, build_items_sync_new
+from sync_products import build_product_sync, build_items_sync_new, build_products_sync_nobarcode_new
 
 
 
@@ -1198,6 +1198,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require barcode to have exactly N digits (default: 12). Use 0 to disable.",
     )
     p7.set_defaults(func=build_items_sync_new)
+
+    p7b = sub.add_parser("build_products_sync_nobarcode_new", help="Build products_sync_nobarcode_NEW (no Odoo ID, empty/short barcode)")
+    p7b.add_argument(
+        "--items-sync",
+        default=r"ENZO-Sage50\_master\products_sync.csv",
+    )
+    p7b.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\products_sync_nobarcode_NEW.csv",
+    )
+    p7b.add_argument(
+        "--barcode-digits",
+        type=int,
+        default=12,
+        help="Require barcode to have at least N digits (default: 12). Use 0 to disable.",
+    )
+    p7b.add_argument(
+        "--invoice-base-dir",
+        default=r"ENZO-Sage50",
+        help="Base directory to search for 2026_02/2026_03 invoice lines",
+    )
+    p7b.set_defaults(func=build_products_sync_nobarcode_new)
 
     p8 = sub.add_parser("export_countries", help="Export Odoo countries + build Sage parity table (address only)")
     p8.add_argument(

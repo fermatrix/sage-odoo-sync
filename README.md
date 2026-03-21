@@ -243,6 +243,16 @@ We currently use the primary Address as the company address. Additional addresse
     - `--barcode-digits 0` disables barcode-length filtering
   - Adds `Invoiced2026` column (X) if item appears in 2026_02 or 2026_03 invoice lines
 
+### Products sync NEW (no barcode)
+- `python sage_odoo_parity.py build_products_sync_nobarcode_new`
+  - Filters `ENZO-Sage50/_master/products_sync.csv`:
+    - No `OdooVariantId`
+    - Barcode is empty or shorter than 12 digits
+    - Excludes `ItemDescriptionForSale` starting with `DERAPAGE`, `ECLIPSE`, `90 PIECE`
+  - Output:
+    - `ENZO-Sage50/_master/products_sync_nobarcode_NEW.csv`
+  - Adds `Invoiced2026` column (X) if item appears in 2026_02 or 2026_03 invoice lines
+
 
 ### Countries & states export
 - `python sage_odoo_parity.py export_countries` fetches Odoo reference data and builds parity:
