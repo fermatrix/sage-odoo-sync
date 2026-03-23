@@ -21,7 +21,7 @@ from sync_contacts import build_contacts_sync, build_contacts_import
 from sync_addresses import build_addresses_sync, build_delivery_import
 from sync_billto import build_billto_sync, build_billto_import
 from sync_parity import OdooClient, export_countries
-from sync_products import build_product_sync, build_items_sync_new, build_products_sync_nobarcode_new
+from sync_products import build_product_sync, build_items_sync_new, build_products_sync_nobarcode_new, build_products_import
 
 
 
@@ -385,6 +385,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     items_out = args.items_out
     os.makedirs(os.path.dirname(customers_out), exist_ok=True)
     os.makedirs(os.path.dirname(items_out), exist_ok=True)
+    odoo_root = os.path.dirname(items_out)
 
     batch = args.batch_size
 
@@ -646,7 +647,15 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 })
             offset += len(rows)
 
-    item_fields = ["OdooVariantId", "OdooName", "OdooVariantName", "OdooItemCode", "OdooColor", "Active"]
+    item_fields = [
+        "OdooVariantId",
+        "OdooName",
+        "OdooVariantName",
+        "OdooItemCode",
+        "OdooColor",
+        "Active",
+        "OdooTemplateExternalId",
+    ]
     with open(items_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=item_fields, delimiter=DELIMITER)
         writer.writeheader()
@@ -655,16 +664,20 @@ def refresh_odoo(args: argparse.Namespace) -> int:
             rows = client.search_read(
                 "product.product",
                 [],
-                ["id", "name", "display_name", "default_code", "active", "product_template_attribute_value_ids"],
+                ["id", "name", "display_name", "default_code", "active", "product_template_attribute_value_ids", "product_tmpl_id"],
                 limit=batch,
                 offset=offset,
             )
             if not rows:
                 break
+            tmpl_ids = set()
             attr_ids = set()
             for r in rows:
                 for aid in r.get("product_template_attribute_value_ids") or []:
                     attr_ids.add(aid)
+                tmpl = r.get("product_tmpl_id") or []
+                if isinstance(tmpl, list) and tmpl:
+                    tmpl_ids.add(tmpl[0])
             attr_map = {}
             if attr_ids:
                 ids = list(attr_ids)
@@ -687,12 +700,35 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                             "name": v.get("name", ""),
                             "attribute": attr_name,
                         }
+            tmpl_external = {}
+            if tmpl_ids:
+                ids = list(tmpl_ids)
+                chunk_size = 1000
+                for i in range(0, len(ids), chunk_size):
+                    chunk = ids[i:i + chunk_size]
+                    data_rows = client.models.execute_kw(
+                        client.db,
+                        client.uid,
+                        client.apikey,
+                        "ir.model.data",
+                        "search_read",
+                        [[("model", "=", "product.template"), ("res_id", "in", chunk)]],
+                        {"fields": ["module", "name", "res_id"]},
+                    )
+                    for d in data_rows:
+                        res_id = d.get("res_id")
+                        module = d.get("module") or ""
+                        name = d.get("name") or ""
+                        if res_id and module and name:
+                            tmpl_external[res_id] = f"{module}.{name}"
             for r in rows:
                 color_values = []
                 for aid in r.get("product_template_attribute_value_ids") or []:
                     info = attr_map.get(aid)
                     if info and (info.get("attribute") or "").lower() == "color":
                         color_values.append(info.get("name", ""))
+                tmpl = r.get("product_tmpl_id") or []
+                tmpl_id = tmpl[0] if isinstance(tmpl, list) and tmpl else ""
                 writer.writerow({
                     "OdooVariantId": r.get("id", ""),
                     "OdooName": r.get("name", "") or "",
@@ -700,6 +736,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "OdooItemCode": r.get("default_code", "") or "",
                     "OdooColor": " / ".join([c for c in color_values if c]),
                     "Active": r.get("active", ""),
+                    "OdooTemplateExternalId": tmpl_external.get(tmpl_id, ""),
                 })
             offset += len(rows)
 
@@ -709,6 +746,48 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     print(f"OK: odoo child partners (all) exported -> {children_all_out}")
     print(f"OK: odoo delivery addresses exported -> {delivery_out}")
     print(f"OK: odoo items exported -> {items_out}")
+    # Export color attribute values
+    try:
+        attr_rows = client.search_read(
+            "product.attribute",
+            [],
+            ["id", "name"],
+            limit=batch,
+            offset=0,
+        )
+        color_attr_ids = [r.get("id") for r in attr_rows if (r.get("name") or "").strip().lower().find("color") >= 0]
+        color_out = os.path.join(odoo_root, "atributos_color.csv")
+        with open(color_out, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["OdooId", "OdooName", "AttributeId", "AttributeName"],
+                delimiter=DELIMITER,
+            )
+            writer.writeheader()
+            if color_attr_ids:
+                offset = 0
+                while True:
+                    rows = client.search_read(
+                        "product.attribute.value",
+                        [["attribute_id", "in", color_attr_ids]],
+                        ["id", "name", "attribute_id"],
+                        limit=batch,
+                        offset=offset,
+                    )
+                    if not rows:
+                        break
+                    for r in rows:
+                        attr = r.get("attribute_id") or []
+                        writer.writerow({
+                            "OdooId": r.get("id", ""),
+                            "OdooName": r.get("name", "") or "",
+                            "AttributeId": attr[0] if isinstance(attr, list) and attr else "",
+                            "AttributeName": attr[1] if isinstance(attr, list) and len(attr) > 1 else "",
+                        })
+                    offset += len(rows)
+        print(f"OK: odoo color attributes exported -> {color_out}")
+    except Exception:
+        print("WARNING: failed to export Odoo color attributes")
     return 0
 
 
@@ -1220,6 +1299,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base directory to search for 2026_02/2026_03 invoice lines",
     )
     p7b.set_defaults(func=build_products_sync_nobarcode_new)
+
+    p7c = sub.add_parser("build_products_import", help="Build products import XLSX from products_sync_NEW")
+    p7c.add_argument(
+        "--sync-path",
+        default=r"ENZO-Sage50\_master\products_sync_NEW.csv",
+    )
+    p7c.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx",
+    )
+    p7c.set_defaults(func=build_products_import)
 
     p8 = sub.add_parser("export_countries", help="Export Odoo countries + build Sage parity table (address only)")
     p8.add_argument(

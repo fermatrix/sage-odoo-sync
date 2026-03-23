@@ -1,5 +1,15 @@
 # Sage 50 → Odoo Sync (Project Notes)
 
+## WORK IN PROGRESS
+- Waiting on Ally’s feedback about **no‑barcode products** that look like frames.
+- Next steps once confirmed:
+  - Move those items from `products_sync_nobarcode_NEW.csv` into `products_sync_NEW.csv`.
+  - Regenerate:
+    - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
+    - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW_verification.xlsx`
+  - Remove those items from the no‑barcode list.
+- `NW77PLAQUE` confirmed: excluded from NEW, kept in no‑barcode.
+
 ## Current Workflow (March 13, 2026)
 
 Primary commands (run from repo root):
@@ -237,6 +247,7 @@ We currently use the primary Address as the company address. Additional addresse
     - No `OdooVariantId`
     - `Barcode` has >= 12 digits (default)
     - Includes inactive items (no `ItemIsInactive` filter)
+    - **Excludes** `ItemID = NW77PLAQUE` (not a frame; handled in nobarcode list)
   - Output:
     - `ENZO-Sage50/_master/products_sync_NEW.csv`
   - Options:
@@ -248,16 +259,102 @@ We currently use the primary Address as the company address. Additional addresse
   - Filters `ENZO-Sage50/_master/products_sync.csv`:
     - No `OdooVariantId`
     - Barcode is empty or shorter than 12 digits
+    - **Includes** `ItemID = NW77PLAQUE` even if barcode exists
     - Excludes `ItemDescriptionForSale` starting with `DERAPAGE`, `ECLIPSE`, `90 PIECE`
   - Output:
     - `ENZO-Sage50/_master/products_sync_nobarcode_NEW.csv`
   - Adds `Invoiced2026` column (X) if item appears in 2026_02 or 2026_03 invoice lines
+
+### Products import (Odoo template)
+- `python sage_odoo_parity.py build_products_import`
+  - Input:
+    - `ENZO-Sage50/_master/products_sync_NEW.csv`
+    - `ENZO-Sage50/_master/odoo_templates/products.xlsx` (template)
+    - `ENZO-Sage50/_master/odoo_templates/products_formulas.csv` (brand formulas, `;` separated)
+  - Output:
+    - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
+  - The output workbook keeps **only the first sheet** (template extra sheets removed).
+  - Rows are **sorted by `Description for Sales`** to group brands together.
+  - Fixed columns:
+    - `id` = `ItemID`
+    - `x` = `F`
+    - `if_favorite` = `FALSE`
+    - `is_storable` = `TRUE`
+    - `Description for Sales` = `ItemDescriptionForSale`
+    - `Item Description` = `ItemDescription`
+  - Brand detection:
+    - Uses leading token from `Description for Sales`.
+    - Multi-word brands handled: `NW 77TH`, `ERKERS 1879`, `THE NEIGHBORS`.
+  - Collection extraction:
+    - If `Description for Sales` contains `COLLECTION` or `SERIES`,
+      the **leading phrase up to that word** is moved into `collection`
+      (examples: `IQ SERIES`, `HOME COLLECTION`, `IQ MINI SERIES`, `SLIDER SERIES`).
+    - `name_processed` removes both brand and collection.
+  - `description_processed`:
+    - Removes the brand from `Item Description`.
+    - Handles simplified brand labels (example: brand `ERKERS 1879` → strips `ERKERS`).
+  - `color_code`:
+    - Extracts `C-XXXX` token from `Item Description` (fallback to `Description for Sales`).
+  - `brand_code`:
+    - `description_processed` without the `color_code` token.
+  - `product_code_odoo`:
+    - Built from `brand_code`, replacing spaces with `_`.
+    - Brand prefixes:
+      - `ERKERS 1879`: no prefix (uses `brand_code`)
+      - `THE NEIGHBORS`: no prefix (uses `brand_code`)
+      - `BA&SH`: `BA_`
+      - `MONOQOOL`: `MQ_`
+      - `TOCCO`: `TO_`
+      - `NW 77TH`: `NW_`
+  - `category`:
+    - `Brand / Sunglass` if `Description for Sales` contains `SUNGLASS` or ` SG `
+    - Otherwise `Brand / Optical`
+  - Formulas:
+    - Formulas come from template row 2 or from `products_formulas.csv` (brand-specific).
+    - Formula rows are adjusted per record by **changing only row numbers** (columns preserved).
+  - `product_code_odoo` cleanup:
+    - Remove generic tokens before building code:
+      - `MOD`
+      - `SPECIAL RESERVE` (with or without parentheses)
+      - `SLIDER SUNGLASS`
+    - After cleanup, spaces are replaced with `_` and brand prefixes applied.
+
+### Products verification (Odoo matches)
+- Output file:
+  - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW_verification.xlsx`
+- Built by script (ad‑hoc) using the **current** `YYYYMMDD_products_NEW.xlsx` and Odoo exports:
+  - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
+  - `ENZO-Sage50/_master_odoo/items_odoo.csv`
+- Purpose:
+  - Check which **products** (not variants) are already in Odoo.
+  - Match rules:
+    1) **Primary**: `brand_model` vs `OdooName` (product template name in Odoo)
+    2) **Secondary**: `product_code_odoo` vs `OdooTemplateExternalId`
+       - Odoo stores it as `__import__.{product_code_odoo}`
+- Columns in verification file:
+  - `id`, `barcode`, `brand_model`, `product_code_odoo`, `odoo_template_external_id`, `odoo_name`
+  - `odoo_template_external_id` is stored **without** the prefix before the dot (e.g. `__import__.X` → `X`)
+- `brand_model` calculation:
+  - Brand = first token from `Description for Sales` (multi‑word brands supported: `NW 77TH`, `ERKERS 1879`, `THE NEIGHBORS`)
+  - `name_processed` = `Description for Sales` without brand and without collection/series
+  - Model = text before `C-` in `name_processed`
+  - `brand_model` = `brand + model`
+- `product_code_odoo` calculation for verification:
+  - Built from **model** (not `brand_code`) to avoid color/size leakage.
+  - Same cleanup rules as import (see above).
+
 
 
 ### Countries & states export
 - `python sage_odoo_parity.py export_countries` fetches Odoo reference data and builds parity:
   - Exports: `countries_odoo.csv`, `states_odoo.csv`
   - Parity tables: `_parity_country.csv`, `_parity_state.csv`
+
+### Odoo color attributes export
+- `python sage_odoo_parity.py refresh_odoo` now also exports:
+  - `ENZO-Sage50/_master_odoo/atributos_color.csv`
+  - Fields: `OdooId`, `OdooName`, `AttributeId`, `AttributeName`
+  - Source: `product.attribute.value` filtered by attribute name containing “color”
 
 ### Template headers (customers.xlsx)
 - Added fields now used: `CustomerRef`, `ContactName`, `ContactEmail`, `ContactPhone`, `ContactJobTitle`, `ContactNotes`.
