@@ -652,12 +652,9 @@ def refresh_odoo(args: argparse.Namespace) -> int:
         "OdooName",
         "OdooVariantName",
         "OdooItemCode",
-        "OdooBarcode",
         "OdooColor",
         "Active",
         "OdooTemplateExternalId",
-        "OdooTemplateCode",
-        "OdooTemplateBarcode",
     ]
     with open(items_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=item_fields, delimiter=DELIMITER)
@@ -667,7 +664,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
             rows = client.search_read(
                 "product.product",
                 [],
-                ["id", "name", "display_name", "default_code", "barcode", "active", "product_template_attribute_value_ids", "product_tmpl_id"],
+                ["id", "name", "display_name", "default_code", "active", "product_template_attribute_value_ids", "product_tmpl_id"],
                 limit=batch,
                 offset=offset,
             )
@@ -704,28 +701,11 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                             "attribute": attr_name,
                         }
             tmpl_external = {}
-            tmpl_info = {}
             if tmpl_ids:
                 ids = list(tmpl_ids)
                 chunk_size = 1000
                 for i in range(0, len(ids), chunk_size):
                     chunk = ids[i:i + chunk_size]
-                    tmpl_rows = client.models.execute_kw(
-                        client.db,
-                        client.uid,
-                        client.apikey,
-                        "product.template",
-                        "read",
-                        [chunk],
-                        {"fields": ["default_code", "barcode"]},
-                    )
-                    for t in tmpl_rows:
-                        tid = t.get("id")
-                        if tid:
-                            tmpl_info[tid] = {
-                                "default_code": t.get("default_code", "") or "",
-                                "barcode": t.get("barcode", "") or "",
-                            }
                     data_rows = client.models.execute_kw(
                         client.db,
                         client.uid,
@@ -749,18 +729,14 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                         color_values.append(info.get("name", ""))
                 tmpl = r.get("product_tmpl_id") or []
                 tmpl_id = tmpl[0] if isinstance(tmpl, list) and tmpl else ""
-                tinfo = tmpl_info.get(tmpl_id, {}) if tmpl_id else {}
                 writer.writerow({
                     "OdooVariantId": r.get("id", ""),
                     "OdooName": r.get("name", "") or "",
                     "OdooVariantName": r.get("display_name", "") or "",
                     "OdooItemCode": r.get("default_code", "") or "",
-                    "OdooBarcode": r.get("barcode", "") or "",
                     "OdooColor": " / ".join([c for c in color_values if c]),
                     "Active": r.get("active", ""),
                     "OdooTemplateExternalId": tmpl_external.get(tmpl_id, ""),
-                    "OdooTemplateCode": tinfo.get("default_code", "") or "",
-                    "OdooTemplateBarcode": tinfo.get("barcode", "") or "",
                 })
             offset += len(rows)
 
@@ -850,23 +826,11 @@ def sync_local(args: argparse.Namespace) -> int:
             odoo_cust_by_name.setdefault(name, []).append(r)
 
     odoo_item_by_code: Dict[str, List[Dict[str, str]]] = {}
-    odoo_item_by_barcode: Dict[str, List[Dict[str, str]]] = {}
-    odoo_template_by_code: Dict[str, List[Dict[str, str]]] = {}
-    odoo_template_by_barcode: Dict[str, List[Dict[str, str]]] = {}
     odoo_item_by_id: Dict[str, Dict[str, str]] = {}
     for r in odoo_item_rows:
         code = (r.get("OdooItemCode") or "").strip()
         if code:
             odoo_item_by_code.setdefault(code, []).append(r)
-        barcode = (r.get("OdooBarcode") or "").strip()
-        if barcode:
-            odoo_item_by_barcode.setdefault(barcode, []).append(r)
-        tcode = (r.get("OdooTemplateCode") or "").strip()
-        if tcode:
-            odoo_template_by_code.setdefault(tcode, []).append(r)
-        tbarcode = (r.get("OdooTemplateBarcode") or "").strip()
-        if tbarcode:
-            odoo_template_by_barcode.setdefault(tbarcode, []).append(r)
         oid = str(r.get("OdooVariantId") or "").strip()
         if oid:
             odoo_item_by_id[oid] = r
@@ -919,26 +883,8 @@ def sync_local(args: argparse.Namespace) -> int:
             continue
         matches = odoo_item_by_code.get(item_id, [])
         row["LastLookupAt"] = now
-        record = None
         if len(matches) == 1:
             record = matches[0]
-        if record is None:
-            barcode = (row.get("Barcode") or "").strip()
-            if barcode:
-                bmatches = odoo_item_by_barcode.get(barcode, [])
-                if len(bmatches) == 1:
-                    record = bmatches[0]
-        if record is None:
-            tmatches = odoo_template_by_code.get(item_id, [])
-            if len(tmatches) == 1:
-                record = tmatches[0]
-        if record is None:
-            barcode = (row.get("Barcode") or "").strip()
-            if barcode:
-                tbmatches = odoo_template_by_barcode.get(barcode, [])
-                if len(tbmatches) == 1:
-                    record = tbmatches[0]
-        if record:
             row["OdooVariantId"] = str(record.get("OdooVariantId", ""))
             row["OdooName"] = record.get("OdooName", "") or ""
             row["OdooColor"] = record.get("OdooColor", "") or ""
