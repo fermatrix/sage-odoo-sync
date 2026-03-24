@@ -1,361 +1,151 @@
-# Sage 50 → Odoo Sync (Project Notes)
+# Sage 50 -> Odoo Sync (Project Notes)
 
 ## WORK IN PROGRESS
-- Waiting on Ally’s feedback about **no‑barcode products** that look like frames.
+- Waiting on Ally’s feedback about **no-barcode products** that look like frames.
 - Next steps once confirmed:
   - Move those items from `products_sync_nobarcode_NEW.csv` into `products_sync_NEW.csv`.
-  - Regenerate:
-    - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
-    - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW_verification.xlsx`
-  - Remove those items from the no‑barcode list.
-- `NW77PLAQUE` confirmed: excluded from NEW, kept in no‑barcode.
+  - Regenerate `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`.
+  - Remove those items from the no-barcode list.
+- `NW77PLAQUE` confirmed: excluded from NEW, kept in no-barcode.
 
-## Current Workflow (March 13, 2026)
+## PROCESOS REMOTOS en el ORDENADOR donde esta SAGE
+- Watcher:
+  - Script: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec\watcher\autoexec_watcher.ps1`
+  - Jobs folder: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec`
+  - EXE folder: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec\exe`
+  - Logs: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec\log\autoexec.log`
+  - Done: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec\done`
+- Job files (`*.job.txt`):
+  - Line 1 = exe name (must exist in `autoexec\exe`)
+  - Line 2+ = one argument per line
+- Important:
+  - `odbc_master_export.exe` requires `--password` or exits with code `2`.
+  - Watcher injects `--out-dir` if missing. Prefer explicit paths:
+    - Sage master exports -> `C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage`
+    - Odoo master exports -> `C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_odoo`
+    - Match/sync outputs -> `C:\Users\soadmin\Dropbox\ENZO-Sage50\_master`
 
-Primary commands (run from repo root):
-```
-python sage_odoo_parity.py refresh_sage
-python sage_odoo_parity.py refresh_odoo
-python sage_odoo_parity.py sync
-python sage_odoo_parity.py build_contacts_sync
-python sage_odoo_parity.py build_contacts
-python sage_odoo_parity.py build_addresses_sync
-python sage_odoo_parity.py build_delivery_addresses
-python sage_odoo_parity.py build_billto_sync
-python sage_odoo_parity.py build_billto
-python sage_odoo_parity.py build_product_sync --year-month 2026_02
-python sage_odoo_parity.py build_items_sync_new
-python sage_odoo_parity.py export_countries
-```
-
-Code layout (March 19, 2026):
-- `sage_odoo_parity.py` — CLI entrypoint (argparse) and core orchestration
-- `sync_customers.py` — shared helpers (CSV, env, normalization) used by flows
-- `sync_contacts.py` — contacts flow (build contacts sync + import XLSX)
-- `sync_products.py` — product sync + products_sync_NEW
-- `sync_parity.py` — countries/states export + parity tables
-- `sync_billto.py` — bill-to sync + import XLSX
-
-Folder layout:
-- `ENZO-Sage50/_master_sage/` — Sage **general/master** exports (non-temporal tables like Customers, Items, Address, Contacts)
-- `ENZO-Sage50/_master_odoo/` — Odoo master exports (`customers_odoo.csv`, `items_odoo.csv`)
-- `ENZO-Sage50/_master/` — Sync outputs and match files (Sage ↔ Odoo)
-
-Key outputs:
-- `ENZO-Sage50/_master/customers_sync.csv`
-  - Includes `CustomerIsInactive`, `CustomerSince`, `LastInvoiceDate`
-- `ENZO-Sage50/_master/products_sync.csv`
-  - Includes `ItemIsInactive`, `OdooColor`, `Barcode` (from `UPC_SKU`), `ItemDescriptionForSale`
-- `ENZO-Sage50/_master/products_sync_NEW.csv`
-  - Items without Odoo match, barcode present (default >=12 digits)
-- `ENZO-Sage50/_master/YYYY_MM_product_sync.csv`
-  - Items present in that month's invoice + credit note lines that are missing in Odoo
-- `ENZO-Sage50/_master/_customer_FAILS.csv`
-- `ENZO-Sage50/_master/_product_FAILS.csv`
-
-Odoo import files:
-- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_NEW.xlsx`
-  - Active Sage customers without Odoo match, formatted for import
-- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_contacts_CHILDREN.xlsx`
-  - Child contact rows for customers that already have `OdooId` (after import + refresh/sync)
-- `ENZO-Sage50/_master/odoo_templates/customer_contacts.xlsx`
-  - Template used for contact imports
-- `ENZO-Sage50/_master/customers_NEW.xlsx`
-  - Same as above, without timestamp (working copy)
-- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_billto_NEW.xlsx`
-  - Bill-to invoice addresses (type=`invoice`) for existing customers
-Note on naming: use `IMPORTED` (not `INPORTED`) in filenames for files that were already imported into Odoo.
-
-Odoo reference exports:
-- `ENZO-Sage50/_master_odoo/countries_odoo.csv`
-- `ENZO-Sage50/_master_odoo/states_odoo.csv`
-- `ENZO-Sage50/_master_odoo/customers_contacts.csv` (Odoo contacts with `ParentId`)
-
-Parity tables (generated from Sage Address + Odoo reference lists):
-- `ENZO-Sage50/_master/_parity_country.csv`
-  - `sage_country_raw` → `odoo_country_code` suggestions (ISO2)
-- `ENZO-Sage50/_master/_parity_state.csv`
-  - `sage_state_raw` → `odoo_state_name` (full state) + implied country
-- `ENZO-Sage50/_master/customers_NEW.xlsx`
-  - Minimal tracking list (same customers, fewer columns)
-
-Data hygiene:
-- All customer and invoice data files are excluded by `.gitignore` (CSV/XLS/XLSX/PDF and Sage output folders).
-
-## Sage ODBC Tables (Known Names)
-
-Confirmed in this DSN/catalog (`STUDIOOPTYXINC`):
-- `Customers` (master customers)
-- `Address` (customer address master)
-- `Contacts` (customer contacts master)
-- `LineItem` (product/master item table used for items export)
-- `JrnlHdr` (invoice/transaction headers)
-- `JrnlRow` (invoice/transaction lines)
+## TABLAS DE SAGE
+Tablas ODBC confirmadas (DSN `STUDIOOPTYXINC`):
+- `Customers`
+- `Address`
+- `Contacts`
+- `LineItem` (items master)
+- `JrnlHdr` (invoice headers)
+- `JrnlRow` (invoice lines)
 - `StoredTransHeaders`
 - `StoredTransRows`
 - `Tax_Code`
 - `Tax_Authority`
 - `PaymentMethod`
 
-Other item-related tables present (not used for master export yet):
+Otras tablas de items (no usadas por ahora):
 - `BOMItems`
 - `InventoryChains`
 - `InventoryCosts`
 
-## Discovery Summary (March 12, 2026)
+## PROCESOS DE SINCRONIZADO
 
-### Invoice references
-- The Excel file `ENZO-Sage50/13_2026/01_02_Feb/_ENZO_balance_sheet_2023_2024_2025.xlsx` contains a sheet **"Sales Invoice List"**.
-- In that sheet, **"Invoice No."** values match the **`Reference`** field in the Sage ODBC exports.
-- **`CustomerInvoiceNo` is empty** in the Sage ODBC exports for these invoices.
-
-Quick validation (February 2026):
-- Excel invoice refs: **2093**
-- Exported header refs matched: **2091** (missing only `""` and `"DELETE THIS"`).
-
-### Journal mapping (current working assumption)
-- **Invoices:** `Module=R`, `JournalEx=8`
-- **Credit notes:** `Module=R`, `JournalEx=3`
-
-These mappings may be refined if the business rules change, but they currently align with the February 2026 invoice list.
-
-### Output structure (fiscal year 13 / 2026)
-Monthly folders under:
-`ENZO-Sage50/13_2026/`
-
-Naming convention:
-- `YYYY_MM_invoices.csv` (invoice headers)
-- `YYYY_MM_invoice_lines.csv` (invoice line items)
-- `YYYY_MM_credit_notes.csv` (credit note headers)
-- `YYYY_MM_credit_note_lines.csv` (credit note line items)
-
-Example:
+### (1) CUSTOMERS
+Comandos:
 ```
-13_2026/01_02_Feb/2026_02_invoices.csv
-13_2026/01_02_Feb/2026_02_invoice_lines.csv
-13_2026/01_02_Feb/2026_02_credit_notes.csv
-13_2026/01_02_Feb/2026_02_credit_note_lines.csv
+python sage_odoo_parity.py refresh_sage
+python sage_odoo_parity.py refresh_odoo
+python sage_odoo_parity.py sync
 ```
+Entradas principales:
+- Sage: `ENZO-Sage50/_master_sage/customers.csv`
+- Sage: `ENZO-Sage50/_master_sage/address.csv` (solo `AddressTypeNumber = 0` para el address principal)
+- Odoo: `ENZO-Sage50/_master_odoo/customers_odoo.csv`
 
-### Remote autoexec watcher
-- Jobs are dropped into: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec`
-- Executables live in: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec\exe`
-- Outputs go to final destination folders (e.g. `13_2026/...`)
-- Logs: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec\log\autoexec.log`
-- Watcher script: `C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec\watcher\autoexec_watcher.ps1`
+Salidas:
+- `ENZO-Sage50/_master/customers_sync.csv`
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_NEW.xlsx`
 
-The watcher ignores jobs prefixed with `executed_`, `failed_`, or `processing_`, and moves completed jobs into `autoexec/done`.
+Lógica clave:
+- Dirección principal:
+  - Se toma **solo** `AddressTypeNumber = 0` como address principal.
+  - Si hay varias filas tipo 0, se usa la de menor `AddressRecordNumber`.
+  - Campos pegados al Customer:
+    - `street` = `AddressLine1`
+    - `street2` = `AddressLine2`
+    - `city` = `City`
+    - `zip` = `Zip`
+    - `state_id` = `State` (con parity)
+    - `country_id` = `Country` (con parity)
+- Parity:
+  - País: `_parity_country.csv`
+  - Estado: `_parity_state.csv`
+- `refresh_odoo` exporta también contactos y child partners para matches posteriores.
 
-#### Autoexec job notes (important)
-- Job files are `*.job.txt` with:
-  - Line 1: exe name (must exist in `autoexec\exe`)
-  - Line 2+: one argument per line
-- `odbc_master_export.exe` **must** be given `--password` or it exits with code `2`.
-- The watcher auto-injects `--out-dir` if not provided, but:
-  - For **Sage general/master** exports, explicitly use:
-    - `C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage`
-  - For **Odoo masters**, use:
-    - `C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_odoo`
-  - For **match/sync outputs**, use:
-    - `C:\Users\soadmin\Dropbox\ENZO-Sage50\_master`
-
-Example job (export Address to `_master_sage`):
+### (2) BILL TO
+Comandos:
 ```
-odbc_master_export.exe
---password
-S@g31879
---table
-Address
---out-name
-address
---out-dir
-C:\Users\soadmin\Dropbox\ENZO-Sage50\_master_sage
+python sage_odoo_parity.py build_billto_sync
+python sage_odoo_parity.py build_billto
 ```
+Entradas:
+- Sage: `contacts.csv`, `address.csv`
+- Odoo: `customers_contacts.csv` (exportado en `refresh_odoo`)
 
-## Customers_NEW generation notes (March 16, 2026)
+Salidas:
+- `ENZO-Sage50/_master/customers_billto_sync.csv`
+- `ENZO-Sage50/_master/customers_billto_sync_NEW.csv`
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_billto_NEW.xlsx`
 
-### Source tables
-- `customers.csv` (Sage master)
-- `address.csv` (Sage master)
-- `contacts.csv` (Sage master)
+Lógica clave:
+- Bill To = contactos primarios (`IsPrimaryContact = 1`).
+- Join con direcciones por `AddressRecordNumber`.
+- En Odoo: `type = invoice`.
+- Match: `ParentId` + `Reference`.
 
-### Address logic
-- Join key: `Customers.CustomerRecordNumber` ↔ `Address.CustomerRecordNumber`.
-- Only **AddressTypeNumber = 0** is used (single address per customer).
-- If no Address row exists, **leave address fields empty** (no fallback to `Cardholder_*`).
-- Country/state mapping is applied **only when generating `customers_NEW.xlsx`**:
-  - Country uses `_parity_country.csv` (ISO2). If no match, keep the Sage value.
-  - State uses `_parity_state.csv` to map code → full name.
-  - If country is missing but the state matches, infer country from state (US/Canada, etc.).
-Pending (stores / delivery addresses):
-We currently use the primary Address as the company address. Additional addresses (stores, delivery locations, or any AddressTypeNumber ≠ 0) will be handled later as a separate flow, likely as child delivery addresses similar to Contacts in Odoo.
+### (3) ADDRESS
+Comandos:
+```
+python sage_odoo_parity.py build_addresses_sync
+python sage_odoo_parity.py build_delivery_addresses
+```
+Entradas:
+- Sage: `contacts.csv`, `address.csv`
+- Odoo: `customers_delivery_addresses.csv` (exportado en `refresh_odoo`)
 
-### Contact logic (primary contact)
-- Child contacts are now exported in a **separate import file** after parent companies exist in Odoo.
-- Each child row is included **only if** there is an `IsPrimaryContact=1` and the parent has an `OdooId`.
-- Child contact has **no address** and **no `company_name`**.
-- Child contact does carry `email` and `phone` (if present in `contacts.csv`).
-- `External_ID` for child contact: `CustomerID_ContactRecordNumber` (fallback to `CustomerID_contact` if missing).
-- `CustomerRef` is filled **only on the company row**, **left empty on child**.
-- `ParentId` is set to the **OdooId** of the parent record in the child row.
-- Contacts are only emitted into the NEW file if:
-  - They do **not** already exist in Odoo (matched by name/email/phone under the same parent), and
-  - The parent company exists in Odoo (valid `ParentId`).
+Salidas:
+- `ENZO-Sage50/_master/customer_delivery_addresses_sync.csv`
+- `ENZO-Sage50/_master/customer_delivery_addresses_sync_NEW.csv`
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_delivery_NEW.xlsx`
 
-### Contacts sync (new)
-- `python sage_odoo_parity.py build_contacts_sync` builds:
-  - `ENZO-Sage50/_master/customer_contacts_sync.csv`
-  - This matches Sage primary contacts to existing Odoo contacts from:
-    - `ENZO-Sage50/_master_odoo/customers_contacts.csv` (exported by `refresh_odoo`)
+Lógica clave:
+- Delivery addresses salen de **contactos no primarios** con `AddressRecordNumber`.
+- Join: `contacts.AddressRecordNumber` -> `address.AddressRecordNumber`.
+- `External_ID` = `CustomerID_ContactRecordNumber`.
+- Notas: `AddressTypeNumber | AddressTypeDesc`.
 
-### Addresses sync (new, draft)
-- `python sage_odoo_parity.py build_addresses_sync` builds:
-  - `ENZO-Sage50/_master/customer_delivery_addresses_sync.csv`
-- Current logic (draft):
-  - Source contacts are **non-primary** Sage contacts that have an `AddressRecordNumber`.
-  - Join is `contacts.AddressRecordNumber` ↔ `address.AddressRecordNumber`.
-  - Delivery name comes from `contacts.CompanyName`.
-  - Matches Odoo delivery addresses using `ParentId` + name or address fields.
-  - `Mail To` and other non-delivery address types are **not handled yet**.
+### (4) PRODUCTS
+Comandos:
+```
+python sage_odoo_parity.py build_product_sync --year-month YYYY_MM
+python sage_odoo_parity.py build_items_sync_new
+python sage_odoo_parity.py build_products_sync_nobarcode_new
+python sage_odoo_parity.py build_products_import
+```
+Entradas:
+- Sage: `ENZO-Sage50/_master_sage/items.csv` (UPC en `UPC_SKU`)
+- Odoo: `ENZO-Sage50/_master_odoo/items_odoo.csv`
 
-### Bill-to sync (new)
-- `python sage_odoo_parity.py build_billto_sync` builds:
-  - `ENZO-Sage50/_master/customers_billto_sync.csv`
-- `python sage_odoo_parity.py build_billto` builds:
-  - `ENZO-Sage50/_master/customers_billto_sync_NEW.csv`
-  - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_billto_NEW.xlsx`
-- Logic:
-  - Uses **primary contacts** (`IsPrimaryContact = 1`) as Bill To.
-  - Join via `contacts.AddressRecordNumber` ↔ `address.AddressRecordNumber`.
-  - Writes `type = invoice` in Odoo import.
-  - Matches by `ParentId` + `Reference` (`res.partner.ref`) to avoid duplicates.
+Salidas:
+- `ENZO-Sage50/_master/products_sync.csv`
+- `ENZO-Sage50/_master/products_sync_NEW.csv` (barcode >= 12)
+- `ENZO-Sage50/_master/products_sync_nobarcode_NEW.csv` (barcode vacío o corto)
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
 
-### Product sync (new)
-- `python sage_odoo_parity.py build_product_sync --year-month YYYY_MM`
-  - Scans:
-    - `ENZO-Sage50/**/YYYY_MM_invoice_lines.csv`
-    - `ENZO-Sage50/**/YYYY_MM_credit_note_lines.csv`
-  - Joins with:
-    - `ENZO-Sage50/_master_sage/items.csv` (barcode in `UPC_SKU`)
-    - `ENZO-Sage50/_master/products_sync.csv`
-  - Outputs:
-    - `ENZO-Sage50/_master/YYYY_MM_product_sync.csv`
+Filtros/Notas:
+- Excluir descripciones que empiecen por `DERAPAGE`, `ECLIPSE`, `90 PIECE`.
+- `NW77PLAQUE` se excluye de NEW y se incluye en nobarcode.
+- El import usa la plantilla simplificada `ENZO-Sage50/_master/odoo_templates/products.xlsx`.
+  - Columnas fijas: `x` = `E`, `id`, `barcode`, `if_favorite`, `is_storable`, `Description for Sales`, `Item Description`.
+- Nota: el fichero de verificacion de productos **ya no se genera**.
 
-### Items sync NEW (new)
-- `python sage_odoo_parity.py build_items_sync_new`
-  - Filters `ENZO-Sage50/_master/products_sync.csv`:
-    - No `OdooVariantId`
-    - `Barcode` has >= 12 digits (default)
-    - Includes inactive items (no `ItemIsInactive` filter)
-    - **Excludes** `ItemID = NW77PLAQUE` (not a frame; handled in nobarcode list)
-  - Output:
-    - `ENZO-Sage50/_master/products_sync_NEW.csv`
-  - Options:
-    - `--barcode-digits 0` disables barcode-length filtering
-  - Adds `Invoiced2026` column (X) if item appears in 2026_02 or 2026_03 invoice lines
-
-### Products sync NEW (no barcode)
-- `python sage_odoo_parity.py build_products_sync_nobarcode_new`
-  - Filters `ENZO-Sage50/_master/products_sync.csv`:
-    - No `OdooVariantId`
-    - Barcode is empty or shorter than 12 digits
-    - **Includes** `ItemID = NW77PLAQUE` even if barcode exists
-    - Excludes `ItemDescriptionForSale` starting with `DERAPAGE`, `ECLIPSE`, `90 PIECE`
-  - Output:
-    - `ENZO-Sage50/_master/products_sync_nobarcode_NEW.csv`
-  - Adds `Invoiced2026` column (X) if item appears in 2026_02 or 2026_03 invoice lines
-
-### Products import (Odoo template)
-- `python sage_odoo_parity.py build_products_import`
-  - Input:
-    - `ENZO-Sage50/_master/products_sync_NEW.csv`
-    - `ENZO-Sage50/_master/odoo_templates/products.xlsx` (template)
-    - `ENZO-Sage50/_master/odoo_templates/products_formulas.csv` (brand formulas, `;` separated)
-  - Output:
-    - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
-  - The output workbook keeps **only the first sheet** (template extra sheets removed).
-  - Rows are **sorted by `Description for Sales`** to group brands together.
-  - Fixed columns:
-    - `id` = `ItemID`
-    - `x` = `F`
-    - `if_favorite` = `FALSE`
-    - `is_storable` = `TRUE`
-    - `Description for Sales` = `ItemDescriptionForSale`
-    - `Item Description` = `ItemDescription`
-  - Brand detection:
-    - Uses leading token from `Description for Sales`.
-    - Multi-word brands handled: `NW 77TH`, `ERKERS 1879`, `THE NEIGHBORS`.
-  - Collection extraction:
-    - If `Description for Sales` contains `COLLECTION` or `SERIES`,
-      the **leading phrase up to that word** is moved into `collection`
-      (examples: `IQ SERIES`, `HOME COLLECTION`, `IQ MINI SERIES`, `SLIDER SERIES`).
-    - `name_processed` removes both brand and collection.
-  - `description_processed`:
-    - Removes the brand from `Item Description`.
-    - Handles simplified brand labels (example: brand `ERKERS 1879` → strips `ERKERS`).
-  - `color_code`:
-    - Extracts `C-XXXX` token from `Item Description` (fallback to `Description for Sales`).
-  - `brand_code`:
-    - `description_processed` without the `color_code` token.
-  - `product_code_odoo`:
-    - Built from `brand_code`, replacing spaces with `_`.
-    - Brand prefixes:
-      - `ERKERS 1879`: no prefix (uses `brand_code`)
-      - `THE NEIGHBORS`: no prefix (uses `brand_code`)
-      - `BA&SH`: `BA_`
-      - `MONOQOOL`: `MQ_`
-      - `TOCCO`: `TO_`
-      - `NW 77TH`: `NW_`
-  - `category`:
-    - `Brand / Sunglass` if `Description for Sales` contains `SUNGLASS` or ` SG `
-    - Otherwise `Brand / Optical`
-  - Formulas:
-    - Formulas come from template row 2 or from `products_formulas.csv` (brand-specific).
-    - Formula rows are adjusted per record by **changing only row numbers** (columns preserved).
-  - `product_code_odoo` cleanup:
-    - Remove generic tokens before building code:
-      - `MOD`
-      - `SPECIAL RESERVE` (with or without parentheses)
-      - `SLIDER SUNGLASS`
-    - After cleanup, spaces are replaced with `_` and brand prefixes applied.
-
-### Products verification (Odoo matches)
-- Output file:
-  - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW_verification.xlsx`
-- Built by script (ad‑hoc) using the **current** `YYYYMMDD_products_NEW.xlsx` and Odoo exports:
-  - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
-  - `ENZO-Sage50/_master_odoo/items_odoo.csv`
-- Purpose:
-  - Check which **products** (not variants) are already in Odoo.
-  - Match rules:
-    1) **Primary**: `brand_model` vs `OdooName` (product template name in Odoo)
-    2) **Secondary**: `product_code_odoo` vs `OdooTemplateExternalId`
-       - Odoo stores it as `__import__.{product_code_odoo}`
-- Columns in verification file:
-  - `id`, `barcode`, `brand_model`, `product_code_odoo`, `odoo_template_external_id`, `odoo_name`
-  - `odoo_template_external_id` is stored **without** the prefix before the dot (e.g. `__import__.X` → `X`)
-- `brand_model` calculation:
-  - Brand = first token from `Description for Sales` (multi‑word brands supported: `NW 77TH`, `ERKERS 1879`, `THE NEIGHBORS`)
-  - `name_processed` = `Description for Sales` without brand and without collection/series
-  - Model = text before `C-` in `name_processed`
-  - `brand_model` = `brand + model`
-- `product_code_odoo` calculation for verification:
-  - Built from **model** (not `brand_code`) to avoid color/size leakage.
-  - Same cleanup rules as import (see above).
-
-
-
-### Countries & states export
-- `python sage_odoo_parity.py export_countries` fetches Odoo reference data and builds parity:
-  - Exports: `countries_odoo.csv`, `states_odoo.csv`
-  - Parity tables: `_parity_country.csv`, `_parity_state.csv`
-
-### Odoo color attributes export
-- `python sage_odoo_parity.py refresh_odoo` now also exports:
+Extras (Odoo):
+- `refresh_odoo` tambien exporta colores:
   - `ENZO-Sage50/_master_odoo/atributos_color.csv`
-  - Fields: `OdooId`, `OdooName`, `AttributeId`, `AttributeName`
-  - Source: `product.attribute.value` filtered by attribute name containing “color”
-
-### Template headers (customers.xlsx)
-- Added fields now used: `CustomerRef`, `ContactName`, `ContactEmail`, `ContactPhone`, `ContactJobTitle`, `ContactNotes`.
-- `Contact*` fields are filled **only on child rows**.
+  - Campos: `OdooId`, `OdooName`, `AttributeId`, `AttributeName`
