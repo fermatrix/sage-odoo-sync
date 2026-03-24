@@ -316,139 +316,8 @@ def build_products_import(args: argparse.Namespace) -> int:
         col_idx = header_map.get(col_name)
         if col_idx:
             ws.cell(row=row_idx, column=col_idx, value=value)
-
-    def adjust_formula(formula: str, row_idx: int) -> str:
-        import re
-        # Replace any cell reference row number with the current row index,
-        # ignoring absolute row ($) so it always tracks the current record.
-        # Example: A2 -> A{row_idx}, $B$2 -> $B{row_idx}, C$5 -> C{row_idx}
-        def repl(match):
-            col = match.group(1)
-            return f"{col}{row_idx}"
-        return re.sub(r"(\$?[A-Z]{1,3})(\$?)(\d+)", repl, formula)
-
-    # Capture default formulas from row 2, if present
-    formula_map = {}
-    for col_idx in range(1, ws.max_column + 1):
-        v = ws.cell(row=2, column=col_idx).value
-        if isinstance(v, str) and v.startswith("="):
-            header = ws.cell(row=1, column=col_idx).value
-            if header:
-                formula_map[str(header).strip()] = v
-
-    # Load brand-specific formulas table (semicolon-separated)
-    formulas_by_brand = {}
-    formulas_path = os.path.join(master_root, "odoo_templates", "products_formulas.csv")
-    if os.path.exists(formulas_path):
-        try:
-            import csv
-            with open(formulas_path, "r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f, delimiter=";")
-                for row in reader:
-                    brand = (row.get("brand") or "").strip()
-                    if not brand:
-                        continue
-                    formulas_by_brand[brand] = row
-        except Exception:
-            formulas_by_brand = {}
-
     ws.delete_rows(2, ws.max_row)
     row_idx = 2
-
-    def clean_spaces(value: str) -> str:
-        return " ".join((value or "").strip().split())
-
-    def extract_brand(desc: str) -> str:
-        v = (desc or "").strip()
-        if not v:
-            return ""
-        upper = v.upper()
-        multi = ["NW 77TH", "ERKERS 1879", "THE NEIGHBORS"]
-        for m in multi:
-            if upper.startswith(m):
-                return m
-        return v.split(" ", 1)[0].strip()
-
-    def strip_brand(desc: str, brand: str) -> str:
-        if not desc:
-            return ""
-        v = desc.strip()
-        if brand:
-            b = brand.upper()
-            if v.upper().startswith(b + " "):
-                v = v[len(brand):].strip()
-            else:
-                # Handle simplified brand names in description (e.g., ERKERS 1879 -> ERKERS)
-                aliases = {
-                    "ERKERS 1879": "ERKERS",
-                    "THE NEIGHBORS": "NEIGHBORS",
-                }
-                alias = aliases.get(b)
-                if alias and v.upper().startswith(alias + " "):
-                    v = v[len(alias):].strip()
-        return clean_spaces(v)
-
-    def extract_collection(name_processed: str) -> tuple[str, str]:
-        import re
-        v = name_processed or ""
-        # Capture leading "{words} COLLECTION|SERIES" as collection
-        m = re.match(r"^\s*([A-Z0-9&/\- ]+?\b(?:COLLECTION|SERIES)\b)\s*(.*)$", v, re.IGNORECASE)
-        if not m:
-            return "", clean_spaces(v)
-        collection = clean_spaces(m.group(1))
-        remainder = clean_spaces(m.group(2))
-        return collection, remainder
-
-    def extract_color_code(desc: str) -> str:
-        import re
-        text = desc or ""
-        m = re.search(r"\bC-([A-Z0-9]+)\b", text, re.IGNORECASE)
-        if not m:
-            return ""
-        return f"C-{m.group(1)}"
-
-    def is_sunglass(desc: str) -> bool:
-        v = (desc or "").upper()
-        if "SUNGLASS" in v:
-            return True
-        if " SG " in f" {v} ":
-            return True
-        return False
-
-    def compute_brand_code(desc_processed: str, color_code: str) -> str:
-        v = desc_processed or ""
-        if color_code:
-            v = v.replace(color_code, "")
-        return clean_spaces(v)
-
-    def sanitize_model_code(value: str) -> str:
-        import re
-        v = value or ""
-        v = re.sub(r"\bMOD\b", "", v, flags=re.IGNORECASE)
-        v = re.sub(r"\bSPECIAL\s+RESERVE\b", "", v, flags=re.IGNORECASE)
-        v = re.sub(r"\bSLIDER\s+SUNGLASS\b", "", v, flags=re.IGNORECASE)
-        v = v.replace("(", " ").replace(")", " ")
-        return clean_spaces(v)
-
-    def product_code_for_brand(brand: str, brand_code: str) -> str:
-        b = (brand or "").upper()
-        model_code = sanitize_model_code(brand_code or "")
-        model_code = model_code.replace(" ", "_")
-        if not model_code:
-            return ""
-        if b == "ERKERS 1879":
-            return model_code
-        if b == "BA&SH":
-            return f"BA_{model_code}"
-        if b == "MONOQOOL":
-            return f"MQ_{model_code}"
-        if b in {"THE NEIGHBORS", "NEIGHBORS"}:
-            return model_code
-        if b == "TOCCO":
-            return f"TO_{model_code}"
-        if b == "NW 77TH":
-            return f"NW_{model_code}"
-        return model_code
 
     rows_sorted = sorted(rows, key=lambda r: (r.get("ItemDescriptionForSale") or "").upper())
     for r in rows_sorted:
@@ -457,15 +326,6 @@ def build_products_import(args: argparse.Namespace) -> int:
         desc_sales = (r.get("ItemDescriptionForSale") or "").strip()
         desc_item = (r.get("ItemDescription") or "").strip()
 
-        brand = extract_brand(desc_sales)
-        desc_processed = strip_brand(desc_item, brand).replace("C- ", "C-")
-        name_processed = strip_brand(desc_sales, brand).replace("C- ", "C-")
-        collection, name_processed = extract_collection(name_processed)
-        color_code = extract_color_code(desc_item) or extract_color_code(desc_sales)
-        brand_code = compute_brand_code(desc_processed, color_code)
-        product_code_odoo = product_code_for_brand(brand, brand_code)
-        category = f"{brand} / {'Sunglass' if is_sunglass(desc_sales) else 'Optical'}" if brand else ""
-
         set_cell("x", "E")
         set_cell("id", item_id)
         set_cell("barcode", barcode)
@@ -473,33 +333,6 @@ def build_products_import(args: argparse.Namespace) -> int:
         set_cell("is_storable", "TRUE")
         set_cell("Description for Sales", desc_sales)
         set_cell("Item Description", desc_item)
-        set_cell("brand", brand)
-        set_cell("collection", collection)
-        set_cell("name_processed", name_processed)
-        set_cell("description_processed", desc_processed)
-        set_cell("color_code", color_code)
-        set_cell("brand_code", brand_code)
-        set_cell("product_code_odoo", product_code_odoo)
-        set_cell("category", category)
-
-        # Apply formulas for calculated columns (brand-specific if available)
-        formula_cols = {
-            "name_clean",
-            "model",
-            "brand_model",
-            "color",
-            "size",
-            "brand_code",
-            "color_color_code",
-            "search_sting",
-        }
-        brand_formulas = formulas_by_brand.get(brand, {})
-        for col_name in formula_cols:
-            formula = brand_formulas.get(col_name) if brand_formulas else None
-            if not formula:
-                formula = formula_map.get(col_name)
-            if formula:
-                set_cell(col_name, adjust_formula(formula, row_idx))
 
         row_idx += 1
 
