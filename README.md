@@ -149,3 +149,17 @@ Extras (Odoo):
 - `refresh_odoo` tambien exporta colores:
   - `ENZO-Sage50/_master_odoo/atributos_color.csv`
   - Campos: `OdooId`, `OdooName`, `AttributeId`, `AttributeName`
+
+Odoo items export (productos):
+- `refresh_odoo` ahora exporta además en `ENZO-Sage50/_master_odoo/items_odoo.csv`:
+  - `OdooBarcode` (barcode de la variante)
+  - `OdooTemplateCode` (default_code del template)
+  - `OdooTemplateBarcode` (barcode del template)
+
+Matching de productos en `sync`:
+- Orden de match:
+  1) `ItemID` (Sage) ↔ `OdooItemCode` (variant)
+  2) `Barcode` (Sage) ↔ `OdooBarcode` (variant)
+  3) `ItemID` (Sage) ↔ `OdooTemplateCode` (template)
+  4) `Barcode` (Sage) ↔ `OdooTemplateBarcode` (template)
+- Esto cubre casos donde el **producto tiene una sola variante** y el código/barcode está en el template.
