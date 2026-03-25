@@ -83,11 +83,16 @@
 
 - **Recurring training "ERP Training: orders@studiooptyx.com" continues (Feb 3, 10, 17, 24):** Covering sales order creation, customer management, pricing, and invoicing.
 - **Warehouse Configuration training series (Feb 4, 11, 18):** "Odoo – Warehouse Configuration" sessions with 6–7 attendees covering warehouse locations, delivery routes, and stock operations.
+- **Warehouse training attendee change (Feb 4):** Annie left the company; warehouse session rescheduled. Fernando met with Ally and Nina to review warehouse operations and prepare configuration for the next training.
+- **Q&A session cancelled (Feb 5):** Cancelled the next-day Q&A after questions were covered during the warehouse visit.
+- **Nina attendance confirmed (Feb 11):** Confirmation request sent to ensure two people manage warehouse operations.
 - **Invoice to Studio Optyx USA — INV/2026/0017 (Feb 11):** Sent to Jack Erker III.
 - **Missing NW77TH models (Feb 16–20):** Fernando found several NW77TH models (Ceiling Fan, Mod 1075, Crop Top, etc.) missing from Odoo. Extended exchange with Jack Erker III and Jack Sr. to obtain product files with correct format; some descriptions received were incomplete.
 - **Payment gateway research:** Fernando asked Ally about the current payment processor (MX Merchant). Ally confirmed they were considering migrating to **Basys IQPro+**.
 - **Pricelists and product categories guidance:** Fernando sent Jack Jr. a detailed explanation of how to structure categories to apply brand-level discounts in pricelists.
 - **Red Eye Europe — invoicing draft issue:** Paco Cruz reported he could not invoice from a draft. Fernando identified a configuration issue caused by a product category change affecting costing — resolved.
+- **Fiscal year confirmation (Feb 26):** Jack Erker confirmed the fiscal year starts on **1st February**.
+- **Internal ERP meeting scheduled (Feb 26):** Fernando proposed an internal meeting with Jack/John/Tony; Jack confirmed the next morning was good and invitation was sent.
 
 ---
 
@@ -97,6 +102,15 @@
 
 - **Product reconciliation — Sage vs. Odoo (Mar 18–23):** Fernando generated a full product comparison from Sage and sent Ally and Nina a file with **2,059 items** found in Sage. Of these, **78 appeared in 2026 invoices** and were flagged as priority imports. Ally confirmed on Mar 19: yellow-highlighted frames need to be transferred; anything else is discontinued. Fernando sent the final file on Mar 23 (cc: Jack III and Jack Jr.).
 - **ODBC access to Sage 50 (Mar 4):** Fernando requested Dan DiCecca to confirm ODBC access for the "ENZO" user. Dan confirmed access.
+- **Accounting meeting request (Mar 3):** Fernando asked to schedule the first accounting meeting with Barbara (Thu, usual time).
+- **IT contact requested (Mar 5):** Asked for Dan DiCecca’s WhatsApp; contact was shared by Ana Sedes.
+- **Pending requests shared (Mar 6):** Fernando listed pending items:
+  - More Sage privileges to access the database directly for invoice imports into Odoo
+  - Regular accounting training with John & Barbara (at least one session per week)
+  - New frames references (new collections)
+  - Request for a shared accounting/finance email address (e.g., accounting@studiooptyx.com)
+- **Customer import criteria (Mar 13):** Identified **328 customers** in Sage not in Odoo; asked Jack to confirm selection criteria using `CustomerSince` and `LastInvoiceDate`.
+- **Leadership meeting attempts (Mar 16):** Requested a meeting with John/Jack/Tony; Jack noted Tony and John were traveling. Follow‑up proposed meeting with John and a separate session with Ally/Nina (approved).
 - **Odoo–Sage synchronizer (Mar 13–25):**
   - Implemented a full local sync pipeline in Python:
     - Sage exports -> `_master_sage/`
