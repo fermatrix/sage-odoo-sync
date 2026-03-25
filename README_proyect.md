@@ -98,7 +98,7 @@
 
 ## March 2026
 
-**Studio Optyx USA — Product reconciliation from Sage. Pink Adillac — Sales training. Red Eye Europe — SEPA & ODBC.**
+**Studio Optyx USA — Product reconciliation from Sage. **
 
 - **Product reconciliation — Sage vs. Odoo (Mar 18–23):** Fernando generated a full product comparison from Sage and sent Ally and Nina a file with **2,059 items** found in Sage. Of these, **78 appeared in 2026 invoices** and were flagged as priority imports. Ally confirmed on Mar 19: yellow-highlighted frames need to be transferred; anything else is discontinued. Fernando sent the final file on Mar 23 (cc: Jack III and Jack Jr.).
 - **ODBC access to Sage 50 (Mar 4):** Fernando requested Dan DiCecca to confirm ODBC access for the "ENZO" user. Dan confirmed access.
