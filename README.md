@@ -127,6 +127,8 @@ python sage_odoo_parity.py build_product_sync --year-month YYYY_MM
 python sage_odoo_parity.py build_items_sync_new
 python sage_odoo_parity.py build_products_sync_nobarcode_new
 python sage_odoo_parity.py build_products_import
+python sage_odoo_parity.py build_products_nobarcode_import
+python sync_products_sun_vs_optics.py --start 1 --limit 100
 ```
 Entradas:
 - Sage: `ENZO-Sage50/_master_sage/items.csv` (UPC en `UPC_SKU`)
@@ -137,6 +139,8 @@ Salidas:
 - `ENZO-Sage50/_master/products_sync_NEW.csv` (barcode >= 12)
 - `ENZO-Sage50/_master/products_sync_nobarcode_NEW.csv` (barcode vacío o corto)
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_nobarcode_NEW.xlsx`
+- `ENZO-Sage50/_master/odoo_imports/20260507_sun_vs_optics_USA_LOG.csv`
 
 Filtros/Notas:
 - Excluir descripciones que empiecen por `DERAPAGE`, `ECLIPSE`, `90 PIECE`.
@@ -144,6 +148,37 @@ Filtros/Notas:
 - El import usa la plantilla simplificada `ENZO-Sage50/_master/odoo_templates/products.xlsx`.
   - Columnas fijas: `x` = `E`, `id`, `barcode`, `if_favorite`, `is_storable`, `Description for Sales`, `Item Description`.
 - Nota: el fichero de verificacion de productos **ya no se genera**.
+
+Import no-barcode (criterio Ally):
+- `python sage_odoo_parity.py build_products_nobarcode_import`
+  - Fuente: `products_sync_nobarcode_NEW.csv`
+  - Incluye filas:
+    - `Invoiced2026 = X`, o
+    - `ItemDescription` empieza por `ERKERS `, `BA&SH `, `NW 77TH `, `MONOQOOL `
+  - Salida: `odoo_imports/YYYYMMDD_products_nobarcode_NEW.xlsx` usando `products.xlsx`.
+
+Sun vs Optics (variantes) — script dedicado:
+- Script: `sync_products_sun_vs_optics.py`
+- Fuente: `ENZO-Sage50/_master/odoo_imports/20260507_sun_vs_optics_USA.xlsx`
+- Solo procesa filas con `x = E/F`.
+- Orden de proceso por fila:
+  1) Busca producto por External Id `__import__.{product_code_odoo}`.
+  2) Si no existe, **crea** `product.template` con:
+     - `name` = `brand_model`
+     - `categ_id` (si la categoría existe por nombre)
+     - External Id `__import__.{product_code_odoo}`
+  3) Asegura valor de atributo **Color** (crea si no existe) y lo añade al producto.
+  4) Localiza variante por color, actualiza:
+     - `default_code` (SKU)
+     - `barcode` (en paso separado)
+     - `is_storable = True`
+  5) Si la variante ya coincide (SKU + barcode + is_storable), marca **SKIP**.
+- Log:
+  - Archivo: `20260507_sun_vs_optics_USA_LOG.csv`
+  - Separador `;`
+  - Columnas clave: `row`, `Item Description`, `color_color_code`, `product_code`, `sku`, `barcode`, `status`, `detail`, `barcode_error`
+  - El `barcode` se escribe con prefijo `'` para conservar ceros.
+  - `barcode_error` guarda **solo** el primer producto en conflicto (parte izquierda antes de “and”).
 
 Extras (Odoo):
 - `refresh_odoo` tambien exporta colores:

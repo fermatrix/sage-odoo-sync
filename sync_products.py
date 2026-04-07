@@ -339,3 +339,86 @@ def build_products_import(args: argparse.Namespace) -> int:
     wb.save(out_xlsx)
     print(f"OK: products NEW import rows: {len(rows)} -> {out_xlsx}")
     return 0
+
+
+def build_products_nobarcode_import(args: argparse.Namespace) -> int:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        load_workbook = None
+
+    if load_workbook is None:
+        print("ERROR: openpyxl not available for XLSX export")
+        return 2
+
+    sync_path = args.sync_path
+    template_path = args.template_path
+
+    if not os.path.exists(sync_path):
+        print(f"ERROR: products nobarcode sync not found: {sync_path}")
+        return 2
+    if not os.path.exists(template_path):
+        print(f"ERROR: template not found: {template_path}")
+        return 2
+
+    master_root = os.path.dirname(sync_path)
+    odoo_imports = os.path.join(master_root, "odoo_imports")
+    os.makedirs(odoo_imports, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    out_xlsx = os.path.join(odoo_imports, f"{stamp}_products_nobarcode_NEW.xlsx")
+
+    _, rows = read_csv(sync_path)
+
+    wb = load_workbook(template_path)
+    ws = wb["Products"] if "Products" in wb.sheetnames else wb.active
+    for sheet_name in list(wb.sheetnames):
+        if wb[sheet_name] is not ws:
+            wb.remove(wb[sheet_name])
+
+    header_map = {}
+    for col_idx in range(1, ws.max_column + 1):
+        header = ws.cell(row=1, column=col_idx).value
+        if header:
+            header_map[str(header).strip()] = col_idx
+
+    def set_cell(col_name: str, value) -> None:
+        col_idx = header_map.get(col_name)
+        if col_idx:
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    def is_priority_row(r: Dict[str, str]) -> bool:
+        if (r.get("Invoiced2026") or "").strip().upper() == "X":
+            return True
+        desc = (r.get("ItemDescription") or "").strip().upper()
+        return (
+            desc.startswith("ERKERS ")
+            or desc.startswith("BA&SH ")
+            or desc.startswith("NW 77TH ")
+            or desc.startswith("MONOQOOL ")
+        )
+
+    ws.delete_rows(2, ws.max_row)
+    row_idx = 2
+
+    rows_sorted = sorted(rows, key=lambda r: (r.get("ItemDescriptionForSale") or "").upper())
+    selected = [r for r in rows_sorted if is_priority_row(r)]
+    for r in selected:
+        item_id = (r.get("ItemID") or "").strip()
+        barcode = (r.get("Barcode") or "").strip()
+        desc_sales = (r.get("ItemDescriptionForSale") or "").strip()
+        desc_item = (r.get("ItemDescription") or "").strip()
+
+        set_cell("x", "E")
+        set_cell("id", item_id)
+        set_cell("barcode", barcode)
+        set_cell("if_favorite", "FALSE")
+        set_cell("is_storable", "TRUE")
+        set_cell("Description for Sales", desc_sales)
+        set_cell("Item Description", desc_item)
+
+        row_idx += 1
+
+    wb.save(out_xlsx)
+    print(f"OK: products nobarcode import rows: {len(selected)} -> {out_xlsx}")
+    return 0

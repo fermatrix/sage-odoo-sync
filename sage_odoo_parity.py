@@ -21,7 +21,7 @@ from sync_contacts import build_contacts_sync, build_contacts_import
 from sync_addresses import build_addresses_sync, build_delivery_import
 from sync_billto import build_billto_sync, build_billto_import
 from sync_parity import OdooClient, export_countries
-from sync_products import build_product_sync, build_items_sync_new, build_products_sync_nobarcode_new, build_products_import
+from sync_products import build_product_sync, build_items_sync_new, build_products_sync_nobarcode_new, build_products_import, build_products_nobarcode_import
 
 
 
@@ -1310,6 +1310,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx",
     )
     p7c.set_defaults(func=build_products_import)
+
+    p7d = sub.add_parser("build_products_nobarcode_import", help="Build products import XLSX from products_sync_nobarcode_NEW")
+    p7d.add_argument(
+        "--sync-path",
+        default=r"ENZO-Sage50\_master\products_sync_nobarcode_NEW.csv",
+    )
+    p7d.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx",
+    )
+    p7d.set_defaults(func=build_products_nobarcode_import)
 
     p8 = sub.add_parser("export_countries", help="Export Odoo countries + build Sage parity table (address only)")
     p8.add_argument(
