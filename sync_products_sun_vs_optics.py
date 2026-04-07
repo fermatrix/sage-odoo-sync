@@ -9,6 +9,7 @@ from sync_customers import load_env_file, get_env_value
 
 try:
     import openpyxl
+    from openpyxl.styles import PatternFill
 except Exception:
     openpyxl = None
 
@@ -92,21 +93,31 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
     log_fields = [
         "timestamp",
         "row",
+        "id",
         "Item Description",
         "color_color_code",
         "product_code",
         "sku",
         "barcode",
+        "APIPath",
+        "APICalls",
         "status",
         "detail",
         "barcode_error",
     ]
 
-    with open(log_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=log_fields, delimiter=";")
-        writer.writeheader()
+    if openpyxl is None:
+        print("ERROR: openpyxl not available for XLSX export")
+        return 2
 
-        for row_data in rows:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "LOG"
+    for col_idx, name in enumerate(log_fields, start=1):
+        ws.cell(row=1, column=col_idx, value=name)
+    log_row = 2
+
+    for row_data in rows:
             product_code = str(row_data.get("product_code_odoo") or "").strip()
             brand_model = str(row_data.get("brand_model") or "").strip()
             category_name = str(row_data.get("category") or "").strip()
@@ -117,29 +128,120 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
             item_desc = str(row_data.get("Item Description") or "").strip()
             color_code_col = str(row_data.get("color_color_code") or "").strip()
 
+            api_calls = 0
+
+            def call(model, method, *args, **kwargs):
+                nonlocal api_calls
+                api_calls += 1
+                return models.execute_kw(db, uid, apikey, model, method, *args, **kwargs)
+
+            path_label = ""
+
+            ok_fill = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
+
             def write_row(status: str, detail: str, barcode_error: str = "") -> None:
-                writer.writerow({
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "row": row_data.get("_row"),
-                    "Item Description": item_desc,
-                    "color_color_code": color_code_col,
-                    "product_code": product_code,
-                    "sku": sku,
-                    "barcode": barcode_log,
-                    "status": status,
-                    "detail": detail,
-                    "barcode_error": barcode_error,
-                })
+                nonlocal log_row
+                values = [
+                    datetime.now().isoformat(timespec="seconds"),
+                    row_data.get("_row"),
+                    sku,
+                    item_desc,
+                    color_code_col,
+                    product_code,
+                    sku,
+                    barcode_log,
+                    path_label,
+                    api_calls,
+                    status,
+                    detail,
+                    barcode_error,
+                ]
+                for col_idx, val in enumerate(values, start=1):
+                    ws.cell(row=log_row, column=col_idx, value=val)
+                if status == "OK":
+                    for col_idx in range(1, len(values) + 1):
+                        ws.cell(row=log_row, column=col_idx).fill = ok_fill
+                log_row += 1
 
             if not product_code or not color_value:
                 write_row("SKIP", "Missing product_code_odoo or color")
                 continue
 
+            # 0) If variant already exists by SKU, validate color + barcode and skip/update
+            sku_match = call(
+                "product.product",
+                "search_read",
+                [[("default_code", "=", sku)]],
+                {"fields": ["id", "barcode", "is_storable", "product_template_attribute_value_ids"]},
+            )
+            if sku_match:
+                path_label = "SHORT"
+                v = sku_match[0]
+                variant_id = v.get("id")
+                current_barcode = (v.get("barcode") or "").strip()
+                current_store = v.get("is_storable")
+                ptav_ids = v.get("product_template_attribute_value_ids") or []
+
+                if args.verify_color:
+                    # Resolve color value name on variant
+                    color_name = ""
+                    if ptav_ids:
+                        ptav_rows = call(
+                            "product.template.attribute.value",
+                            "read",
+                            [ptav_ids],
+                            {"fields": ["name", "attribute_id"]},
+                        )
+                        for pr in ptav_rows:
+                            attr = pr.get("attribute_id") or []
+                            attr_name = (attr[1] if isinstance(attr, list) and len(attr) > 1 else "") or ""
+                            if attr_name.lower() == "color":
+                                color_name = (pr.get("name") or "").strip()
+                                break
+
+                    if not color_name:
+                        write_row("ERROR", "SKU exists but no color on variant")
+                        continue
+                    if color_name != color_value:
+                        write_row("ERROR", f"SKU exists but color mismatch ({color_name})")
+                        continue
+
+                if current_barcode == barcode and bool(current_store) is True:
+                    write_row("OK", "Already up to date")
+                    continue
+
+                # Update is_storable only if needed
+                if not bool(current_store):
+                    try:
+                        call("product.product", "write", [[variant_id], {"is_storable": True}])
+                    except Exception as e:
+                        write_row("WARN", f"is_storable failed: {e}")
+
+                if args.update_barcode and barcode:
+                    try:
+                        call("product.product", "write", [[variant_id], {"barcode": barcode}])
+                        write_row("OK", "Barcode updated")
+                    except Exception as e:
+                        msg = str(e)
+                        left = msg.split(" and ")[0]
+                        conflict = _extract_barcode_conflict(left)
+                        write_row("ERROR", "Barcode update failed", conflict)
+                else:
+                    if barcode:
+                        if current_barcode and current_barcode != barcode:
+                            detail = "Barcode mismatch (update disabled)"
+                        elif current_barcode:
+                            detail = "Barcode already set (update disabled)"
+                        else:
+                            detail = "Barcode missing (update disabled)"
+                    else:
+                        detail = "No barcode provided (update disabled)"
+                    write_row("SKIP", detail)
+                continue
+
             # Find product.template by external id __import__.product_code
-            model_data = models.execute_kw(
-                db,
-                uid,
-                apikey,
+            path_label = "LONG"
+            model_data = call(
                 "ir.model.data",
                 "search_read",
                 [[("model", "=", "product.template"), ("module", "=", "__import__"), ("name", "=", product_code)]],
@@ -153,10 +255,7 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                 # Create product.template
                 categ_id = None
                 if category_name:
-                    c_ids = models.execute_kw(
-                        db,
-                        uid,
-                        apikey,
+                    c_ids = call(
                         "product.category",
                         "search",
                         [[("name", "=", category_name)]],
@@ -167,11 +266,8 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                 vals = {"name": brand_model}
                 if categ_id:
                     vals["categ_id"] = categ_id
-                tmpl_id = models.execute_kw(db, uid, apikey, "product.template", "create", [vals])
-                models.execute_kw(
-                    db,
-                    uid,
-                    apikey,
+                tmpl_id = call("product.template", "create", [vals])
+                call(
                     "ir.model.data",
                     "create",
                     [{
@@ -185,10 +281,7 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                 created = True
 
             # Ensure color attribute value exists
-            color_attrs = models.execute_kw(
-                db,
-                uid,
-                apikey,
+            color_attrs = call(
                 "product.attribute",
                 "search_read",
                 [[("name", "ilike", "color")]],
@@ -199,10 +292,7 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                 write_row("ERROR", "No color attribute found")
                 continue
 
-            val_ids = models.execute_kw(
-                db,
-                uid,
-                apikey,
+            val_ids = call(
                 "product.attribute.value",
                 "search",
                 [[("name", "=", color_value), ("attribute_id", "in", color_attr_ids)]],
@@ -210,20 +300,14 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
             if val_ids:
                 color_val_id = val_ids[0]
             else:
-                color_val_id = models.execute_kw(
-                    db,
-                    uid,
-                    apikey,
+                color_val_id = call(
                     "product.attribute.value",
                     "create",
                     [{"name": color_value, "attribute_id": color_attr_ids[0]}],
                 )
 
             # Add color to product.template (attribute line)
-            line_ids = models.execute_kw(
-                db,
-                uid,
-                apikey,
+            line_ids = call(
                 "product.template",
                 "read",
                 [[tmpl_id]],
@@ -232,10 +316,7 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
 
             color_line_id = None
             if line_ids:
-                lines = models.execute_kw(
-                    db,
-                    uid,
-                    apikey,
+                lines = call(
                     "product.template.attribute.line",
                     "read",
                     [line_ids],
@@ -246,10 +327,7 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                     if attr and attr[0] in color_attr_ids:
                         color_line_id = line["id"]
                         if color_val_id not in (line.get("value_ids") or []):
-                            models.execute_kw(
-                                db,
-                                uid,
-                                apikey,
+                            call(
                                 "product.template.attribute.line",
                                 "write",
                                 [[color_line_id], {"value_ids": [(4, color_val_id)]}],
@@ -257,20 +335,14 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                         break
 
             if color_line_id is None:
-                models.execute_kw(
-                    db,
-                    uid,
-                    apikey,
+                call(
                     "product.template",
                     "write",
                     [[tmpl_id], {"attribute_line_ids": [(0, 0, {"attribute_id": color_attr_ids[0], "value_ids": [(6, 0, [color_val_id])]} )]}],
                 )
 
             # Find variant
-            ptav_ids = models.execute_kw(
-                db,
-                uid,
-                apikey,
+            ptav_ids = call(
                 "product.template.attribute.value",
                 "search",
                 [[("product_tmpl_id", "=", tmpl_id), ("product_attribute_value_id", "=", color_val_id)]],
@@ -279,10 +351,7 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                 write_row("ERROR", "No product.template.attribute.value found")
                 continue
 
-            variant_ids = models.execute_kw(
-                db,
-                uid,
-                apikey,
+            variant_ids = call(
                 "product.product",
                 "search",
                 [[("product_tmpl_id", "=", tmpl_id), ("product_template_attribute_value_ids", "in", ptav_ids)]],
@@ -294,10 +363,7 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
             variant_id = variant_ids[0]
 
             # Check current values to decide SKIP
-            current = models.execute_kw(
-                db,
-                uid,
-                apikey,
+            current = call(
                 "product.product",
                 "read",
                 [[variant_id]],
@@ -311,36 +377,45 @@ def process_sun_vs_optics(args: argparse.Namespace) -> int:
                 detail = "Already up to date"
                 if created:
                     detail = "Created product; already up to date"
-                write_row("SKIP", detail)
+                write_row("OK", detail)
                 continue
 
             # Update SKU first
             try:
-                models.execute_kw(db, uid, apikey, "product.product", "write", [[variant_id], {"default_code": sku}])
+                call("product.product", "write", [[variant_id], {"default_code": sku}])
             except Exception as e:
                 write_row("ERROR", f"SKU update failed: {e}")
                 continue
 
-            # Update is_storable if possible
-            try:
-                models.execute_kw(db, uid, apikey, "product.product", "write", [[variant_id], {"is_storable": True}])
-            except Exception as e:
-                write_row("WARN", f"is_storable failed: {e}")
+            # Update is_storable only if needed
+            if not bool(current_store):
+                try:
+                    call("product.product", "write", [[variant_id], {"is_storable": True}])
+                except Exception as e:
+                    write_row("WARN", f"is_storable failed: {e}")
 
-            # Update barcode separately
-            try:
-                models.execute_kw(db, uid, apikey, "product.product", "write", [[variant_id], {"barcode": barcode}])
-                detail = "SKU + barcode updated"
+            # Update barcode separately (always for created/long path)
+            if barcode:
+                try:
+                    call("product.product", "write", [[variant_id], {"barcode": barcode}])
+                    detail = "SKU + barcode updated"
+                    if created:
+                        detail = "Created product; SKU + barcode updated"
+                    write_row("OK", detail)
+                except Exception as e:
+                    msg = str(e)
+                    left = msg.split(" and ")[0]
+                    conflict = _extract_barcode_conflict(left)
+                    write_row("ERROR", "Barcode update failed", conflict)
+            else:
+                detail = "SKU updated; no barcode provided"
                 if created:
-                    detail = "Created product; SKU + barcode updated"
+                    detail = "Created product; SKU updated; no barcode provided"
                 write_row("OK", detail)
-            except Exception as e:
-                msg = str(e)
-                left = msg.split(" and ")[0]
-                conflict = _extract_barcode_conflict(left)
-                write_row("ERROR", "Barcode update failed", conflict)
 
-    print(f\"OK: processed {len(rows)} rows -> {log_path}\")
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    wb.save(log_path)
+    print(f"OK: processed {len(rows)} rows -> {log_path}")
     return 0
 
 
@@ -348,30 +423,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Process sun_vs_optics_USA variants (create product if needed)")
     parser.add_argument(
         "--xlsx-path",
-        default=r\"ENZO-Sage50\\_master\\odoo_imports\\20260507_sun_vs_optics_USA.xlsx\",
-        help=\"Input XLSX with E/F rows\",
+        default=r"ENZO-Sage50\_master\odoo_imports\20260507_sun_vs_optics_USA.xlsx",
+        help="Input XLSX with E/F rows",
     )
     parser.add_argument(
         "--log-path",
-        default=r\"ENZO-Sage50\\_master\\odoo_imports\\20260507_sun_vs_optics_USA_LOG.csv\",
-        help=\"Output log CSV (semicolon-separated)\",
+        default=r"ENZO-Sage50\_master\odoo_imports\20260507_sun_vs_optics_USA_LOG.xlsx",
+        help="Output log XLSX",
     )
     parser.add_argument(
-        \"--start\",
+        "--start",
         type=int,
         default=1,
-        help=\"1-based index among filtered E/F rows\",
+        help="1-based index among filtered E/F rows",
     )
     parser.add_argument(
-        \"--limit\",
+        "--limit",
         type=int,
         default=100,
-        help=\"Number of rows to process\",
+        help="Number of rows to process",
     )
     parser.add_argument(
-        \"--env-file\",
-        default=\".env\",
-        help=\"Env file with Odoo credentials\",
+        "--env-file",
+        default=".env",
+        help="Env file with Odoo credentials",
+    )
+    parser.add_argument(
+        "--update-barcode",
+        action="store_true",
+        help="Update barcode on variant (default: disabled)",
+    )
+    parser.add_argument(
+        "--verify-color",
+        action="store_true",
+        help="Verify variant color in step 0 (default: disabled)",
     )
     return parser
 
@@ -382,5 +467,5 @@ def main() -> int:
     return process_sun_vs_optics(args)
 
 
-if __name__ == \"__main__\":
+if __name__ == "__main__":
     raise SystemExit(main())

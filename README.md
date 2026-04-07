@@ -140,7 +140,7 @@ Salidas:
 - `ENZO-Sage50/_master/products_sync_nobarcode_NEW.csv` (barcode vacío o corto)
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_NEW.xlsx`
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_products_nobarcode_NEW.xlsx`
-- `ENZO-Sage50/_master/odoo_imports/20260507_sun_vs_optics_USA_LOG.csv`
+- `ENZO-Sage50/_master/odoo_imports/20260507_sun_vs_optics_USA_LOG.xlsx`
 
 Filtros/Notas:
 - Excluir descripciones que empiecen por `DERAPAGE`, `ECLIPSE`, `90 PIECE`.
@@ -172,13 +172,27 @@ Sun vs Optics (variantes) — script dedicado:
      - `default_code` (SKU)
      - `barcode` (en paso separado)
      - `is_storable = True`
-  5) Si la variante ya coincide (SKU + barcode + is_storable), marca **SKIP**.
+  5) Si la variante ya coincide (SKU + barcode + is_storable), marca **OK**.
 - Log:
-  - Archivo: `20260507_sun_vs_optics_USA_LOG.csv`
-  - Separador `;`
+  - Archivo: `20260507_sun_vs_optics_USA_LOG.xlsx`
   - Columnas clave: `row`, `Item Description`, `color_color_code`, `product_code`, `sku`, `barcode`, `status`, `detail`, `barcode_error`
   - El `barcode` se escribe con prefijo `'` para conservar ceros.
   - `barcode_error` guarda **solo** el primer producto en conflicto (parte izquierda antes de “and”).
+  - Filas con `status = OK` se rellenan en verde claro.
+  - En el **paso 0**, si no se actualiza barcode, `detail` indica:  
+    - `Barcode mismatch (update disabled)`  
+    - `Barcode already set (update disabled)`  
+    - `Barcode missing (update disabled)`  
+    - `No barcode provided (update disabled)`
+
+Flags del script:
+- `--update-barcode`  
+  - Solo aplica en el **paso 0** (cuando la variante ya existe por SKU).  
+  - Por defecto **no** actualiza barcode en ese paso.
+- `--verify-color`  
+  - Solo aplica en el **paso 0**.  
+  - Si se activa, valida que el color de la variante coincide con `color_color_code`.  
+  - Si no coincide, marca `ERROR` y no continúa.
 
 Extras (Odoo):
 - `refresh_odoo` tambien exporta colores:
