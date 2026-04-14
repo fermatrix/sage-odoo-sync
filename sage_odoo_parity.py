@@ -831,6 +831,113 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 })
             offset += len(rows)
     print(f"OK: odoo pricelists exported -> {pricelists_out}")
+    # Export Odoo pricelist items (master + per-pricelist)
+    pricelist_items_out = os.path.join(odoo_root, "pricelist_items_odoo.csv")
+    pricelists_by_id = {}
+    if os.path.exists(pricelists_out):
+        with open(pricelists_out, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=DELIMITER)
+            for r in reader:
+                pid = str(r.get("OdooId", "")).strip()
+                if pid:
+                    pricelists_by_id[pid] = r.get("OdooName", "") or ""
+
+    items_fields = [
+        "OdooId",
+        "PricelistId",
+        "PricelistName",
+        "AppliedOn",
+        "ProductTemplateId",
+        "ProductId",
+        "MinQuantity",
+        "FixedPrice",
+        "PercentPrice",
+        "DateStart",
+        "DateEnd",
+        "ComputePrice",
+        "Base",
+        "BasePricelistId",
+        "CurrencyId",
+    ]
+    with open(pricelist_items_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=items_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "product.pricelist.item",
+                [],
+                [
+                    "id",
+                    "pricelist_id",
+                    "applied_on",
+                    "product_tmpl_id",
+                    "product_id",
+                    "min_quantity",
+                    "fixed_price",
+                    "percent_price",
+                    "date_start",
+                    "date_end",
+                    "compute_price",
+                    "base",
+                    "base_pricelist_id",
+                    "currency_id",
+                ],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                pricelist = r.get("pricelist_id") or []
+                pid = str(pricelist[0]) if isinstance(pricelist, list) and pricelist else ""
+                pname = pricelist[1] if isinstance(pricelist, list) and len(pricelist) > 1 else pricelists_by_id.get(pid, "")
+                tmpl = r.get("product_tmpl_id") or []
+                prod = r.get("product_id") or []
+                base_pl = r.get("base_pricelist_id") or []
+                currency = r.get("currency_id") or []
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "PricelistId": pid,
+                    "PricelistName": pname,
+                    "AppliedOn": r.get("applied_on", "") or "",
+                    "ProductTemplateId": tmpl[0] if isinstance(tmpl, list) and tmpl else "",
+                    "ProductId": prod[0] if isinstance(prod, list) and prod else "",
+                    "MinQuantity": r.get("min_quantity", ""),
+                    "FixedPrice": r.get("fixed_price", ""),
+                    "PercentPrice": r.get("percent_price", ""),
+                    "DateStart": r.get("date_start", "") or "",
+                    "DateEnd": r.get("date_end", "") or "",
+                    "ComputePrice": r.get("compute_price", "") or "",
+                    "Base": r.get("base", "") or "",
+                    "BasePricelistId": base_pl[0] if isinstance(base_pl, list) and base_pl else "",
+                    "CurrencyId": currency[0] if isinstance(currency, list) and currency else "",
+                })
+            offset += len(rows)
+    print(f"OK: odoo pricelist items exported -> {pricelist_items_out}")
+
+    # Split pricelist items per pricelist
+    try:
+        pricelist_dir = os.path.join(odoo_root, "pricelists")
+        os.makedirs(pricelist_dir, exist_ok=True)
+        by_list = {}
+        with open(pricelist_items_out, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=DELIMITER)
+            for row in reader:
+                name = (row.get("PricelistName") or "UNKNOWN").strip()
+                by_list.setdefault(name, []).append(row)
+        for name, rows in by_list.items():
+            safe_name = "".join([c if c.isalnum() or c in ("_", "-", " ") else "_" for c in name]).strip()
+            if not safe_name:
+                safe_name = "UNKNOWN"
+            out_path = os.path.join(pricelist_dir, f"pricelist_{safe_name}.csv")
+            with open(out_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=items_fields, delimiter=DELIMITER)
+                writer.writeheader()
+                writer.writerows(rows)
+        print(f"OK: odoo pricelist items split -> {pricelist_dir}")
+    except Exception:
+        print("WARNING: failed to split pricelist items per list")
     # Export color attribute values
     try:
         attr_rows = client.search_read(

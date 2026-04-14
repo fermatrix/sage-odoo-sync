@@ -367,6 +367,8 @@ Esto se usa en:
 Exportados en `refresh_odoo`:
 - `ENZO-Sage50/_master_odoo/users_odoo.csv` (res.users)
 - `ENZO-Sage50/_master_odoo/pricelists_odoo.csv` (product.pricelist)
+- `ENZO-Sage50/_master_odoo/pricelist_items_odoo.csv` (product.pricelist.item)
+- `ENZO-Sage50/_master_odoo/pricelists/` (un CSV por cada pricelist)
 - `ENZO-Sage50/_master_odoo/customers_odoo.csv` incluye:
   - `OdooSalespersonId` + `OdooSalesperson` (sales rep en Odoo)
   - `OdooPricelistId` + `OdooPricelist` (pricing level en Odoo)
