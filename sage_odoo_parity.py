@@ -21,7 +21,13 @@ from sync_contacts import build_contacts_sync, build_contacts_import
 from sync_addresses import build_addresses_sync, build_delivery_import
 from sync_billto import build_billto_sync, build_billto_import
 from sync_parity import OdooClient, export_countries
-from sync_products import build_product_sync, build_items_sync_new, build_products_sync_nobarcode_new, build_products_import, build_products_nobarcode_import
+from sync_products import (
+    build_product_sync,
+    build_items_sync_new,
+    build_products_sync_nobarcode_new,
+    build_products_import,
+    build_products_nobarcode_import,
+)
 
 
 
@@ -389,7 +395,19 @@ def refresh_odoo(args: argparse.Namespace) -> int:
 
     batch = args.batch_size
 
-    customer_fields = ["OdooId", "OdooName", "OdooRef", "Active", "ParentId", "OdooEmail", "OdooPhone"]
+    customer_fields = [
+        "OdooId",
+        "OdooName",
+        "OdooRef",
+        "Active",
+        "ParentId",
+        "OdooEmail",
+        "OdooPhone",
+        "OdooSalespersonId",
+        "OdooSalesperson",
+        "OdooPricelistId",
+        "OdooPricelist",
+    ]
     with open(customers_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=customer_fields, delimiter=DELIMITER)
         writer.writeheader()
@@ -398,7 +416,17 @@ def refresh_odoo(args: argparse.Namespace) -> int:
             rows = client.search_read(
                 "res.partner",
                 [],
-                ["id", "name", "ref", "active", "parent_id", "email", "phone"],
+                [
+                    "id",
+                    "name",
+                    "ref",
+                    "active",
+                    "parent_id",
+                    "email",
+                    "phone",
+                    "user_id",
+                    "property_product_pricelist",
+                ],
                 limit=batch,
                 offset=offset,
             )
@@ -407,6 +435,8 @@ def refresh_odoo(args: argparse.Namespace) -> int:
             for r in rows:
                 parent = r.get("parent_id") or []
                 parent_id = parent[0] if isinstance(parent, list) and parent else ""
+                salesperson = r.get("user_id") or []
+                pricelist = r.get("property_product_pricelist") or []
                 writer.writerow({
                     "OdooId": r.get("id", ""),
                     "OdooName": r.get("name", "") or "",
@@ -415,6 +445,10 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "ParentId": parent_id,
                     "OdooEmail": r.get("email", "") or "",
                     "OdooPhone": r.get("phone", "") or "",
+                    "OdooSalespersonId": salesperson[0] if isinstance(salesperson, list) and salesperson else "",
+                    "OdooSalesperson": salesperson[1] if isinstance(salesperson, list) and len(salesperson) > 1 else "",
+                    "OdooPricelistId": pricelist[0] if isinstance(pricelist, list) and pricelist else "",
+                    "OdooPricelist": pricelist[1] if isinstance(pricelist, list) and len(pricelist) > 1 else "",
                 })
             offset += len(rows)
 
@@ -746,6 +780,57 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     print(f"OK: odoo child partners (all) exported -> {children_all_out}")
     print(f"OK: odoo delivery addresses exported -> {delivery_out}")
     print(f"OK: odoo items exported -> {items_out}")
+    # Export Odoo users (salespeople)
+    users_out = os.path.join(odoo_root, "users_odoo.csv")
+    users_fields = ["OdooId", "OdooName", "OdooLogin", "Active"]
+    with open(users_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=users_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "res.users",
+                [],
+                ["id", "name", "login", "active"],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "OdooName": r.get("name", "") or "",
+                    "OdooLogin": r.get("login", "") or "",
+                    "Active": r.get("active", ""),
+                })
+            offset += len(rows)
+    print(f"OK: odoo users exported -> {users_out}")
+    # Export Odoo pricelists
+    pricelists_out = os.path.join(odoo_root, "pricelists_odoo.csv")
+    pricelist_fields = ["OdooId", "OdooName", "Active"]
+    with open(pricelists_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=pricelist_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "product.pricelist",
+                [],
+                ["id", "name", "active"],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "OdooName": r.get("name", "") or "",
+                    "Active": r.get("active", ""),
+                })
+            offset += len(rows)
+    print(f"OK: odoo pricelists exported -> {pricelists_out}")
     # Export color attribute values
     try:
         attr_rows = client.search_read(
@@ -1040,6 +1125,230 @@ def sync_local(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_employees_sync(args: argparse.Namespace) -> int:
+    root = args.root_dir
+    master_sage = os.path.join(root, "_master_sage")
+    master_odoo = os.path.join(root, "_master_odoo")
+    master = os.path.join(root, "_master")
+    os.makedirs(master, exist_ok=True)
+
+    employees_path = os.path.join(master_sage, "employees.csv")
+    users_path = os.path.join(master_odoo, "users_odoo.csv")
+
+    if not os.path.exists(employees_path):
+        print(f"ERROR: missing {employees_path}")
+        return 2
+
+    months = [m.strip() for m in (args.months or "").split(",") if m.strip()]
+    if not months:
+        months = ["2026_02", "2026_03", "2026_04"]
+
+    # Collect EmpRecordNumber from sales orders headers
+    emp_ids_orders = set()
+    # The main data lives under ENZO-Sage50/13_2026
+    year_root = os.path.join(root, "13_2026")
+    if not os.path.isdir(year_root):
+        print(f"ERROR: missing {year_root}")
+        return 2
+
+    for m in months:
+        header_name = f"{m}_sales_orders_headers.csv"
+        found = False
+        for sub in os.listdir(year_root):
+            subdir = os.path.join(year_root, sub)
+            if not os.path.isdir(subdir):
+                continue
+            candidate = os.path.join(subdir, header_name)
+            if os.path.exists(candidate):
+                found = True
+                with open(candidate, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f, delimiter=DELIMITER)
+                    for row in reader:
+                        emp = (row.get("EmpRecordNumber") or "").strip()
+                        if emp:
+                            emp_ids_orders.add(emp)
+                break
+        if not found:
+            print(f"WARNING: sales order headers not found for {m}")
+
+    # Collect EmpRecordNumber from invoices (JrnlHdr master) within months
+    emp_ids_invoices = set()
+    jrnlhdr_path = os.path.join(master_sage, "jrnlhdr.csv")
+    if os.path.exists(jrnlhdr_path):
+        # Build date ranges for months
+        month_ranges = []
+        for m in months:
+            try:
+                year, month = m.split("_")
+                start = f"{year}-{month}-01"
+                # naive month end: handle 12 -> next year
+                y = int(year)
+                mo = int(month)
+                if mo == 12:
+                    end = f"{y+1}-01-01"
+                else:
+                    end = f"{y}-{mo+1:02d}-01"
+                month_ranges.append((start, end))
+            except Exception:
+                continue
+        def in_ranges(date_str: str) -> bool:
+            if not date_str:
+                return False
+            for start, end in month_ranges:
+                if start <= date_str < end:
+                    return True
+            return False
+
+        with open(jrnlhdr_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=DELIMITER)
+            for row in reader:
+                if row.get("Module") != "R":
+                    continue
+                # Invoices: JournalEx 8 (per existing export process)
+                if row.get("JournalEx") != "8":
+                    continue
+                if not in_ranges(row.get("TransactionDate", "")):
+                    continue
+                emp = (row.get("EmpRecordNumber") or "").strip()
+                if emp:
+                    emp_ids_invoices.add(emp)
+
+    emp_ids_2026 = emp_ids_orders.union(emp_ids_invoices)
+
+    # Load employees (include all)
+    employees = []
+    with open(employees_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, delimiter=DELIMITER)
+        for row in reader:
+            employees.append(row)
+
+    # Load Odoo users for optional matching
+    users = []
+    if os.path.exists(users_path):
+        with open(users_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter=DELIMITER)
+            users = list(reader)
+
+    def normalize(value: str) -> str:
+        return (value or "").strip().lower()
+
+    user_by_name = {normalize(u.get("OdooName", "")): u for u in users if u.get("OdooName")}
+    user_by_login = {normalize(u.get("OdooLogin", "")): u for u in users if u.get("OdooLogin")}
+
+    out_path = os.path.join(master, "employees_sync.csv")
+    out_new_path = os.path.join(master, "employees_NEW.csv")
+    fields = [
+        "EmpRecordNumber",
+        "EmployeeID",
+        "EmployeeName",
+        "Employee_FirstName",
+        "Employee_LastName",
+        "IsSalesRep",
+        "EmployeeIsInactive",
+        "JobTitle",
+        "Email",
+        "PhoneNumber",
+        "PhoneWork",
+        "PhoneMobile",
+        "Address1",
+        "Address2",
+        "City",
+        "State",
+        "ZIP",
+        "Country",
+        "Invoiced2026",
+        "OdooUserId",
+        "OdooUserName",
+        "OdooUserLogin",
+        "OdooUserActive",
+        "MatchReason",
+    ]
+    fields_new = [
+        "EmpRecordNumber",
+        "EmployeeID",
+        "EmployeeName",
+        "Employee_FirstName",
+        "Employee_LastName",
+        "IsSalesRep",
+        "EmployeeIsInactive",
+        "JobTitle",
+        "Email",
+        "PhoneNumber",
+        "PhoneWork",
+        "PhoneMobile",
+        "Address1",
+        "Address2",
+        "City",
+        "State",
+        "ZIP",
+        "Country",
+        "Invoiced2026",
+    ]
+
+    rows_out = []
+    rows_new = []
+    for row in employees:
+        emp_name = row.get("EmployeeName", "") or ""
+        emp_id = row.get("EmployeeID", "") or ""
+        match = None
+        reason = ""
+        if normalize(emp_name) in user_by_name:
+            match = user_by_name[normalize(emp_name)]
+            reason = "name"
+        elif normalize(emp_id) in user_by_login:
+            match = user_by_login[normalize(emp_id)]
+            reason = "login"
+        elif normalize(emp_id) in user_by_name:
+            match = user_by_name[normalize(emp_id)]
+            reason = "name_empid"
+
+        out_row = {
+            "EmpRecordNumber": row.get("EmpRecordNumber", "") or "",
+            "EmployeeID": emp_id,
+            "EmployeeName": emp_name,
+            "Employee_FirstName": row.get("Employee_FirstName", "") or "",
+            "Employee_LastName": row.get("Employee_LastName", "") or "",
+            "IsSalesRep": row.get("IsSalesRep", "") or "",
+            "EmployeeIsInactive": row.get("EmployeeIsInactive", "") or "",
+            "JobTitle": row.get("JobTitle", "") or "",
+            "Email": row.get("Email", "") or "",
+            "PhoneNumber": row.get("PhoneNumber", "") or "",
+            "PhoneWork": row.get("PhoneWork", "") or "",
+            "PhoneMobile": row.get("PhoneMobile", "") or "",
+            "Address1": row.get("Address1", "") or "",
+            "Address2": row.get("Address2", "") or "",
+            "City": row.get("City", "") or "",
+            "State": row.get("State", "") or "",
+            "ZIP": row.get("ZIP", "") or "",
+            "Country": row.get("Country", "") or "",
+            "Invoiced2026": "X" if (row.get("EmpRecordNumber") or "").strip() in emp_ids_2026 else "",
+            "OdooUserId": match.get("OdooId", "") if match else "",
+            "OdooUserName": match.get("OdooName", "") if match else "",
+            "OdooUserLogin": match.get("OdooLogin", "") if match else "",
+            "OdooUserActive": match.get("Active", "") if match else "",
+            "MatchReason": reason,
+        }
+        rows_out.append(out_row)
+        if not match:
+            rows_new.append(out_row)
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, delimiter=DELIMITER)
+        writer.writeheader()
+        for r in rows_out:
+            writer.writerow(r)
+
+    with open(out_new_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields_new, delimiter=DELIMITER)
+        writer.writeheader()
+        for r in rows_new:
+            writer.writerow({k: r.get(k, "") for k in fields_new})
+
+    print(f"OK: employees sync -> {out_path} ({len(rows_out)} rows)")
+    print(f"OK: employees NEW -> {out_new_path} ({len(rows_new)} rows)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sage ↔ Odoo parity tables")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1229,6 +1538,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"ENZO-Sage50\_master\odoo_templates\customer_billto.xlsx",
     )
     p5e.set_defaults(func=build_billto_import)
+
+    p5f = sub.add_parser("build_employees_sync", help="Build employees sync from Sage employees + sales orders")
+    p5f.add_argument(
+        "--root-dir",
+        default=r"ENZO-Sage50",
+        help="Root ENZO-Sage50 directory",
+    )
+    p5f.add_argument(
+        "--months",
+        default="2026_02,2026_03,2026_04",
+        help="Comma-separated list of months (YYYY_MM) to include",
+    )
+    p5f.set_defaults(func=build_employees_sync)
 
     p6 = sub.add_parser("build_product_sync", help="Build product sync for a given YYYY_MM using invoice + credit note lines")
     p6.add_argument(

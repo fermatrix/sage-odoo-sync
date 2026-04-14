@@ -3,6 +3,12 @@ import os
 from datetime import datetime
 from typing import Dict, List
 
+from parity_utils import (
+    load_country_name_to_code,
+    load_country_parity,
+    load_state_parity,
+    normalize_country,
+)
 from sync_customers import normalize_name, read_csv, sanitize_external_id, write_csv
 
 
@@ -50,66 +56,12 @@ def _load_odoo_delivery_by_parent(odoo_delivery_csv: str) -> Dict[str, List[Dict
     return existing
 
 
-def _load_country_parity(parity_path: str) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    if not os.path.exists(parity_path):
-        return mapping
-    _, rows = read_csv(parity_path)
-    for r in rows:
-        raw = (r.get("sage_country_raw") or "").strip()
-        code = (r.get("odoo_country_code") or "").strip()
-        if raw and code:
-            mapping[raw] = code
-    return mapping
-
-
-def _load_country_name_to_code(countries_odoo_path: str) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    if not os.path.exists(countries_odoo_path):
-        return mapping
-    _, rows = read_csv(countries_odoo_path)
-    for r in rows:
-        name = (r.get("OdooName") or "").strip()
-        code = (r.get("OdooCode") or "").strip()
-        if name and code:
-            mapping[name] = code
-    return mapping
-
-
-def _load_state_parity(state_parity_path: str) -> Dict[str, Dict[str, str]]:
-    mapping: Dict[str, Dict[str, str]] = {}
-    if not os.path.exists(state_parity_path):
-        return mapping
-    _, rows = read_csv(state_parity_path)
-    for r in rows:
-        raw = (r.get("sage_state_raw") or "").strip()
-        if not raw:
-            continue
-        mapping[raw] = {
-            "state_name": (r.get("odoo_state_name") or "").strip(),
-            "country_name": (r.get("odoo_country_name") or "").strip(),
-        }
-    return mapping
-
-
 def _normalize_country(
     raw_country: str,
     country_parity: Dict[str, str],
     country_name_to_code: Dict[str, str],
 ) -> str:
-    raw = (raw_country or "").strip()
-    if not raw:
-        return ""
-    if raw in country_parity:
-        return country_parity[raw]
-    if raw in country_name_to_code:
-        return country_name_to_code[raw]
-    upper = raw.upper()
-    if upper in {"USA", "U.S.A.", "US", "UNITED STATES", "UNITED STATES OF AMERICA"}:
-        return "US"
-    if upper in {"CANADA", "CA", "CAN"}:
-        return "CA"
-    return raw
+    return normalize_country(raw_country, country_parity, country_name_to_code)
 
 
 def _match_delivery(existing_rows: List[Dict[str, str]], name: str, addr_key: str) -> str:
@@ -154,9 +106,9 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
     customers_by_record = _load_customers_by_record(customers_sync)
     addresses_by_record = _load_addresses_by_record(address_master)
     existing_by_parent = _load_odoo_delivery_by_parent(odoo_delivery)
-    country_parity = _load_country_parity(country_parity_path)
-    country_name_to_code = _load_country_name_to_code(countries_odoo_path)
-    state_parity = _load_state_parity(state_parity_path)
+    country_parity = load_country_parity(country_parity_path)
+    country_name_to_code = load_country_name_to_code(countries_odoo_path)
+    state_parity = load_state_parity(state_parity_path)
 
     _, contact_rows = read_csv(contacts_master)
 
