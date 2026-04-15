@@ -196,6 +196,41 @@ Ficheros generados (Feb/Mar/Abr 2026):
 - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_sales_orders_headers.csv`
 - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_sales_orders_lines.csv`
 
+### Sales Orders API Sync (draft)
+Script nuevo:
+- `sync_sales_orders_api.py`
+
+Objetivo:
+- Crear `sale.order` en Odoo por API (XML-RPC), en borrador, leyendo Sage `sales_orders_headers/lines`.
+- Mantener numeración Sage en `sale.order.name` (campo `Reference` de Sage).
+- Crear también las líneas de pedido (`sale.order.line`).
+
+Comando base:
+```
+python sync_sales_orders_api.py --limit 1
+```
+
+Log de ejecución:
+- `ENZO-Sage50/_master/orders_api_log.csv`
+- Estados principales: `OK`, `OK_WARN`, `SKIP`, `ERROR`, `DRY_RUN`, `DRY_RUN_WARN`.
+
+Validaciones implementadas:
+- Match de customer (`CustVendId` -> `customers_sync.csv` -> `OdooId`).
+- Match de producto por línea (`ItemRecordNumber` -> `products_sync.csv` -> `OdooVariantId`).
+- Intento de match de términos de pago (`TermsDescription` de Sage con `account.payment.term` de Odoo).
+- Control de totales (`MainAmount` vs total de líneas preparadas).
+- Si hay inconsistencias, la order se puede crear igual en draft y se marca como `OK_WARN`.
+
+Orden de procesado:
+- Cronológico real: `TransactionDate` ascendente (y desempate por `Reference`, `PostOrder`).
+
+Fecha de creación vs fecha de pedido:
+- `create_date` **no se puede** forzar por import estándar ni por API ORM estándar.
+- Pruebas realizadas:
+  - API `write/create` con `create_date`: Odoo ignora el valor y mantiene la fecha real de creación.
+  - Import CSV/XLSX con columna `create_date`: Odoo no reconoce el campo.
+- Campo operativo para fecha histórica del pedido: `date_order` (Quotation/Order Date en Odoo).
+
 Campos clave en `invoice_lines`:
 - `INV_POSOOrderNumber` no aparece en `invoice_lines` (líneas), solo en headers.
 - Para relacionar Orders ↔ Invoices se usa `INV_POSOOrderNumber` en `JrnlHdr`.
@@ -465,9 +500,11 @@ Match de producto:
 IMPORT (líneas nuevas):
 - Se usa cuando no existe una línea equivalente en `product.pricelist.item`.
 - Match de existencia: `PricelistId + AppliedOn + ProductTemplateId + MinQuantity`.
-- El fichero usa la plantilla `ENZO-Sage50/_master/odoo_templates/pricelist.csv`.
+- El fichero usa la plantilla `ENZO-Sage50/_master/odoo_templates/NEW_pricelist.csv`.
 - No incluye ID de línea existente porque Odoo debe crearla.
 - Si `pricelist_lines_NEW.csv` queda a `0`, no hay nada nuevo que importar.
+- Los `id` de pricelist deben ir sin espacios (ej.: `PRICE_LEVEL_2_USD`, `DISTRIBUTOR_US`) para evitar el error de Odoo `ir_model_data_name_nospaces`.
+- Los precios en `item_ids/fixed_price` se exportan con punto decimal `.` (formato US/Odoo), nunca con coma.
 
 UPDATE (precios existentes que cambiaron):
 - Se usa cuando la línea ya existe en Odoo pero `FixedPrice` difiere del precio esperado desde Sage.

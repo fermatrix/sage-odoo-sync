@@ -2014,8 +2014,22 @@ def build_pricelist_import(args: argparse.Namespace) -> int:
             return "CAD", "CAD", "CAD"
         if upper_name in {"AUD", "AUD (AUD)"}:
             return "AUD", "AUD", "AUD"
+        if upper_name in {"PRICE LEVEL 2", "PRICE LEVEL 2 (USD)"}:
+            return "PRICE_LEVEL_2_USD", "Price Level 2", "USD"
+        if upper_name in {"PRICE LEVEL 3", "PRICE LEVEL 3 (USD)"}:
+            return "PRICE_LEVEL_3_USD", "Price Level 3", "USD"
+        if upper_name in {"PRICE LEVEL 4", "PRICE LEVEL 4 (USD)"}:
+            return "PRICE_LEVEL_4_USD", "Price Level 4", "USD"
+        if upper_name in {"PRICE LEVEL 5", "PRICE LEVEL 5 (USD)"}:
+            return "PRICE_LEVEL_5_USD", "Price Level 5", "USD"
+        if upper_name in {"DISTRIBUTOR US", "DISTRIBUTOR US (USD)"}:
+            return "DISTRIBUTOR_US", "Distributor US", "USD"
         plain_name = upper_name.split("(", 1)[0].strip() if upper_name else ""
-        return plain_name, plain_name, cur
+        safe_id = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in plain_name)
+        while "__" in safe_id:
+            safe_id = safe_id.replace("__", "_")
+        safe_id = safe_id.strip("_")
+        return safe_id, (raw_name or plain_name), cur
 
     def normalize_price(value: str) -> str:
         raw = (value or "").strip()
@@ -2135,7 +2149,8 @@ def build_pricelist_update(args: argparse.Namespace) -> int:
         return f"{value:.2f}"
 
     def normalize_pricelist(name: str, currency: str):
-        upper_name = (name or "").strip().upper()
+        raw_name = (name or "").strip()
+        upper_name = raw_name.upper()
         cur = (currency or "").strip().upper()
         if upper_name in {"USA", "USA (USD)"}:
             return "USA", "USA", "USD"
@@ -2147,8 +2162,22 @@ def build_pricelist_update(args: argparse.Namespace) -> int:
             return "CAD", "CAD", "CAD"
         if upper_name in {"AUD", "AUD (AUD)"}:
             return "AUD", "AUD", "AUD"
+        if upper_name in {"PRICE LEVEL 2", "PRICE LEVEL 2 (USD)"}:
+            return "PRICE_LEVEL_2_USD", "Price Level 2", "USD"
+        if upper_name in {"PRICE LEVEL 3", "PRICE LEVEL 3 (USD)"}:
+            return "PRICE_LEVEL_3_USD", "Price Level 3", "USD"
+        if upper_name in {"PRICE LEVEL 4", "PRICE LEVEL 4 (USD)"}:
+            return "PRICE_LEVEL_4_USD", "Price Level 4", "USD"
+        if upper_name in {"PRICE LEVEL 5", "PRICE LEVEL 5 (USD)"}:
+            return "PRICE_LEVEL_5_USD", "Price Level 5", "USD"
+        if upper_name in {"DISTRIBUTOR US", "DISTRIBUTOR US (USD)"}:
+            return "DISTRIBUTOR_US", "Distributor US", "USD"
         plain_name = upper_name.split("(", 1)[0].strip() if upper_name else ""
-        return plain_name, plain_name, cur
+        safe_id = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in plain_name)
+        while "__" in safe_id:
+            safe_id = safe_id.replace("__", "_")
+        safe_id = safe_id.strip("_")
+        return safe_id, (raw_name or plain_name), cur
 
     existing_by_key = {}
     _, existing_rows = read_csv(existing_path)
