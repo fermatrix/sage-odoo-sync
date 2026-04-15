@@ -2,6 +2,7 @@ import argparse
 import os
 from datetime import datetime
 from typing import Dict, List
+from collections import Counter
 
 from parity_utils import (
     load_country_name_to_code,
@@ -14,6 +15,20 @@ from sync_customers import normalize_name, read_csv, sanitize_external_id, write
 
 def _norm_text(value: str) -> str:
     return normalize_name(value or "")
+
+
+def _norm_country_compare(value: str) -> str:
+    normalized = _norm_text(value)
+    aliases = {
+        "us": "united states",
+        "usa": "united states",
+        "united states of america": "united states",
+        "ca": "canada",
+        "can": "canada",
+        "gb": "united kingdom",
+        "uk": "united kingdom",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _norm_addr(street: str, street2: str, city: str, state: str, zip_code: str) -> str:
@@ -64,14 +79,27 @@ def _normalize_country(
     return normalize_country(raw_country, country_parity, country_name_to_code)
 
 
-def _match_delivery(existing_rows: List[Dict[str, str]], name: str, addr_key: str) -> str:
+def _match_delivery(existing_rows: List[Dict[str, str]], sage_reference: str, name: str, addr_key: str) -> Dict[str, str]:
     if not existing_rows:
-        return ""
+        return {}
+    # Best match: exact SAGE reference already stored in Odoo partner.ref.
+    ref = (sage_reference or "").strip()
+    odoo_refs = [((r.get("OdooRef") or "").strip()) for r in existing_rows]
+    has_any_odoo_ref = any(odoo_refs)
+    if ref:
+        for r in existing_rows:
+            odoo_ref = (r.get("OdooRef") or "").strip()
+            if odoo_ref and odoo_ref == ref:
+                return r
+        # Safety: if Odoo has refs for this parent but none match exactly, do not
+        # fall back to name/address to avoid cross-linking different delivery records.
+        if has_any_odoo_ref:
+            return {}
     n_name = _norm_text(name)
     for r in existing_rows:
         r_name = _norm_text(r.get("OdooName", ""))
         if n_name and r_name and n_name == r_name:
-            return str(r.get("OdooId", ""))
+            return r
     if addr_key:
         for r in existing_rows:
             r_key = _norm_addr(
@@ -82,8 +110,26 @@ def _match_delivery(existing_rows: List[Dict[str, str]], name: str, addr_key: st
                 r.get("Zip", ""),
             )
             if r_key and r_key == addr_key:
-                return str(r.get("OdooId", ""))
-    return ""
+                return r
+    return {}
+
+
+def _field_mismatches(row: Dict[str, str], existing: Dict[str, str]) -> List[str]:
+    checks = [
+        ("name", row.get("DeliveryName", ""), existing.get("OdooName", "")),
+        ("email", row.get("Email", ""), existing.get("OdooEmail", "")),
+        ("street", row.get("Street", ""), existing.get("Street", "")),
+        ("street2", row.get("Street2", ""), existing.get("Street2", "")),
+        ("city", row.get("City", ""), existing.get("City", "")),
+        ("zip", row.get("Zip", ""), existing.get("Zip", "")),
+        ("state", row.get("OdooState", "") or row.get("State", ""), existing.get("State", "")),
+    ]
+    mismatches = [name for name, left, right in checks if _norm_text(left) != _norm_text(right)]
+    left_phone = "".join(ch for ch in (row.get("Phone", "") or "") if ch.isdigit())
+    right_phone = "".join(ch for ch in (existing.get("OdooPhone", "") or "") if ch.isdigit())
+    if left_phone != right_phone:
+        mismatches.append("phone")
+    return mismatches
 
 
 def build_addresses_sync(args: argparse.Namespace) -> int:
@@ -133,7 +179,10 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
         "OdooCountry",
         "Notes",
         "OdooAddressId",
+        "OdooAddressExternalId",
         "OdooParentId",
+        "DeliverySyncStatus",
+        "DeliveryMismatchFields",
         "LastLookupAt",
     ]
 
@@ -180,9 +229,35 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
         if cust:
             odoo_parent_id = (cust.get("OdooId") or "").strip()
 
-        match_id = ""
+        match_row: Dict[str, str] = {}
         if odoo_parent_id:
-            match_id = _match_delivery(existing_by_parent.get(odoo_parent_id, []), delivery_name, addr_key)
+            match_row = _match_delivery(
+                existing_by_parent.get(odoo_parent_id, []),
+                (c.get("RecordNumber") or "").strip(),
+                delivery_name,
+                addr_key,
+            )
+
+        match_id = (match_row.get("OdooId") or "").strip()
+        strict_ref_match = False
+        if match_row:
+            strict_ref_match = ((c.get("RecordNumber") or "").strip() == ((match_row.get("OdooRef") or "").strip()))
+        mismatches = []
+        if match_row:
+            draft_row = {
+                "DeliveryName": delivery_name,
+                "Email": (c.get("Email") or "").strip(),
+                "Phone": (c.get("Telephone1") or "").strip(),
+                "Street": (addr.get("AddressLine1") or "").strip(),
+                "Street2": (addr.get("AddressLine2") or "").strip(),
+                "City": (addr.get("City") or "").strip(),
+                "State": raw_state,
+                "Zip": (addr.get("Zip") or "").strip(),
+                "Country": raw_country,
+                "OdooState": mapped_state,
+                "OdooCountry": mapped_country,
+            }
+            mismatches = _field_mismatches(draft_row, match_row)
 
         rows_out.append({
             "ContactRecordNumber": (c.get("RecordNumber") or "").strip(),
@@ -205,7 +280,18 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
             "OdooCountry": mapped_country,
             "Notes": f"{addr.get('AddressTypeNumber','')} | {addr.get('AddressTypeDesc','')}".strip(),
             "OdooAddressId": match_id,
+            "OdooAddressExternalId": (match_row.get("OdooExternalId") or "").strip(),
             "OdooParentId": odoo_parent_id,
+            "DeliverySyncStatus": (
+                "UPDATE"
+                if (match_id and mismatches and strict_ref_match)
+                else ("MATCH" if match_id and (not mismatches or strict_ref_match) else "NEW")
+            ),
+            "DeliveryMismatchFields": (
+                "|".join(mismatches)
+                if strict_ref_match or not (match_id and mismatches)
+                else "fallback_non_strict_match_blocked"
+            ),
             "LastLookupAt": now_stamp,
         })
 
@@ -306,4 +392,98 @@ def build_delivery_import(args: argparse.Namespace) -> int:
     write_csv(out_csv, fieldnames, new_rows)
     print(f"OK: delivery new rows: {emitted} -> {out_xlsx}")
     print(f"OK: delivery NEW sync -> {out_csv}")
+    return 0
+
+
+def build_delivery_update(args: argparse.Namespace) -> int:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        load_workbook = None
+
+    if load_workbook is None:
+        print("ERROR: openpyxl not available for XLSX export")
+        return 2
+
+    sync_path = args.sync_path
+    template_path = args.template_path
+    if not os.path.exists(sync_path):
+        print(f"ERROR: delivery sync file not found: {sync_path}")
+        return 2
+    if not os.path.exists(template_path):
+        print(f"ERROR: template not found: {template_path}")
+        return 2
+
+    master_root = os.path.dirname(sync_path)
+    odoo_update = os.path.join(master_root, "odoo_UPDATE")
+    os.makedirs(odoo_update, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    out_xlsx = os.path.join(odoo_update, f"{stamp}_customers_delivery_UPDATE.xlsx")
+    out_csv = os.path.join(master_root, "customer_delivery_addresses_sync_UPDATE.csv")
+    conflicts_csv = os.path.join(master_root, "customer_delivery_addresses_sync_UPDATE_CONFLICTS.csv")
+
+    _, sync_rows = read_csv(sync_path)
+    candidates = [
+        r for r in sync_rows
+        if (r.get("DeliverySyncStatus") or "").strip().upper() == "UPDATE"
+        and (r.get("OdooParentId") or "").strip()
+        and (r.get("OdooAddressExternalId") or "").strip()
+    ]
+    ext_counts = Counter((r.get("OdooAddressExternalId") or "").strip() for r in candidates)
+    update_rows = [r for r in candidates if ext_counts[(r.get("OdooAddressExternalId") or "").strip()] == 1]
+    conflict_rows = [r for r in candidates if ext_counts[(r.get("OdooAddressExternalId") or "").strip()] > 1]
+
+    wb = load_workbook(template_path)
+    ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
+    header_map = {}
+    for col_idx in range(1, ws.max_column + 1):
+        header = ws.cell(row=1, column=col_idx).value
+        if header:
+            header_map[str(header).strip()] = col_idx
+
+    def set_cell(col_name: str, value: str) -> None:
+        col_idx = header_map.get(col_name)
+        if col_idx:
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    ws.delete_rows(2, ws.max_row)
+    row_idx = 2
+    emitted = 0
+    for r in update_rows:
+        ext_id = (r.get("OdooAddressExternalId") or "").strip()
+        if ext_id.startswith("__import__."):
+            ext_id = ext_id.split(".", 1)[1]
+        parent_id = (r.get("OdooParentId") or "").strip()
+        name = (r.get("DeliveryName") or "").strip()
+        if not ext_id or not parent_id or not name:
+            continue
+        state = (r.get("OdooState") or "").strip() or (r.get("State") or "").strip()
+        country = (r.get("OdooCountry") or "").strip() or (r.get("Country") or "").strip()
+
+        set_cell("External_ID", ext_id)
+        set_cell("Parent/Database ID", parent_id)
+        set_cell("Reference", (r.get("ContactRecordNumber") or "").strip())
+        set_cell("is_company", 0)
+        set_cell("type", "delivery")
+        set_cell("Name", name)
+        set_cell("Email", (r.get("Email") or "").strip())
+        set_cell("Phone", (r.get("Phone") or "").strip())
+        set_cell("Street", (r.get("Street") or "").strip())
+        set_cell("Street2", (r.get("Street2") or "").strip())
+        set_cell("City", (r.get("City") or "").strip())
+        set_cell("State", state)
+        set_cell("ZIP", (r.get("Zip") or "").strip())
+        set_cell("Country", country)
+        set_cell("Notes", (r.get("Notes") or "").strip())
+        row_idx += 1
+        emitted += 1
+
+    wb.save(out_xlsx)
+    fieldnames = list(candidates[0].keys()) if candidates else []
+    write_csv(out_csv, fieldnames, update_rows)
+    write_csv(conflicts_csv, fieldnames, conflict_rows)
+    print(f"OK: delivery update rows: {emitted} -> {out_xlsx}")
+    print(f"OK: delivery UPDATE sync -> {out_csv}")
+    print(f"OK: delivery UPDATE conflicts -> {conflicts_csv} ({len(conflict_rows)} rows)")
     return 0

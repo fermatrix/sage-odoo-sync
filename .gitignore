@@ -26,3 +26,5 @@ build/
 dist/
 remote/__pycache__/
 __pycache__/
+.venv/
+optyx-sync/

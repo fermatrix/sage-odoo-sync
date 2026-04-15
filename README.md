@@ -240,27 +240,36 @@ Comandos:
 ```
 python sage_odoo_parity.py build_billto_sync
 python sage_odoo_parity.py build_billto
+python sage_odoo_parity.py build_billto_update
 ```
 Entradas:
 - Sage: `contacts.csv`, `address.csv`
-- Odoo: `customers_contacts.csv` (exportado en `refresh_odoo`)
+- Odoo: `customers_child_partners_all.csv` (exportado en `refresh_odoo`)
 
 Salidas:
 - `ENZO-Sage50/_master/customers_billto_sync.csv`
 - `ENZO-Sage50/_master/customers_billto_sync_NEW.csv`
+- `ENZO-Sage50/_master/customers_billto_sync_UPDATE.csv`
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_billto_NEW.xlsx`
+- `ENZO-Sage50/_master/odoo_UPDATE/YYYYMMDD_customers_billto_UPDATE.xlsx`
 
 Lógica clave:
 - Bill To = contactos primarios (`IsPrimaryContact = 1`).
 - Join con direcciones por `AddressRecordNumber`.
 - En Odoo: `type = invoice`.
-- Match: `ParentId` + `Reference`.
+- Match estricto: `ParentId` + `Reference` (`OdooRef` = `ContactRecordNumber`).
+- Sin fallback para UPDATE (ni por nombre ni por dirección).
+- NEW: solo se generan filas con `BilltoSyncStatus = NEW` y `OdooParentId` informado.
+- UPDATE: usa `OdooContactExternalId` real de Odoo (no generado).
+- Country se puede mantener fuera de UPDATE según plantilla (`UPDATE_customers_billto.xlsx`).
+- Plantilla NEW actual: `ENZO-Sage50/_master/odoo_templates/NEW_customer_billto.xlsx`.
 
 ### (3) ADDRESS
 Comandos:
 ```
 python sage_odoo_parity.py build_addresses_sync
 python sage_odoo_parity.py build_delivery_addresses
+python sage_odoo_parity.py build_delivery_addresses_update
 ```
 Entradas:
 - Sage: `contacts.csv`, `address.csv`
@@ -269,13 +278,31 @@ Entradas:
 Salidas:
 - `ENZO-Sage50/_master/customer_delivery_addresses_sync.csv`
 - `ENZO-Sage50/_master/customer_delivery_addresses_sync_NEW.csv`
+- `ENZO-Sage50/_master/customer_delivery_addresses_sync_UPDATE.csv`
+- `ENZO-Sage50/_master/customer_delivery_addresses_sync_UPDATE_CONFLICTS.csv`
 - `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_customers_delivery_NEW.xlsx`
+- `ENZO-Sage50/_master/odoo_UPDATE/YYYYMMDD_customers_delivery_UPDATE.xlsx`
 
 Lógica clave:
 - Delivery addresses salen de **contactos no primarios** con `AddressRecordNumber`.
 - Join: `contacts.AddressRecordNumber` -> `address.AddressRecordNumber`.
 - `External_ID` = `CustomerID_ContactRecordNumber`.
 - Notas: `AddressTypeNumber | AddressTypeDesc`.
+- `Reference` en Odoo = `ContactRecordNumber` de SAGE.
+- Match estricto para UPDATE: `ParentId` + `Reference` (`OdooRef` exacto).
+- Sin fallback para UPDATE; si no hay match estricto queda en NEW.
+- NEW de delivery sin `OdooParentId` no se importa (cliente no existe en Odoo).
+- UPDATE de delivery usa `OdooAddressExternalId` real de Odoo.
+- `Country` no entra en mismatch para UPDATE cuando la plantilla de update no lo incluye.
+- Estado/country se normalizan con parity (`_parity_state.csv`, `_parity_country.csv`).
+
+Operativa de recuperación (si faltan deliveries importadas previamente):
+- Comparar `_master/odoo_imports/_IMPORTED/*customers_delivery*.xlsx` contra `_master_odoo/customers_delivery_addresses.csv`.
+- Generar restore solo de `External_ID` faltantes (manteniendo `Parent/Database ID` actual).
+- Importar restore y repetir:
+  - `python sage_odoo_parity.py refresh_odoo`
+  - `python sage_odoo_parity.py build_addresses_sync`
+  - `python sage_odoo_parity.py build_delivery_addresses_update`
 
 ### (4) PRODUCTS
 **Nota:** el flujo de variantes **Sun vs Optics** vive ahora en `optyx-sync/README.md`.
@@ -387,4 +414,64 @@ Odoo (masters actuales):
 Conclusión provisional:
 - El `PriceLevel` numérico de Sage **no tiene mapeo directo** a las pricelists actuales de Odoo.
 - Los sales reps todavía no existen como `res.users` en Odoo (o al menos no están asignados a customers).
+
+### Sage Multiple Price Levels (confirmado en UI)
+En la ventana de Sage **Multiple Price Levels** (item level), el orden mostrado corresponde a `PriceLevel1..10` de `items.csv`:
+- `PriceLevel1Amount` -> `REGULAR PRICE` (USA)
+- `PriceLevel2Amount` -> `Price Level 2`
+- `PriceLevel3Amount` -> `Price Level 3`
+- `PriceLevel4Amount` -> `Price Level 4`
+- `PriceLevel5Amount` -> `Price Level 5`
+- `PriceLevel6Amount` -> `EURO PRICING`
+- `PriceLevel7Amount` -> `GBP PRICING`
+- `PriceLevel8Amount` -> `CAD PRICING`
+- `PriceLevel9Amount` -> `DISTRIBUTOR US`
+- `PriceLevel10Amount` -> `SPECS PRICING`
+
+Nota importante:
+- En Odoo, las pricelists actuales son geográficas (`USA`, `EU`, `UK`, `CAD`, `AUD`) y se aplican por `product.template` (no por variante).
+- En Sage, los precios viven por item/variante, por eso hay que agrupar por template al comparar con Odoo.
+
+Mapeo operativo (actual, pendiente de validación final con negocio):
+- `USA (USD)` -> `PriceLevel1Amount`
+- `EU (EUR)` -> `PriceLevel6Amount`
+- `UK (GBP)` -> `PriceLevel7Amount`
+- `CAD (CAD)` -> `PriceLevel8Amount`
+- `AUD (AUD)` -> pendiente (no aparece explícito en la pantalla de Multiple Price Levels mostrada)
+
+### Pricelist lines (IMPORT vs UPDATE)
+Flujo:
+```
+python sage_odoo_parity.py refresh_odoo
+python sage_odoo_parity.py build_pricelist_lines
+python sage_odoo_parity.py build_pricelist_import
+python sage_odoo_parity.py build_pricelist_update
+```
+
+Ficheros base:
+- Sage esperado: `ENZO-Sage50/_master/pricelist_lines.csv`
+- Nuevas líneas: `ENZO-Sage50/_master/pricelist_lines_NEW.csv`
+- Conflictos de precio por variantes del mismo producto: `ENZO-Sage50/_master/pricelist_lines_CONFLICTS.csv`
+- IMPORT: `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_pricelist.csv`
+- UPDATE: `ENZO-Sage50/_master/odoo_UPDATE/YYYYMMDD_pricelist_UPDATE.csv`
+
+Match de producto:
+- Sage trabaja por variante/item.
+- Odoo pricelists trabajan por `product.template`.
+- `products_sync.csv` conserva `OdooVariantId`, `OdooTemplateId` y `OdooTemplateExternalId`.
+- Para importar en Odoo se usa el External ID corto del template en `item_ids/product_tmpl_id/id`.
+- Ejemplo: si Odoo exporta `__import__.NW_110`, en el CSV se usa `NW_110`.
+
+IMPORT (líneas nuevas):
+- Se usa cuando no existe una línea equivalente en `product.pricelist.item`.
+- Match de existencia: `PricelistId + AppliedOn + ProductTemplateId + MinQuantity`.
+- El fichero usa la plantilla `ENZO-Sage50/_master/odoo_templates/pricelist.csv`.
+- No incluye ID de línea existente porque Odoo debe crearla.
+- Si `pricelist_lines_NEW.csv` queda a `0`, no hay nada nuevo que importar.
+
+UPDATE (precios existentes que cambiaron):
+- Se usa cuando la línea ya existe en Odoo pero `FixedPrice` difiere del precio esperado desde Sage.
+- El fichero tiene el mismo formato que `pricelist.csv`, pero añade `item_ids/.id`.
+- Importante: para actualizar una línea existente hay que usar `item_ids/.id` con el ID interno de `product.pricelist.item`.
+- No usar `item_ids/id` para este caso: Odoo lo interpreta como External ID y puede duplicar líneas.
 

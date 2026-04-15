@@ -31,8 +31,9 @@ def sanitize_external_id(value: str) -> str:
     v = str(value).strip()
     if not v:
         return ""
-    # Odoo XML IDs cannot contain spaces.
-    v = re.sub(r"\s+", "_", v)
+    # Odoo XML IDs cannot contain spaces or punctuation such as commas.
+    v = re.sub(r"[^A-Za-z0-9_.-]+", "_", v)
+    v = v.strip("_")
     return v
 
 

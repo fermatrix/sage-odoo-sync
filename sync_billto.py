@@ -83,6 +83,19 @@ def _match_invoice(existing_rows: List[Dict[str, str]], ref: str) -> str:
     return ""
 
 
+def _match_invoice_row(existing_rows: List[Dict[str, str]], ref: str) -> Dict[str, str]:
+    if not existing_rows:
+        return {}
+    n_ref = (ref or "").strip()
+    if not n_ref:
+        return {}
+    for r in existing_rows:
+        r_ref = (r.get("OdooRef", "") or "").strip()
+        if r_ref and r_ref == n_ref:
+            return r
+    return {}
+
+
 def _normalize_country(
     raw_country: str,
     country_parity: Dict[str, str],
@@ -141,7 +154,10 @@ def build_billto_sync(args: argparse.Namespace) -> int:
         "OdooCountry",
         "Notes",
         "OdooContactId",
+        "OdooContactExternalId",
         "OdooParentId",
+        "BilltoSyncStatus",
+        "BilltoMismatchFields",
         "LastLookupAt",
     ]
 
@@ -181,12 +197,28 @@ def build_billto_sync(args: argparse.Namespace) -> int:
                     mapped_country = inferred
 
         odoo_parent_id = (cust.get("OdooId") or "").strip() if cust else ""
-        match_id = ""
+        match_row: Dict[str, str] = {}
         if odoo_parent_id:
-            match_id = _match_invoice(
+            match_row = _match_invoice_row(
                 existing_by_parent.get(odoo_parent_id, []),
                 (c.get("RecordNumber") or "").strip(),
             )
+        match_id = (match_row.get("OdooId") or "").strip()
+
+        mismatches: List[str] = []
+        if match_row:
+            checks = [
+                ("name", match_name, match_row.get("OdooName", "")),
+                ("email", (c.get("Email") or "").strip(), match_row.get("OdooEmail", "")),
+                ("street", (addr.get("AddressLine1") or "").strip(), match_row.get("Street", "")),
+                ("street2", (addr.get("AddressLine2") or "").strip(), match_row.get("Street2", "")),
+                ("city", (addr.get("City") or "").strip(), match_row.get("City", "")),
+                ("zip", (addr.get("Zip") or "").strip(), match_row.get("Zip", "")),
+                ("state", mapped_state, match_row.get("State", "")),
+            ]
+            mismatches = [name for name, left, right in checks if _norm_text(left) != _norm_text(right)]
+            if _norm_phone((c.get("Telephone1") or "").strip()) != _norm_phone(match_row.get("OdooPhone", "")):
+                mismatches.append("phone")
 
         rows_out.append({
             "ContactRecordNumber": (c.get("RecordNumber") or "").strip(),
@@ -212,7 +244,10 @@ def build_billto_sync(args: argparse.Namespace) -> int:
             "OdooCountry": mapped_country,
             "Notes": (c.get("Notes") or "").strip(),
             "OdooContactId": match_id,
+            "OdooContactExternalId": (match_row.get("OdooExternalId") or "").strip(),
             "OdooParentId": odoo_parent_id,
+            "BilltoSyncStatus": "UPDATE" if (match_id and mismatches) else ("MATCH" if match_id else "NEW"),
+            "BilltoMismatchFields": "|".join(mismatches),
             "LastLookupAt": now_stamp,
         })
 
@@ -270,6 +305,8 @@ def build_billto_import(args: argparse.Namespace) -> int:
     emitted = 0
     new_rows: List[Dict[str, str]] = []
     for r in sync_rows:
+        if (r.get("BilltoSyncStatus") or "").strip().upper() != "NEW":
+            continue
         parent_id = (r.get("OdooParentId") or "").strip()
         if not parent_id:
             continue
@@ -314,4 +351,96 @@ def build_billto_import(args: argparse.Namespace) -> int:
     write_csv(out_csv, fieldnames, new_rows)
     print(f"OK: billto new rows: {emitted} -> {out_xlsx}")
     print(f"OK: billto NEW sync -> {out_csv}")
+    return 0
+
+
+def build_billto_update(args: argparse.Namespace) -> int:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        load_workbook = None
+
+    if load_workbook is None:
+        print("ERROR: openpyxl not available for XLSX export")
+        return 2
+
+    sync_path = args.sync_path
+    template_path = args.template_path
+
+    if not os.path.exists(sync_path):
+        print(f"ERROR: billto sync file not found: {sync_path}")
+        return 2
+    if not os.path.exists(template_path):
+        print(f"ERROR: template not found: {template_path}")
+        return 2
+
+    master_root = os.path.dirname(sync_path)
+    odoo_update = os.path.join(master_root, "odoo_UPDATE")
+    os.makedirs(odoo_update, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d")
+    out_xlsx = os.path.join(odoo_update, f"{stamp}_customers_billto_UPDATE.xlsx")
+    out_csv = os.path.join(master_root, "customers_billto_sync_UPDATE.csv")
+
+    _, sync_rows = read_csv(sync_path)
+    update_rows = [
+        r for r in sync_rows
+        if (r.get("BilltoSyncStatus") or "").strip().upper() == "UPDATE"
+        and (r.get("OdooParentId") or "").strip()
+        and (r.get("OdooContactExternalId") or "").strip()
+    ]
+
+    wb = load_workbook(template_path)
+    ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
+    header_map = {}
+    for col_idx in range(1, ws.max_column + 1):
+        header = ws.cell(row=1, column=col_idx).value
+        if header:
+            header_map[str(header).strip()] = col_idx
+
+    def set_cell(col_name: str, value: str) -> None:
+        col_idx = header_map.get(col_name)
+        if col_idx:
+            ws.cell(row=row_idx, column=col_idx, value=value)
+
+    ws.delete_rows(2, ws.max_row)
+    row_idx = 2
+    emitted = 0
+    for r in update_rows:
+        ext_id = (r.get("OdooContactExternalId") or "").strip()
+        if ext_id.startswith("__import__."):
+            ext_id = ext_id.split(".", 1)[1]
+        parent_id = (r.get("OdooParentId") or "").strip()
+        first = (r.get("FirstName") or "").strip()
+        last = (r.get("LastName") or "").strip()
+        full_name = " ".join([p for p in [first, last] if p]).strip()
+        company_name = (r.get("DeliveryName") or "").strip()
+        name = full_name if full_name else company_name
+        if not ext_id or not parent_id or not name:
+            continue
+
+        set_cell("External_ID", ext_id)
+        set_cell("Parent/Database ID", parent_id)
+        set_cell("Reference", (r.get("ContactRecordNumber") or "").strip())
+        set_cell("is_company", 0)
+        set_cell("type", "invoice")
+        set_cell("Name", name)
+        set_cell("Email", (r.get("Email") or "").strip())
+        set_cell("Phone", (r.get("Phone") or "").strip())
+        set_cell("Job Position", (r.get("Title") or "").strip())
+        set_cell("Street", (r.get("Street") or "").strip())
+        set_cell("Street2", (r.get("Street2") or "").strip())
+        set_cell("City", (r.get("City") or "").strip())
+        set_cell("State", (r.get("OdooState") or "").strip() or (r.get("State") or "").strip())
+        set_cell("ZIP", (r.get("Zip") or "").strip())
+        set_cell("Notes", (r.get("Notes") or "").strip())
+        set_cell("Language", "English (US)")
+        row_idx += 1
+        emitted += 1
+
+    wb.save(out_xlsx)
+    fieldnames = list(update_rows[0].keys()) if update_rows else []
+    write_csv(out_csv, fieldnames, update_rows)
+    print(f"OK: billto update rows: {emitted} -> {out_xlsx}")
+    print(f"OK: billto UPDATE sync -> {out_csv}")
     return 0

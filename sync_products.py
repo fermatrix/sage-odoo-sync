@@ -77,7 +77,7 @@ def build_product_sync(args: argparse.Namespace) -> int:
     ]
     rows_out: List[Dict[str, str]] = []
     for rec in sorted(item_records, key=lambda x: int(x) if x.isdigit() else x):
-        sync = sync_by_record.get(rec)
+        sync = sync_by_record.get(rec) or {}
         reason = ""
         if not sync:
             reason = "NO_SYNC"
@@ -86,7 +86,7 @@ def build_product_sync(args: argparse.Namespace) -> int:
                 reason = "NO_ODOO"
         if not reason:
             continue
-        master = master_by_record.get(rec, {})
+        master = master_by_record.get(rec) or {}
         rows_out.append({
             "ItemRecordNumber": rec,
             "ItemID": (sync.get("ItemID") or master.get("ItemID") or "").strip(),
@@ -128,12 +128,13 @@ def build_items_sync_new(args: argparse.Namespace) -> int:
         targets = [
             os.path.join(invoice_base_dir, "**", "2026_02_invoice_lines.csv"),
             os.path.join(invoice_base_dir, "**", "2026_03_invoice_lines.csv"),
+            os.path.join(invoice_base_dir, "**", "2026_04_invoice_lines.csv"),
         ]
         matched = []
         for pattern in targets:
             matched.extend(glob.glob(pattern, recursive=True))
         if not matched:
-            print("WARNING: no invoice_lines found for 2026_02 or 2026_03")
+            print("WARNING: no invoice_lines found for 2026_02, 2026_03, or 2026_04")
         for path in matched:
             try:
                 _, inv_rows = read_csv(path)
@@ -211,12 +212,13 @@ def build_products_sync_nobarcode_new(args: argparse.Namespace) -> int:
         targets = [
             os.path.join(invoice_base_dir, "**", "2026_02_invoice_lines.csv"),
             os.path.join(invoice_base_dir, "**", "2026_03_invoice_lines.csv"),
+            os.path.join(invoice_base_dir, "**", "2026_04_invoice_lines.csv"),
         ]
         matched = []
         for pattern in targets:
             matched.extend(glob.glob(pattern, recursive=True))
         if not matched:
-            print("WARNING: no invoice_lines found for 2026_02 or 2026_03")
+            print("WARNING: no invoice_lines found for 2026_02, 2026_03, or 2026_04")
         for path in matched:
             try:
                 _, inv_rows = read_csv(path)
@@ -422,3 +424,52 @@ def build_products_nobarcode_import(args: argparse.Namespace) -> int:
     wb.save(out_xlsx)
     print(f"OK: products nobarcode import rows: {len(selected)} -> {out_xlsx}")
     return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Products sync utilities (Sage <-> Odoo templates)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p6 = sub.add_parser("build_product_sync", help="Build product sync for a given YYYY_MM using invoice + credit note lines")
+    p6.add_argument("year_month", help="YYYY_MM (e.g., 2026_03)")
+    p6.add_argument("--base-dir", default=r"ENZO-Sage50")
+    p6.add_argument("--items-master", default=r"ENZO-Sage50\_master_sage\items.csv")
+    p6.add_argument("--items-sync", default=r"ENZO-Sage50\_master\products_sync.csv")
+    p6.add_argument("--out-path", default=r"ENZO-Sage50\_master\{year_month}_products_sync.csv")
+    p6.set_defaults(func=build_product_sync)
+
+    p7 = sub.add_parser("build_items_sync_new", help="Build products_sync_NEW with filters (no Odoo ID, active, barcode)")
+    p7.add_argument("--sync-path", default=r"ENZO-Sage50\_master\products_sync.csv")
+    p7.add_argument("--out-path", default=r"ENZO-Sage50\_master\products_sync_NEW.csv")
+    p7.add_argument("--base-dir", default=r"ENZO-Sage50")
+    p7.add_argument("--barcode-len", type=int, default=12, help="Require barcode to have exactly N digits (default: 12). Use 0 to disable.")
+    p7.set_defaults(func=build_items_sync_new)
+
+    p7b = sub.add_parser("build_products_sync_nobarcode_new", help="Build products_sync_nobarcode_NEW (no Odoo ID, empty/short barcode)")
+    p7b.add_argument("--sync-path", default=r"ENZO-Sage50\_master\products_sync.csv")
+    p7b.add_argument("--out-path", default=r"ENZO-Sage50\_master\products_sync_nobarcode_NEW.csv")
+    p7b.add_argument("--barcode-min", type=int, default=12, help="Require barcode to have at least N digits (default: 12). Use 0 to disable.")
+    p7b.add_argument("--base-dir", default=r"ENZO-Sage50")
+    p7b.set_defaults(func=build_products_sync_nobarcode_new)
+
+    p7c = sub.add_parser("build_products_import", help="Build products import XLSX from products_sync_NEW")
+    p7c.add_argument("--sync-path", default=r"ENZO-Sage50\_master\products_sync_NEW.csv")
+    p7c.add_argument("--template-path", default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx")
+    p7c.set_defaults(func=build_products_import)
+
+    p7d = sub.add_parser("build_products_nobarcode_import", help="Build products import XLSX from products_sync_nobarcode_NEW")
+    p7d.add_argument("--sync-path", default=r"ENZO-Sage50\_master\products_sync_nobarcode_NEW.csv")
+    p7d.add_argument("--template-path", default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx")
+    p7d.set_defaults(func=build_products_nobarcode_import)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

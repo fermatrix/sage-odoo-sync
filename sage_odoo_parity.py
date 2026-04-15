@@ -18,9 +18,10 @@ from sync_customers import (
     get_env_value,
 )
 from sync_contacts import build_contacts_sync, build_contacts_import
-from sync_addresses import build_addresses_sync, build_delivery_import
-from sync_billto import build_billto_sync, build_billto_import
+from sync_addresses import build_addresses_sync, build_delivery_import, build_delivery_update
+from sync_billto import build_billto_sync, build_billto_import, build_billto_update
 from sync_parity import OdooClient, export_countries
+from parity_utils import load_state_parity
 from sync_products import (
     build_product_sync,
     build_items_sync_new,
@@ -71,6 +72,22 @@ def refresh_sage(args: argparse.Namespace) -> int:
     _, customer_rows = read_csv(customers_master)
     _, item_rows = read_csv(items_master)
 
+    address_master_path = os.path.join(os.path.dirname(customers_master), "address.csv")
+    address_by_customer = {}
+    if os.path.exists(address_master_path):
+        _, address_rows = read_csv(address_master_path)
+        for addr in address_rows:
+            if (addr.get("AddressTypeNumber") or "").strip() != "0":
+                continue
+            customer_record = (addr.get("CustomerRecordNumber") or "").strip()
+            if not customer_record or customer_record == "0":
+                continue
+            existing_addr = address_by_customer.get(customer_record)
+            current_num = int(addr.get("AddressRecordNumber") or "999999999")
+            existing_num = int((existing_addr or {}).get("AddressRecordNumber") or "999999999")
+            if existing_addr is None or current_num < existing_num:
+                address_by_customer[customer_record] = addr
+
     customer_fields = [
         "CustomerRecordNumber",
         "CustomerIsInactive",
@@ -78,9 +95,19 @@ def refresh_sage(args: argparse.Namespace) -> int:
         "LastInvoiceDate",
         "CustomerID",
         "Customer_Bill_Name",
+        "Phone",
+        "Email",
+        "Street",
+        "Street2",
+        "City",
+        "Zip",
+        "State",
+        "Country",
         "OdooId",
         "OdooName",
         "Exclude",
+        "CustomerSyncStatus",
+        "CustomerMismatchFields",
         "LastLookupAt",
     ]
     item_fields = [
@@ -91,6 +118,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
         "Barcode",
         "ItemIsInactive",
         "OdooVariantId",
+        "OdooTemplateId",
+        "OdooTemplateExternalId",
         "OdooName",
         "OdooColor",
         "Exclude",
@@ -103,6 +132,7 @@ def refresh_sage(args: argparse.Namespace) -> int:
         if not key:
             continue
         existing = existing_customers.get(key, {})
+        addr = address_by_customer.get(key, {})
         out_customers.append({
             "CustomerRecordNumber": key,
             "CustomerIsInactive": (row.get("CustomerIsInactive") or "").strip(),
@@ -110,9 +140,19 @@ def refresh_sage(args: argparse.Namespace) -> int:
             "LastInvoiceDate": (row.get("LastInvoiceDate") or "").strip(),
             "CustomerID": (row.get("CustomerID") or "").strip(),
             "Customer_Bill_Name": (row.get("Customer_Bill_Name") or "").strip(),
+            "Phone": (row.get("Phone_Number") or row.get("PhoneNumber2") or "").strip(),
+            "Email": (row.get("eMail_Address") or "").strip(),
+            "Street": (addr.get("AddressLine1") or "").strip(),
+            "Street2": (addr.get("AddressLine2") or "").strip(),
+            "City": (addr.get("City") or "").strip(),
+            "Zip": (addr.get("Zip") or "").strip(),
+            "State": (addr.get("State") or "").strip(),
+            "Country": (addr.get("Country") or "").strip(),
             "OdooId": (existing.get("OdooId") or "").strip(),
             "OdooName": (existing.get("OdooName") or "").strip(),
             "Exclude": (existing.get("Exclude") or "").strip(),
+            "CustomerSyncStatus": (existing.get("CustomerSyncStatus") or "").strip(),
+            "CustomerMismatchFields": (existing.get("CustomerMismatchFields") or "").strip(),
             "LastLookupAt": (existing.get("LastLookupAt") or "").strip(),
         })
 
@@ -131,6 +171,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
             "ItemIsInactive": (row.get("ItemIsInactive") or "").strip(),
             "OdooColor": (existing.get("OdooColor") or "").strip(),
             "OdooVariantId": (existing.get("OdooVariantId") or "").strip(),
+            "OdooTemplateId": (existing.get("OdooTemplateId") or "").strip(),
+            "OdooTemplateExternalId": (existing.get("OdooTemplateExternalId") or "").strip(),
             "OdooName": (existing.get("OdooName") or "").strip(),
             "Exclude": (existing.get("Exclude") or "").strip(),
             "LastLookupAt": (existing.get("LastLookupAt") or "").strip(),
@@ -397,17 +439,49 @@ def refresh_odoo(args: argparse.Namespace) -> int:
 
     customer_fields = [
         "OdooId",
+        "OdooExternalId",
         "OdooName",
         "OdooRef",
         "Active",
         "ParentId",
         "OdooEmail",
         "OdooPhone",
+        "Street",
+        "Street2",
+        "City",
+        "Zip",
+        "State",
+        "Country",
         "OdooSalespersonId",
         "OdooSalesperson",
         "OdooPricelistId",
         "OdooPricelist",
     ]
+
+    def _load_external_ids(model: str) -> Dict[str, str]:
+        external_by_res_id: Dict[str, str] = {}
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "ir.model.data",
+                [["model", "=", model]],
+                ["module", "name", "res_id"],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for row in rows:
+                res_id = str(row.get("res_id") or "").strip()
+                module = (row.get("module") or "").strip()
+                name = (row.get("name") or "").strip()
+                if res_id and module and name and res_id not in external_by_res_id:
+                    external_by_res_id[res_id] = f"{module}.{name}"
+            offset += len(rows)
+        return external_by_res_id
+
+    partner_external_ids = _load_external_ids("res.partner")
+
     with open(customers_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=customer_fields, delimiter=DELIMITER)
         writer.writeheader()
@@ -424,6 +498,12 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "parent_id",
                     "email",
                     "phone",
+                    "street",
+                    "street2",
+                    "city",
+                    "zip",
+                    "state_id",
+                    "country_id",
                     "user_id",
                     "property_product_pricelist",
                 ],
@@ -437,14 +517,23 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 parent_id = parent[0] if isinstance(parent, list) and parent else ""
                 salesperson = r.get("user_id") or []
                 pricelist = r.get("property_product_pricelist") or []
+                state = r.get("state_id") or []
+                country = r.get("country_id") or []
                 writer.writerow({
                     "OdooId": r.get("id", ""),
+                    "OdooExternalId": partner_external_ids.get(str(r.get("id", "")), ""),
                     "OdooName": r.get("name", "") or "",
                     "OdooRef": r.get("ref", "") or "",
                     "Active": r.get("active", ""),
                     "ParentId": parent_id,
                     "OdooEmail": r.get("email", "") or "",
                     "OdooPhone": r.get("phone", "") or "",
+                    "Street": r.get("street", "") or "",
+                    "Street2": r.get("street2", "") or "",
+                    "City": r.get("city", "") or "",
+                    "Zip": r.get("zip", "") or "",
+                    "State": state[1] if isinstance(state, list) and len(state) > 1 else "",
+                    "Country": country[1] if isinstance(country, list) and len(country) > 1 else "",
                     "OdooSalespersonId": salesperson[0] if isinstance(salesperson, list) and salesperson else "",
                     "OdooSalesperson": salesperson[1] if isinstance(salesperson, list) and len(salesperson) > 1 else "",
                     "OdooPricelistId": pricelist[0] if isinstance(pricelist, list) and pricelist else "",
@@ -486,6 +575,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     children_out = os.path.join(os.path.dirname(customers_out), "customers_child_partners.csv")
     children_fields = [
         "OdooId",
+        "OdooExternalId",
         "ParentId",
         "ParentName",
         "OdooName",
@@ -538,6 +628,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 country = r.get("country_id") or []
                 writer.writerow({
                     "OdooId": r.get("id", ""),
+                    "OdooExternalId": partner_external_ids.get(str(r.get("id", "")), ""),
                     "ParentId": parent_id,
                     "ParentName": parent_name,
                     "OdooName": r.get("name", "") or "",
@@ -594,6 +685,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 country = r.get("country_id") or []
                 writer.writerow({
                     "OdooId": r.get("id", ""),
+                    "OdooExternalId": partner_external_ids.get(str(r.get("id", "")), ""),
                     "ParentId": parent_id,
                     "ParentName": parent_name,
                     "OdooName": r.get("name", "") or "",
@@ -615,6 +707,8 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     delivery_out = os.path.join(os.path.dirname(customers_out), "customers_delivery_addresses.csv")
     delivery_fields = [
         "OdooId",
+        "OdooExternalId",
+        "OdooRef",
         "ParentId",
         "ParentName",
         "OdooName",
@@ -641,6 +735,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "id",
                     "parent_id",
                     "name",
+                    "ref",
                     "type",
                     "street",
                     "street2",
@@ -665,6 +760,8 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 country = r.get("country_id") or []
                 writer.writerow({
                     "OdooId": r.get("id", ""),
+                    "OdooExternalId": partner_external_ids.get(str(r.get("id", "")), ""),
+                    "OdooRef": r.get("ref", "") or "",
                     "ParentId": parent_id,
                     "ParentName": parent_name,
                     "OdooName": r.get("name", "") or "",
@@ -688,7 +785,9 @@ def refresh_odoo(args: argparse.Namespace) -> int:
         "OdooItemCode",
         "OdooColor",
         "Active",
+        "OdooTemplateId",
         "OdooTemplateExternalId",
+        "OdooTemplateListPrice",
     ]
     with open(items_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=item_fields, delimiter=DELIMITER)
@@ -735,11 +834,24 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                             "attribute": attr_name,
                         }
             tmpl_external = {}
+            tmpl_prices = {}
             if tmpl_ids:
                 ids = list(tmpl_ids)
                 chunk_size = 1000
                 for i in range(0, len(ids), chunk_size):
                     chunk = ids[i:i + chunk_size]
+                    tmpl_rows = client.models.execute_kw(
+                        client.db,
+                        client.uid,
+                        client.apikey,
+                        "product.template",
+                        "read",
+                        [chunk],
+                        {"fields": ["list_price"]},
+                    )
+                    for t in tmpl_rows:
+                        if t.get("id"):
+                            tmpl_prices[t.get("id")] = t.get("list_price", "")
                     data_rows = client.models.execute_kw(
                         client.db,
                         client.uid,
@@ -770,7 +882,9 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     "OdooItemCode": r.get("default_code", "") or "",
                     "OdooColor": " / ".join([c for c in color_values if c]),
                     "Active": r.get("active", ""),
+                    "OdooTemplateId": tmpl_id,
                     "OdooTemplateExternalId": tmpl_external.get(tmpl_id, ""),
+                    "OdooTemplateListPrice": tmpl_prices.get(tmpl_id, ""),
                 })
             offset += len(rows)
 
@@ -808,7 +922,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     print(f"OK: odoo users exported -> {users_out}")
     # Export Odoo pricelists
     pricelists_out = os.path.join(odoo_root, "pricelists_odoo.csv")
-    pricelist_fields = ["OdooId", "OdooName", "Active"]
+    pricelist_fields = ["OdooId", "OdooName", "Active", "CurrencyId", "CurrencyName"]
     with open(pricelists_out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=pricelist_fields, delimiter=DELIMITER)
         writer.writeheader()
@@ -817,7 +931,35 @@ def refresh_odoo(args: argparse.Namespace) -> int:
             rows = client.search_read(
                 "product.pricelist",
                 [],
-                ["id", "name", "active"],
+                ["id", "name", "active", "currency_id"],
+                limit=batch,
+                offset=offset,
+            )
+            if not rows:
+                break
+            for r in rows:
+                currency = r.get("currency_id") or []
+                writer.writerow({
+                    "OdooId": r.get("id", ""),
+                    "OdooName": r.get("name", "") or "",
+                    "Active": r.get("active", ""),
+                    "CurrencyId": currency[0] if isinstance(currency, list) and currency else "",
+                    "CurrencyName": currency[1] if isinstance(currency, list) and len(currency) > 1 else "",
+                })
+            offset += len(rows)
+    print(f"OK: odoo pricelists exported -> {pricelists_out}")
+    # Export Odoo currencies
+    currencies_out = os.path.join(odoo_root, "currencies_odoo.csv")
+    currency_fields = ["OdooId", "OdooName", "Code", "Symbol", "Rounding", "DecimalPlaces", "Active"]
+    with open(currencies_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=currency_fields, delimiter=DELIMITER)
+        writer.writeheader()
+        offset = 0
+        while True:
+            rows = client.search_read(
+                "res.currency",
+                [],
+                ["id", "name", "symbol", "rounding", "decimal_places", "active"],
                 limit=batch,
                 offset=offset,
             )
@@ -827,10 +969,14 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 writer.writerow({
                     "OdooId": r.get("id", ""),
                     "OdooName": r.get("name", "") or "",
+                    "Code": r.get("name", "") or "",
+                    "Symbol": r.get("symbol", "") or "",
+                    "Rounding": r.get("rounding", ""),
+                    "DecimalPlaces": r.get("decimal_places", ""),
                     "Active": r.get("active", ""),
                 })
             offset += len(rows)
-    print(f"OK: odoo pricelists exported -> {pricelists_out}")
+    print(f"OK: odoo currencies exported -> {currencies_out}")
     # Export Odoo pricelist items (master + per-pricelist)
     pricelist_items_out = os.path.join(odoo_root, "pricelist_items_odoo.csv")
     pricelists_by_id = {}
@@ -1032,31 +1178,81 @@ def sync_local(args: argparse.Namespace) -> int:
 
     if "LastLookupAt" not in customer_fields:
         customer_fields.append("LastLookupAt")
+    if "CustomerSyncStatus" not in customer_fields:
+        customer_fields.append("CustomerSyncStatus")
+    if "CustomerMismatchFields" not in customer_fields:
+        customer_fields.append("CustomerMismatchFields")
+    if "OdooExternalId" not in customer_fields:
+        customer_fields.append("OdooExternalId")
     if "LastLookupAt" not in item_fields:
         item_fields.append("LastLookupAt")
+    if "OdooTemplateId" not in item_fields:
+        item_fields.append("OdooTemplateId")
+    if "OdooTemplateExternalId" not in item_fields:
+        item_fields.append("OdooTemplateExternalId")
 
     updated_customers = 0
+
+    def _norm_text(value: str) -> str:
+        return " ".join((value or "").strip().upper().split())
+
+    def _norm_phone(value: str) -> str:
+        return "".join(ch for ch in (value or "") if ch.isdigit())
+
+    def _customer_mismatches(row: Dict[str, str], record: Dict[str, str]) -> List[str]:
+        checks = [
+            ("name", row.get("Customer_Bill_Name", ""), record.get("OdooName", "")),
+            ("reference", row.get("CustomerID", ""), record.get("OdooRef", "")),
+            ("email", row.get("Email", ""), record.get("OdooEmail", "")),
+            ("street", row.get("Street", ""), record.get("Street", "")),
+            ("street2", row.get("Street2", ""), record.get("Street2", "")),
+            ("city", row.get("City", ""), record.get("City", "")),
+            ("zip", row.get("Zip", ""), record.get("Zip", "")),
+        ]
+        mismatches = [name for name, left, right in checks if _norm_text(left) != _norm_text(right)]
+        if _norm_phone(row.get("Phone", "")) != _norm_phone(record.get("OdooPhone", "")):
+            mismatches.append("phone")
+        return mismatches
+
     for row in customer_rows:
-        if row.get("OdooId"):
-            continue
         if truthy(row.get("Exclude")):
             continue
         customer_id = (row.get("CustomerID") or "").strip()
         customer_name = (row.get("Customer_Bill_Name") or "").strip()
         record = None
-        if customer_id:
+        match_source = ""
+        if row.get("OdooId"):
+            record = next((r for r in odoo_cust_rows if str(r.get("OdooId") or "").strip() == str(row.get("OdooId")).strip()), None)
+            if record is not None:
+                match_source = "id"
+        if record is None and customer_id:
             matches = odoo_cust_by_ref.get(customer_id, [])
             if len(matches) == 1:
                 record = matches[0]
+                match_source = "ref"
         if record is None and args.customer_match_name and customer_name:
             matches = odoo_cust_by_name.get(customer_name, [])
             if len(matches) == 1:
                 record = matches[0]
+                match_source = "name"
         row["LastLookupAt"] = now
         if record:
-            row["OdooId"] = str(record.get("OdooId", ""))
-            row["OdooName"] = record.get("OdooName", "") or ""
-            updated_customers += 1
+            strict_match = match_source in {"id", "ref"}
+            if strict_match:
+                row["OdooId"] = str(record.get("OdooId", ""))
+                row["OdooExternalId"] = record.get("OdooExternalId", "") or ""
+                row["OdooName"] = record.get("OdooName", "") or ""
+                mismatches = _customer_mismatches(row, record)
+                row["CustomerSyncStatus"] = "UPDATE" if mismatches else "MATCH"
+                row["CustomerMismatchFields"] = "|".join(mismatches)
+                updated_customers += 1
+            else:
+                # Name fallback can help discovery, but never for UPDATE safety.
+                row["CustomerSyncStatus"] = "NEW"
+                row["CustomerMismatchFields"] = "fallback_name_only"
+        else:
+            row["CustomerSyncStatus"] = "NEW"
+            row["CustomerMismatchFields"] = ""
 
     updated_items = 0
     for row in item_rows:
@@ -1067,6 +1263,10 @@ def sync_local(args: argparse.Namespace) -> int:
                     row["OdooColor"] = existing.get("OdooColor", "") or ""
                 if not row.get("OdooName"):
                     row["OdooName"] = existing.get("OdooName", "") or ""
+                if not row.get("OdooTemplateId"):
+                    row["OdooTemplateId"] = existing.get("OdooTemplateId", "") or ""
+                if not row.get("OdooTemplateExternalId"):
+                    row["OdooTemplateExternalId"] = existing.get("OdooTemplateExternalId", "") or ""
             continue
         if truthy(row.get("Exclude")):
             continue
@@ -1080,6 +1280,8 @@ def sync_local(args: argparse.Namespace) -> int:
             row["OdooVariantId"] = str(record.get("OdooVariantId", ""))
             row["OdooName"] = record.get("OdooName", "") or ""
             row["OdooColor"] = record.get("OdooColor", "") or ""
+            row["OdooTemplateId"] = record.get("OdooTemplateId", "") or ""
+            row["OdooTemplateExternalId"] = record.get("OdooTemplateExternalId", "") or ""
             updated_items += 1
 
     customer_rows.sort(key=lambda r: int(r["CustomerRecordNumber"]))
@@ -1456,6 +1658,674 @@ def build_employees_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_pricelist_parity(args: argparse.Namespace) -> int:
+    root = args.root_dir
+    master = os.path.join(root, "_master")
+    master_odoo = os.path.join(root, "_master_odoo")
+    os.makedirs(master, exist_ok=True)
+
+    pricelists_path = os.path.join(master_odoo, "pricelists_odoo.csv")
+    currencies_path = os.path.join(master_odoo, "currencies_odoo.csv")
+    parity_currency_out = os.path.join(master, "_parity_currency.csv")
+    parity_pricelist_out = os.path.join(master, "_parity_pricelist.csv")
+
+    # Build currency parity from Odoo currencies
+    currency_rows = []
+    if os.path.exists(currencies_path):
+        _, currency_rows = read_csv(currencies_path)
+    with open(parity_currency_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["currency_code", "odoo_currency_id", "odoo_currency_name", "symbol", "match_type"],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        for r in currency_rows:
+            writer.writerow({
+                "currency_code": (r.get("Code") or "").strip(),
+                "odoo_currency_id": (r.get("OdooId") or "").strip(),
+                "odoo_currency_name": (r.get("OdooName") or "").strip(),
+                "symbol": (r.get("Symbol") or "").strip(),
+                "match_type": "odoo",
+            })
+
+    # Build pricelist parity template (levels 1..10)
+    pricelist_rows = []
+    if os.path.exists(pricelists_path):
+        _, pricelist_rows = read_csv(pricelists_path)
+    with open(parity_pricelist_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "sage_price_level",
+                "odoo_pricelist_id",
+                "odoo_pricelist_name",
+                "odoo_currency_id",
+                "odoo_currency_code",
+                "notes",
+            ],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        # default empty mappings for levels 1..10
+        for level in range(1, 11):
+            writer.writerow({
+                "sage_price_level": str(level),
+                "odoo_pricelist_id": "",
+                "odoo_pricelist_name": "",
+                "odoo_currency_id": "",
+                "odoo_currency_code": "",
+                "notes": "",
+            })
+        # Append available pricelists as reference rows
+        for r in pricelist_rows:
+            writer.writerow({
+                "sage_price_level": "",
+                "odoo_pricelist_id": (r.get("OdooId") or "").strip(),
+                "odoo_pricelist_name": (r.get("OdooName") or "").strip(),
+                "odoo_currency_id": (r.get("CurrencyId") or "").strip(),
+                "odoo_currency_code": (r.get("CurrencyName") or "").strip(),
+                "notes": "odoo_pricelist_reference",
+            })
+
+    print(f"OK: parity currency -> {parity_currency_out}")
+    print(f"OK: parity pricelist -> {parity_pricelist_out}")
+    return 0
+
+
+def build_pricelist_lines(args: argparse.Namespace) -> int:
+    root = args.root_dir
+    master = os.path.join(root, "_master")
+    master_sage = os.path.join(root, "_master_sage")
+    master_odoo = os.path.join(root, "_master_odoo")
+    os.makedirs(master, exist_ok=True)
+
+    items_path = args.items_master
+    odoo_items_path = args.items_odoo
+    pricelist_items_path = args.pricelist_items_odoo
+    parity_pricelist_path = args.parity_pricelist
+
+    if not os.path.exists(items_path):
+        print(f"ERROR: missing {items_path}")
+        return 2
+    if not os.path.exists(odoo_items_path):
+        print(f"ERROR: missing {odoo_items_path}")
+        return 2
+    if not os.path.exists(parity_pricelist_path):
+        print(f"ERROR: missing {parity_pricelist_path}")
+        return 2
+
+    # Map Sage ItemID -> OdooTemplateId
+    item_to_template = {}
+    _, odoo_item_rows = read_csv(odoo_items_path)
+    for r in odoo_item_rows:
+        code = (r.get("OdooItemCode") or "").strip()
+        tmpl_id = (r.get("OdooTemplateId") or "").strip()
+        if code and tmpl_id:
+            item_to_template[code] = tmpl_id
+
+    # Load parity mapping: price level -> pricelist info
+    parity_map = {}
+    _, parity_rows = read_csv(parity_pricelist_path)
+    for r in parity_rows:
+        level = (r.get("sage_price_level") or "").strip()
+        if not level:
+            continue
+        parity_map[level] = r
+
+    def _to_float(raw: str):
+        value = (raw or "").strip()
+        if not value:
+            return None
+        # Sage exports usually use comma decimal separator (e.g. 79,95)
+        if "," in value and "." not in value:
+            value = value.replace(",", ".")
+        else:
+            value = value.replace(",", "")
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _fmt_price(number: float) -> str:
+        return f"{number:.2f}"
+
+    price_cols = [f"PriceLevel{i}Amount" for i in range(1, 11)]
+    # Consolidate by pricelist + product template (one row per product, not per variant)
+    grouped_prices: Dict[tuple, set] = defaultdict(set)
+    grouped_meta: Dict[tuple, Dict[str, str]] = {}
+    _, items_rows = read_csv(items_path)
+    for r in items_rows:
+        item_id = (r.get("ItemID") or "").strip()
+        tmpl_id = item_to_template.get(item_id)
+        if not tmpl_id:
+            continue
+        for i, col in enumerate(price_cols, start=1):
+            price_num = _to_float(r.get(col) or "")
+            if price_num is None or abs(price_num) < 0.0000001:
+                continue
+            parity = parity_map.get(str(i), {})
+            pricelist_id = (parity.get("odoo_pricelist_id") or "").strip()
+            pricelist_name = (parity.get("odoo_pricelist_name") or "").strip()
+            currency_id = (parity.get("odoo_currency_id") or "").strip()
+            if not pricelist_id:
+                continue
+            key = (pricelist_id, tmpl_id)
+            grouped_prices[key].add(price_num)
+            if key not in grouped_meta:
+                grouped_meta[key] = {
+                    "OdooId": "",
+                    "PricelistId": pricelist_id,
+                    "PricelistName": pricelist_name,
+                    "AppliedOn": "1_product",
+                    "ProductTemplateId": tmpl_id,
+                    "ProductId": "",
+                    "MinQuantity": "0.0",
+                    "PercentPrice": "0.0",
+                    "DateStart": "",
+                    "DateEnd": "",
+                    "ComputePrice": "fixed",
+                    "Base": "list_price",
+                    "BasePricelistId": "",
+                    "CurrencyId": currency_id,
+                }
+
+    lines = []
+    conflicts = []
+    for key, prices in grouped_prices.items():
+        meta = grouped_meta[key]
+        if len(prices) == 1:
+            price_num = next(iter(prices))
+            row = dict(meta)
+            row["FixedPrice"] = _fmt_price(price_num)
+            lines.append(row)
+        else:
+            # Keep conflicts out of import; export to a dedicated review file.
+            conflicts.append({
+                "PricelistId": meta["PricelistId"],
+                "PricelistName": meta["PricelistName"],
+                "ProductTemplateId": meta["ProductTemplateId"],
+                "CurrencyId": meta["CurrencyId"],
+                "PricesFound": " | ".join([_fmt_price(p) for p in sorted(prices)]),
+                "Reason": "multiple_variant_prices_for_same_template",
+            })
+
+    out_path = os.path.join(master, "pricelist_lines.csv")
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "OdooId",
+                "PricelistId",
+                "PricelistName",
+                "AppliedOn",
+                "ProductTemplateId",
+                "ProductId",
+                "MinQuantity",
+                "FixedPrice",
+                "PercentPrice",
+                "DateStart",
+                "DateEnd",
+                "ComputePrice",
+                "Base",
+                "BasePricelistId",
+                "CurrencyId",
+            ],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        writer.writerows(lines)
+
+    conflicts_path = os.path.join(master, "pricelist_lines_CONFLICTS.csv")
+    with open(conflicts_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "PricelistId",
+                "PricelistName",
+                "ProductTemplateId",
+                "CurrencyId",
+                "PricesFound",
+                "Reason",
+            ],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        writer.writerows(conflicts)
+
+    # Build NEW by excluding existing Odoo pricelist items
+    existing_keys = set()
+    if os.path.exists(pricelist_items_path):
+        _, existing_rows = read_csv(pricelist_items_path)
+        for r in existing_rows:
+            key = (
+                (r.get("PricelistId") or "").strip(),
+                (r.get("AppliedOn") or "").strip(),
+                (r.get("ProductTemplateId") or "").strip(),
+                (r.get("MinQuantity") or "").strip(),
+            )
+            existing_keys.add(key)
+
+    new_lines = []
+    for r in lines:
+        key = (
+            (r.get("PricelistId") or "").strip(),
+            (r.get("AppliedOn") or "").strip(),
+            (r.get("ProductTemplateId") or "").strip(),
+            (r.get("MinQuantity") or "").strip(),
+        )
+        if key in existing_keys:
+            continue
+        new_lines.append(r)
+
+    out_new_path = os.path.join(master, "pricelist_lines_NEW.csv")
+    with open(out_new_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "OdooId",
+                "PricelistId",
+                "PricelistName",
+                "AppliedOn",
+                "ProductTemplateId",
+                "ProductId",
+                "MinQuantity",
+                "FixedPrice",
+                "PercentPrice",
+                "DateStart",
+                "DateEnd",
+                "ComputePrice",
+                "Base",
+                "BasePricelistId",
+                "CurrencyId",
+            ],
+            delimiter=DELIMITER,
+        )
+        writer.writeheader()
+        writer.writerows(new_lines)
+
+    print(f"OK: pricelist lines -> {out_path} ({len(lines)} rows)")
+    print(f"OK: pricelist lines NEW -> {out_new_path} ({len(new_lines)} rows)")
+    print(f"OK: pricelist conflicts -> {conflicts_path} ({len(conflicts)} rows)")
+    return 0
+
+
+def build_pricelist_import(args: argparse.Namespace) -> int:
+    root = args.root_dir
+    master_odoo = os.path.join(root, "_master_odoo")
+    template_path = args.template_path
+    sync_path = args.sync_path
+    out_path = args.out_path
+    items_odoo_path = os.path.join(master_odoo, "items_odoo.csv")
+    pricelists_path = os.path.join(master_odoo, "pricelists_odoo.csv")
+
+    if not os.path.exists(template_path):
+        print(f"ERROR: template not found: {template_path}")
+        return 2
+    if not os.path.exists(sync_path):
+        print(f"ERROR: sync not found: {sync_path}")
+        return 2
+    if not os.path.exists(items_odoo_path):
+        print(f"ERROR: odoo items not found: {items_odoo_path}")
+        return 2
+    if not os.path.exists(pricelists_path):
+        print(f"ERROR: odoo pricelists not found: {pricelists_path}")
+        return 2
+
+    # Load template headers from CSV
+    with open(template_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f, delimiter=DELIMITER)
+        headers = next(reader)
+
+    if "{date}" in out_path:
+        out_path = out_path.format(date=datetime.now().strftime("%Y%m%d"))
+    if not out_path.lower().endswith(".csv"):
+        out_path = os.path.splitext(out_path)[0] + ".csv"
+
+    tmpl_to_external = {}
+    _, odoo_item_rows = read_csv(items_odoo_path)
+    for row in odoo_item_rows:
+        tmpl_id = (row.get("OdooTemplateId") or "").strip()
+        external_id = (row.get("OdooTemplateExternalId") or "").strip()
+        if tmpl_id and external_id and tmpl_id not in tmpl_to_external:
+            tmpl_to_external[tmpl_id] = external_id.split(".", 1)[1] if "." in external_id else external_id
+
+    pricelist_map = {}
+    _, pricelist_rows = read_csv(pricelists_path)
+    for row in pricelist_rows:
+        pricelist_id = (row.get("OdooId") or "").strip()
+        if pricelist_id:
+            pricelist_map[pricelist_id] = {
+                "name": (row.get("OdooName") or "").strip(),
+                "currency": (row.get("CurrencyName") or "").strip(),
+            }
+
+    def normalize_pricelist(name: str, currency: str):
+        raw_name = (name or "").strip()
+        upper_name = raw_name.upper()
+        cur = (currency or "").strip().upper()
+        if upper_name in {"USA", "USA (USD)"}:
+            return "USA", "USA", "USD"
+        if upper_name in {"EU", "EU (EUR)"}:
+            return "EU", "EU", "EUR"
+        if upper_name in {"UK", "UK (GBP)"}:
+            return "UK", "UK", "GBP"
+        if upper_name in {"CAD", "CAD (CAD)"}:
+            return "CAD", "CAD", "CAD"
+        if upper_name in {"AUD", "AUD (AUD)"}:
+            return "AUD", "AUD", "AUD"
+        plain_name = upper_name.split("(", 1)[0].strip() if upper_name else ""
+        return plain_name, plain_name, cur
+
+    def normalize_price(value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        try:
+            return f"{float(raw.replace(',', '.')):.2f}"
+        except Exception:
+            return raw.replace(",", ".")
+
+    _, rows = read_csv(sync_path)
+    out_rows = []
+    missing_template_external = 0
+    for row in rows:
+        pricelist_id = (row.get("PricelistId") or "").strip()
+        tmpl_id = (row.get("ProductTemplateId") or "").strip()
+        fixed_price = (row.get("FixedPrice") or "").strip()
+        tmpl_external = tmpl_to_external.get(tmpl_id, "")
+        if tmpl_id and not tmpl_external:
+            missing_template_external += 1
+        if not pricelist_id or not tmpl_external:
+            continue
+        plist = pricelist_map.get(pricelist_id, {})
+        out_id, out_name, out_currency = normalize_pricelist(
+            plist.get("name", row.get("PricelistName", "")),
+            plist.get("currency", row.get("CurrencyId", "")),
+        )
+        out_rows.append({
+            "id": out_id,
+            "name": out_name,
+            "country_group_ids/id": "",
+            "currency_id": out_currency,
+            "item_ids/applied_on": "Product",
+            "item_ids/base": "Sales Price",
+            "item_ids/compute_price": "Fixed Price",
+            "item_ids/fixed_price": normalize_price(fixed_price),
+            "item_ids/product_tmpl_id/id": tmpl_external,
+        })
+
+    seen = set()
+    unique_rows = []
+    for row in out_rows:
+        key = (row.get("id", ""), row.get("item_ids/product_tmpl_id/id", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers, delimiter=DELIMITER)
+        writer.writeheader()
+        for row in unique_rows:
+            writer.writerow({h: row.get(h, "") for h in headers})
+
+    print(f"OK: pricelist import -> {out_path} ({len(unique_rows)} rows)")
+    if missing_template_external:
+        print(f"WARNING: missing product template external IDs: {missing_template_external}")
+    return 0
+
+
+def build_pricelist_update(args: argparse.Namespace) -> int:
+    root = args.root_dir
+    master = os.path.join(root, "_master")
+    master_odoo = os.path.join(root, "_master_odoo")
+    template_path = args.template_path
+    lines_path = args.lines_path
+    existing_path = args.pricelist_items_odoo
+    items_odoo_path = args.items_odoo
+    pricelists_path = args.pricelists_odoo
+    out_path = args.out_path
+
+    required = [template_path, lines_path, existing_path, items_odoo_path, pricelists_path]
+    for path in required:
+        if not os.path.exists(path):
+            print(f"ERROR: missing {path}")
+            return 2
+
+    with open(template_path, newline="", encoding="utf-8") as f:
+        headers = next(csv.reader(f, delimiter=DELIMITER))
+    if "item_ids/id" in headers:
+        headers = ["item_ids/.id" if h == "item_ids/id" else h for h in headers]
+    if "item_ids/.id" not in headers:
+        headers = ["item_ids/.id"] + headers
+
+    if "{date}" in out_path:
+        out_path = out_path.format(date=datetime.now().strftime("%Y%m%d"))
+
+    tmpl_to_external = {}
+    _, item_rows = read_csv(items_odoo_path)
+    for row in item_rows:
+        tmpl_id = (row.get("OdooTemplateId") or "").strip()
+        external_id = (row.get("OdooTemplateExternalId") or "").strip()
+        if tmpl_id and external_id and tmpl_id not in tmpl_to_external:
+            tmpl_to_external[tmpl_id] = external_id.split(".", 1)[1] if "." in external_id else external_id
+
+    pricelist_map = {}
+    _, pricelist_rows = read_csv(pricelists_path)
+    for row in pricelist_rows:
+        pricelist_id = (row.get("OdooId") or "").strip()
+        if pricelist_id:
+            pricelist_map[pricelist_id] = {
+                "name": (row.get("OdooName") or "").strip(),
+                "currency": (row.get("CurrencyName") or "").strip(),
+            }
+
+    def normalize_price(value: str):
+        raw = (value or "").strip()
+        if not raw:
+            return None
+        try:
+            return float(raw.replace(",", "."))
+        except Exception:
+            return None
+
+    def format_price(value: float) -> str:
+        return f"{value:.2f}"
+
+    def normalize_pricelist(name: str, currency: str):
+        upper_name = (name or "").strip().upper()
+        cur = (currency or "").strip().upper()
+        if upper_name in {"USA", "USA (USD)"}:
+            return "USA", "USA", "USD"
+        if upper_name in {"EU", "EU (EUR)"}:
+            return "EU", "EU", "EUR"
+        if upper_name in {"UK", "UK (GBP)"}:
+            return "UK", "UK", "GBP"
+        if upper_name in {"CAD", "CAD (CAD)"}:
+            return "CAD", "CAD", "CAD"
+        if upper_name in {"AUD", "AUD (AUD)"}:
+            return "AUD", "AUD", "AUD"
+        plain_name = upper_name.split("(", 1)[0].strip() if upper_name else ""
+        return plain_name, plain_name, cur
+
+    existing_by_key = {}
+    _, existing_rows = read_csv(existing_path)
+    for row in existing_rows:
+        key = (
+            (row.get("PricelistId") or "").strip(),
+            (row.get("AppliedOn") or "").strip(),
+            (row.get("ProductTemplateId") or "").strip(),
+            (row.get("MinQuantity") or "").strip(),
+        )
+        existing_by_key[key] = row
+
+    _, line_rows = read_csv(lines_path)
+    update_rows = []
+    for row in line_rows:
+        key = (
+            (row.get("PricelistId") or "").strip(),
+            (row.get("AppliedOn") or "").strip(),
+            (row.get("ProductTemplateId") or "").strip(),
+            (row.get("MinQuantity") or "").strip(),
+        )
+        existing = existing_by_key.get(key)
+        if not existing:
+            continue
+        new_price = normalize_price(row.get("FixedPrice") or "")
+        old_price = normalize_price(existing.get("FixedPrice") or "")
+        if new_price is None or old_price is None:
+            continue
+        if abs(new_price - old_price) < 0.0001:
+            continue
+
+        pricelist_id = key[0]
+        tmpl_id = key[2]
+        tmpl_external = tmpl_to_external.get(tmpl_id, "")
+        if not tmpl_external:
+            continue
+        plist = pricelist_map.get(pricelist_id, {})
+        out_id, out_name, out_currency = normalize_pricelist(
+            plist.get("name", row.get("PricelistName", "")),
+            plist.get("currency", row.get("CurrencyId", "")),
+        )
+        update_rows.append({
+            "item_ids/.id": existing.get("OdooId", ""),
+            "id": out_id,
+            "name": out_name,
+            "country_group_ids/id": "",
+            "currency_id": out_currency,
+            "item_ids/applied_on": "Product",
+            "item_ids/base": "Sales Price",
+            "item_ids/compute_price": "Fixed Price",
+            "item_ids/fixed_price": format_price(new_price),
+            "item_ids/product_tmpl_id/id": tmpl_external,
+        })
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=headers, delimiter=DELIMITER)
+        writer.writeheader()
+        for row in update_rows:
+            writer.writerow({h: row.get(h, "") for h in headers})
+
+    print(f"OK: pricelist update -> {out_path} ({len(update_rows)} rows)")
+    return 0
+
+
+def build_customers_update(args: argparse.Namespace) -> int:
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        print("ERROR: openpyxl not available")
+        return 2
+
+    sync_path = args.customers_sync
+    template_path = args.template_path
+    master_out = args.master_out
+    out_path = args.out_path
+
+    if not os.path.exists(sync_path):
+        print(f"ERROR: customers sync not found: {sync_path}")
+        return 2
+    if not os.path.exists(template_path):
+        print(f"ERROR: template not found: {template_path}")
+        return 2
+    if "{date}" in out_path:
+        out_path = out_path.format(date=datetime.now().strftime("%Y%m%d"))
+
+    state_parity_path = os.path.join(os.path.dirname(sync_path), "_parity_state.csv")
+    state_parity = load_state_parity(state_parity_path)
+
+    def _odoo_state(raw_state: str) -> str:
+        raw = (raw_state or "").strip()
+        if not raw:
+            return ""
+        info = state_parity.get(raw, {})
+        state_name = info.get("state_name") or raw
+        country_name = info.get("country_name") or ""
+        if state_name and country_name == "United States":
+            return f"{state_name} (US)"
+        if state_name and country_name == "Canada":
+            return f"{state_name} (CA)"
+        return state_name
+
+    _, rows = read_csv(sync_path)
+    update_rows = [
+        r for r in rows
+        if (r.get("CustomerSyncStatus") or "").strip().upper() == "UPDATE"
+        and not truthy(r.get("Exclude"))
+        and (r.get("CustomerIsInactive") or "").strip() != "1"
+    ]
+
+    skipped_blank_name = 0
+    skipped_blank_external_id = 0
+    prepared_rows = []
+    for r in update_rows:
+        name = (r.get("Customer_Bill_Name") or "").strip()
+        if not name:
+            skipped_blank_name += 1
+            continue
+        odoo_id = (r.get("OdooId") or "").strip()
+        if not odoo_id:
+            skipped_blank_external_id += 1
+            continue
+        ext_id = (r.get("OdooExternalId") or "").strip()
+        if ext_id.startswith("__import__."):
+            ext_id = ext_id.split(".", 1)[1]
+        if not ext_id:
+            ext_id = sanitize_external_id(r.get("CustomerID", ""))
+        if not ext_id:
+            ext_id = sanitize_external_id(r.get("CustomerRecordNumber", ""))
+        if not ext_id:
+            skipped_blank_external_id += 1
+            continue
+        prepared_rows.append((r, name, ext_id, odoo_id))
+
+    def build_workbook(target_path: str) -> None:
+        wb = load_workbook(template_path)
+        ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        for c, h in enumerate(headers, start=1):
+            ws.cell(row=1, column=c).value = h
+        if ws.max_row > 1:
+            ws.delete_rows(2, ws.max_row - 1)
+        for r, name, ext_id, odoo_id in prepared_rows:
+            out = {
+                "Database ID": odoo_id,
+                "External_ID": ext_id,
+                "name": name,
+                "is_company": "TRUE",
+                "company_name": "",
+                "country_id": r.get("Country", ""),
+                "state_id": _odoo_state(r.get("State", "")),
+                "zip": r.get("Zip", ""),
+                "city": r.get("City", ""),
+                "street": r.get("Street", ""),
+                "street2": r.get("Street2", ""),
+                "phone": r.get("Phone", ""),
+                "email": r.get("Email", ""),
+                "Reference": r.get("CustomerID", ""),
+                "Notes": "",
+                "Language": "en_US",
+            }
+            ws.append([out.get(h, "") for h in headers])
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        wb.save(target_path)
+
+    build_workbook(master_out)
+    build_workbook(out_path)
+    print(f"OK: customers UPDATE master -> {master_out} ({len(prepared_rows)} rows)")
+    print(f"OK: customers UPDATE import -> {out_path} ({len(prepared_rows)} rows)")
+    if skipped_blank_name or skipped_blank_external_id:
+        print(
+            "WARN: skipped customers UPDATE rows "
+            f"(blank name={skipped_blank_name}, blank OdooId/external id={skipped_blank_external_id})"
+        )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sage ↔ Odoo parity tables")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1600,6 +2470,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p5c.set_defaults(func=build_delivery_import)
 
+    p5cu = sub.add_parser("build_delivery_addresses_update", help="Build delivery address UPDATE XLSX from sync mismatches")
+    p5cu.add_argument(
+        "--sync-path",
+        default=r"ENZO-Sage50\_master\customer_delivery_addresses_sync.csv",
+    )
+    p5cu.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\UPDATE_customers_delivery_address.xlsx",
+    )
+    p5cu.set_defaults(func=build_delivery_update)
+
     p5d = sub.add_parser("build_billto_sync", help="Build bill-to sync file from primary contacts + addresses")
     p5d.add_argument(
         "--contacts-master",
@@ -1642,9 +2523,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p5e.add_argument(
         "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\customer_billto.xlsx",
+        default=r"ENZO-Sage50\_master\odoo_templates\NEW_customer_billto.xlsx",
     )
     p5e.set_defaults(func=build_billto_import)
+
+    p5eu = sub.add_parser("build_billto_update", help="Build bill-to UPDATE XLSX from sync mismatches")
+    p5eu.add_argument(
+        "--sync-path",
+        default=r"ENZO-Sage50\_master\customers_billto_sync.csv",
+    )
+    p5eu.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\UPDATE_customers_billto.xlsx",
+    )
+    p5eu.set_defaults(func=build_billto_update)
 
     p5f = sub.add_parser("build_employees_sync", help="Build employees sync from Sage employees + sales orders")
     p5f.add_argument(
@@ -1658,6 +2550,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated list of months (YYYY_MM) to include",
     )
     p5f.set_defaults(func=build_employees_sync)
+
+    p5g = sub.add_parser("build_customers_update", help="Build customers_UPDATE from customers_sync mismatches")
+    p5g.add_argument(
+        "--customers-sync",
+        default=r"ENZO-Sage50\_master\customers_sync.csv",
+    )
+    p5g.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\UPDATE_customers.xlsx",
+    )
+    p5g.add_argument(
+        "--master-out",
+        default=r"ENZO-Sage50\_master\customers_UPDATE.xlsx",
+    )
+    p5g.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\odoo_UPDATE\{date}_customers_UPDATE.xlsx",
+    )
+    p5g.set_defaults(func=build_customers_update)
 
     p6 = sub.add_parser("build_product_sync", help="Build product sync for a given YYYY_MM using invoice + credit note lines")
     p6.add_argument(
@@ -1750,6 +2661,91 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx",
     )
     p7d.set_defaults(func=build_products_nobarcode_import)
+
+    p7e = sub.add_parser("build_pricelist_parity", help="Build parity files for pricelists/currencies")
+    p7e.add_argument(
+        "--root-dir",
+        default=r"ENZO-Sage50",
+    )
+    p7e.set_defaults(func=build_pricelist_parity)
+
+    p7f = sub.add_parser("build_pricelist_lines", help="Build pricelist_lines and pricelist_lines_NEW from Sage items")
+    p7f.add_argument(
+        "--root-dir",
+        default=r"ENZO-Sage50",
+    )
+    p7f.add_argument(
+        "--items-master",
+        default=r"ENZO-Sage50\_master_sage\items.csv",
+    )
+    p7f.add_argument(
+        "--items-odoo",
+        default=r"ENZO-Sage50\_master_odoo\items_odoo.csv",
+    )
+    p7f.add_argument(
+        "--pricelist-items-odoo",
+        default=r"ENZO-Sage50\_master_odoo\pricelist_items_odoo.csv",
+    )
+    p7f.add_argument(
+        "--parity-pricelist",
+        default=r"ENZO-Sage50\_master\_parity_pricelist.csv",
+    )
+    p7f.set_defaults(func=build_pricelist_lines)
+
+    p7g = sub.add_parser("build_pricelist_import", help="Build pricelist import CSV from pricelist_lines_NEW")
+    p7g.add_argument(
+        "--root-dir",
+        default=r"ENZO-Sage50",
+    )
+    p7g.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\pricelist.csv",
+    )
+    p7g.add_argument(
+        "--template-xlsx",
+        default="",
+        help="Optional XLSX template (if provided, first sheet is reused)",
+    )
+    p7g.add_argument(
+        "--sync-path",
+        default=r"ENZO-Sage50\_master\pricelist_lines_NEW.csv",
+    )
+    p7g.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\odoo_imports\{date}_pricelist.csv",
+    )
+    p7g.set_defaults(func=build_pricelist_import)
+
+    p7h = sub.add_parser("build_pricelist_update", help="Build pricelist update CSV for changed existing lines")
+    p7h.add_argument(
+        "--root-dir",
+        default=r"ENZO-Sage50",
+    )
+    p7h.add_argument(
+        "--template-path",
+        default=r"ENZO-Sage50\_master\odoo_templates\pricelist.csv",
+    )
+    p7h.add_argument(
+        "--lines-path",
+        default=r"ENZO-Sage50\_master\pricelist_lines.csv",
+    )
+    p7h.add_argument(
+        "--pricelist-items-odoo",
+        default=r"ENZO-Sage50\_master_odoo\pricelist_items_odoo.csv",
+    )
+    p7h.add_argument(
+        "--items-odoo",
+        default=r"ENZO-Sage50\_master_odoo\items_odoo.csv",
+    )
+    p7h.add_argument(
+        "--pricelists-odoo",
+        default=r"ENZO-Sage50\_master_odoo\pricelists_odoo.csv",
+    )
+    p7h.add_argument(
+        "--out-path",
+        default=r"ENZO-Sage50\_master\odoo_UPDATE\{date}_pricelist_UPDATE.csv",
+    )
+    p7h.set_defaults(func=build_pricelist_update)
 
     p8 = sub.add_parser("export_countries", help="Export Odoo countries + build Sage parity table (address only)")
     p8.add_argument(
