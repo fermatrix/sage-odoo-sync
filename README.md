@@ -210,6 +210,11 @@ Comando base:
 python sync_sales_orders_api.py --limit 1
 ```
 
+Modo estricto (por defecto):
+- El proceso se detiene al primer error crítico de datos.
+- Error crítico = falta de `customer`, `payment term`, `salesperson` (employee/user) o shipping sin match exacto.
+- Para permitir continuar con parciales: `--allow-partial`.
+
 Log de ejecución:
 - `ENZO-Sage50/_master/orders_api_log.csv`
 - Estados principales: `OK`, `OK_WARN`, `SKIP`, `ERROR`, `DRY_RUN`, `DRY_RUN_WARN`.
@@ -220,6 +225,39 @@ Validaciones implementadas:
 - Intento de match de términos de pago (`TermsDescription` de Sage con `account.payment.term` de Odoo).
 - Control de totales (`MainAmount` vs total de líneas preparadas).
 - Si hay inconsistencias, la order se puede crear igual en draft y se marca como `OK_WARN`.
+- Además, en modo estricto no se crea/actualiza la order cuando falta dato crítico.
+- Caso especial `EmpRecordNumber = 0`:
+  - No se bloquea la SO por falta de rep.
+  - Se limpia explícitamente el salesperson en Odoo (`user_id = False`).
+
+Fechas en Odoo (estado actual):
+- `date_order` = `TransactionDate` (Sage).
+- `commitment_date` (Delivery Date) = `ShipByDate` (Sage). Si faltara, fallback a `TransactionDate`.
+- `validity_date` (Expiration) = `TransactionDate` (pendiente decisión funcional futura).
+
+ShipVia (Sage) -> Odoo (estado actual y futuro):
+- **Estado actual (replicación histórica fiel a Sage):**
+  - Se conserva literalmente el `ShipVia` de Sage (incluyendo legacy: `Airborne`, `Courier`, `MQPE60`).
+  - Si la SO trae línea de shipping, se añade `Shipping Method: <ShipVia>` en la descripción de esa línea.
+  - Si la SO **no** trae línea de shipping, se añade al final una `line_note` con `Shipping Method: <ShipVia>`.
+- **Estado futuro (normalización solicitada por negocio):**
+  - Catálogo objetivo: `UPS Ground`, `US Mail (USPS)`, `Hand Deliver`, `2nd Day Air`, `Overnight Delivery`.
+  - `Airborne` se sustituirá por `2nd Day Air` / `Overnight Delivery`.
+  - `MQPE60` se ignora (valor erróneo/legacy).
+  - `Courier` pendiente de decisión funcional.
+
+Resolución de Customer / Invoice / Delivery (regla actual):
+- Dato 100% fiable en Order de Sage: `CustVendId` (customer).
+- En el CSV de Sales Orders no viene un ID explícito de address para shipping/billing.
+- `partner_id` (Odoo) se fija por `CustVendId`.
+- `partner_invoice_id` sigue la lógica de Odoo: contacto `invoice` asociado al customer (`partner_id`). Si no existe, fallback al partner padre.
+- `partner_shipping_id` se resuelve por `ShipToName/Address/City/State/ZIP` contra child partners de Odoo:
+  - primero delivery,
+  - y como fallback contactos child con misma dirección.
+- Si no hay match fiable para shipping, fallback al partner padre.
+
+Limitación conocida:
+- Sin un `AddressRecordNumber` explícito en la Order de Sage, shipping/billing se resuelven por la mejor coincidencia disponible (no perfecto, pero actualmente es el mejor criterio operativo).
 
 Orden de procesado:
 - Cronológico real: `TransactionDate` ascendente (y desempate por `Reference`, `PostOrder`).
@@ -235,6 +273,18 @@ Campos clave en `invoice_lines`:
 - `INV_POSOOrderNumber` no aparece en `invoice_lines` (líneas), solo en headers.
 - Para relacionar Orders ↔ Invoices se usa `INV_POSOOrderNumber` en `JrnlHdr`.
 
+Campos de Sales Order de Sage todavía no mapeados 1:1 en Odoo:
+- `PurchOrder` (PO del cliente) aún no se está escribiendo en un campo destino.
+- `ShipVia` no se guarda en un campo estructurado de cabecera; de momento queda en descripción/nota de líneas.
+- `ShipByDate` y `GoodThruDate` aún no se trasladan explícitamente.
+- Flags de cierre (`POSOisClosed`, `CompletedDate`) no se aplican al estado de la SO en Odoo.
+- Metadatos técnicos de Sage (por ejemplo `JournalEx`, `DistNumber`) no se trasladan.
+- Impuesto de Sage por línea (`TaxAuthorityCode` / `SalesTaxType`) no se replica 1:1 (Odoo usa su lógica fiscal).
+
+Observación de datos (2026):
+- Se detectaron 75 Sales Orders con línea `SALES TAX` (todas con `TaxAuthorityCode = SO`).
+- Esto explica parte de los `Order total mismatch` cuando no se traslada esa línea aún.
+
 ## PROCESOS DE SINCRONIZADO
 
 ### (1) CUSTOMERS
@@ -244,6 +294,10 @@ python sage_odoo_parity.py refresh_sage
 python sage_odoo_parity.py refresh_odoo
 python sage_odoo_parity.py sync
 ```
+Filtro NEW (actual):
+- Se usa `LAST_SALESORDER_MIN` (env).  
+- Compatibilidad hacia atrás: si no existe `LAST_SALESORDER_MIN`, usa `LAST_INVOICE_MIN`.
+- `LastSalesOrderDate` se calcula desde `*_sales_orders_headers.csv` y se guarda en `customers_sync.csv`.
 Entradas principales:
 - Sage: `ENZO-Sage50/_master_sage/customers.csv`
 - Sage: `ENZO-Sage50/_master_sage/address.csv` (solo `AddressTypeNumber = 0` para el address principal)

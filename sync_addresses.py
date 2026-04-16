@@ -212,7 +212,12 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
             addr.get("Zip", ""),
         )
 
+        raw_zip = (addr.get("Zip") or "").strip()
         raw_country = (addr.get("Country") or "").strip()
+        # Sage data cleanup: some rows carry ZIP in Country (e.g. "33166") and leave Zip empty.
+        if raw_country.isdigit() and len(raw_country) in {4, 5, 6} and not raw_zip:
+            raw_zip = raw_country
+            raw_country = ""
         mapped_country = _normalize_country(raw_country, country_parity, country_name_to_code)
 
         raw_state = (addr.get("State") or "").strip()
@@ -252,7 +257,7 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
                 "Street2": (addr.get("AddressLine2") or "").strip(),
                 "City": (addr.get("City") or "").strip(),
                 "State": raw_state,
-                "Zip": (addr.get("Zip") or "").strip(),
+                "Zip": raw_zip,
                 "Country": raw_country,
                 "OdooState": mapped_state,
                 "OdooCountry": mapped_country,
@@ -274,7 +279,7 @@ def build_addresses_sync(args: argparse.Namespace) -> int:
             "Street2": (addr.get("AddressLine2") or "").strip(),
             "City": (addr.get("City") or "").strip(),
             "State": raw_state,
-            "Zip": (addr.get("Zip") or "").strip(),
+            "Zip": raw_zip,
             "Country": raw_country,
             "OdooState": mapped_state,
             "OdooCountry": mapped_country,

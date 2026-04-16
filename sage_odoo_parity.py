@@ -36,9 +36,13 @@ from sync_products import (
 def refresh_sage(args: argparse.Namespace) -> int:
     env = load_env_file(".env")
     min_customer_since = get_env_value(env, "CUSTOMER_SINCE_MIN")
-    min_last_invoice = get_env_value(env, "LAST_INVOICE_MIN")
+    min_last_salesorder = get_env_value(
+        env,
+        "LAST_SALESORDER_MIN",
+        get_env_value(env, "LAST_INVOICE_MIN"),
+    )
     min_customer_since_date = parse_date(min_customer_since)
-    min_last_invoice_date = parse_date(min_last_invoice)
+    min_last_salesorder_date = parse_date(min_last_salesorder)
 
     customers_master = args.customers_master
     items_master = args.items_master
@@ -72,6 +76,27 @@ def refresh_sage(args: argparse.Namespace) -> int:
     _, customer_rows = read_csv(customers_master)
     _, item_rows = read_csv(items_master)
 
+    # Build latest Sales Order date by Sage CustomerID from downloaded headers.
+    last_sales_order_by_customer_id: Dict[str, str] = {}
+    sage_root = os.path.dirname(os.path.dirname(customers_master))
+    if os.path.isdir(sage_root):
+        for root_dir, _, files in os.walk(sage_root):
+            for filename in files:
+                if not filename.endswith("_sales_orders_headers.csv"):
+                    continue
+                so_headers_path = os.path.join(root_dir, filename)
+                _, so_rows = read_csv(so_headers_path)
+                for so in so_rows:
+                    customer_id = (so.get("CustVendId") or "").strip()
+                    if not customer_id:
+                        continue
+                    trx_date = (so.get("TransactionDate") or "").strip()
+                    if not trx_date:
+                        continue
+                    prev = last_sales_order_by_customer_id.get(customer_id, "")
+                    if not prev or trx_date > prev:
+                        last_sales_order_by_customer_id[customer_id] = trx_date
+
     address_master_path = os.path.join(os.path.dirname(customers_master), "address.csv")
     address_by_customer = {}
     if os.path.exists(address_master_path):
@@ -93,6 +118,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
         "CustomerIsInactive",
         "CustomerSince",
         "LastInvoiceDate",
+        "LastSalesOrderDate",
+        "PriceLevel",
         "CustomerID",
         "Customer_Bill_Name",
         "Phone",
@@ -105,6 +132,10 @@ def refresh_sage(args: argparse.Namespace) -> int:
         "Country",
         "OdooId",
         "OdooName",
+        "OdooPricelistId",
+        "OdooPricelist",
+        "ExpectedOdooPricelistId",
+        "ExpectedOdooPricelist",
         "Exclude",
         "CustomerSyncStatus",
         "CustomerMismatchFields",
@@ -138,6 +169,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
             "CustomerIsInactive": (row.get("CustomerIsInactive") or "").strip(),
             "CustomerSince": (row.get("CustomerSince") or "").strip(),
             "LastInvoiceDate": (row.get("LastInvoiceDate") or "").strip(),
+            "LastSalesOrderDate": last_sales_order_by_customer_id.get((row.get("CustomerID") or "").strip(), ""),
+            "PriceLevel": (row.get("PriceLevel") or "").strip(),
             "CustomerID": (row.get("CustomerID") or "").strip(),
             "Customer_Bill_Name": (row.get("Customer_Bill_Name") or "").strip(),
             "Phone": (row.get("Phone_Number") or row.get("PhoneNumber2") or "").strip(),
@@ -150,6 +183,10 @@ def refresh_sage(args: argparse.Namespace) -> int:
             "Country": (addr.get("Country") or "").strip(),
             "OdooId": (existing.get("OdooId") or "").strip(),
             "OdooName": (existing.get("OdooName") or "").strip(),
+            "OdooPricelistId": (existing.get("OdooPricelistId") or "").strip(),
+            "OdooPricelist": (existing.get("OdooPricelist") or "").strip(),
+            "ExpectedOdooPricelistId": (existing.get("ExpectedOdooPricelistId") or "").strip(),
+            "ExpectedOdooPricelist": (existing.get("ExpectedOdooPricelist") or "").strip(),
             "Exclude": (existing.get("Exclude") or "").strip(),
             "CustomerSyncStatus": (existing.get("CustomerSyncStatus") or "").strip(),
             "CustomerMismatchFields": (existing.get("CustomerMismatchFields") or "").strip(),
@@ -197,7 +234,9 @@ def refresh_sage(args: argparse.Namespace) -> int:
     stamp = datetime.now().strftime("%Y%m%d")
     customers_new_xlsx = os.path.join(odoo_imports, f"{stamp}_customers_NEW.xlsx")
     customers_new_min_xlsx = os.path.join(master_root, "customers_NEW.xlsx")
-    template_path = os.path.join(master_root, "odoo_templates", "customers.xlsx")
+    template_path = os.path.join(master_root, "odoo_templates", "NEW_customers.xlsx")
+    if not os.path.exists(template_path):
+        template_path = os.path.join(master_root, "odoo_templates", "customers.xlsx")
 
     # Filter: active in Sage + no OdooId + optional date thresholds
     new_customers = [
@@ -209,8 +248,12 @@ def refresh_sage(args: argparse.Namespace) -> int:
             or (parse_date(c.get("CustomerSince")) or datetime.min.date()) >= min_customer_since_date
         )
         and (
-            not min_last_invoice_date
-            or (parse_date(c.get("LastInvoiceDate")) or datetime.min.date()) >= min_last_invoice_date
+            not min_last_salesorder_date
+            or (
+                parse_date(c.get("LastSalesOrderDate"))
+                or parse_date(c.get("LastInvoiceDate"))
+                or datetime.min.date()
+            ) >= min_last_salesorder_date
         )
     ]
 
@@ -385,6 +428,8 @@ def refresh_sage(args: argparse.Namespace) -> int:
             if credit_msg and credit_msg != "You have requested to be notified when a transaction is created for this customer.":
                 set_cell("Notes", credit_msg)
             set_cell("Reference", cid)
+            # Optional pricelist fields (template-dependent)
+            set_cell("Pricelist", c.get("ExpectedOdooPricelist", ""))
             set_cell("Language", "English (US)")
             row_idx += 1
         wb.save(customers_new_xlsx)
@@ -394,6 +439,7 @@ def refresh_sage(args: argparse.Namespace) -> int:
         "CustomerRecordNumber",
         "CustomerSince",
         "LastInvoiceDate",
+        "LastSalesOrderDate",
         "CustomerID",
         "Customer_Bill_Name",
     ]
@@ -902,12 +948,19 @@ def refresh_odoo(args: argparse.Namespace) -> int:
         writer.writeheader()
         offset = 0
         while True:
-            rows = client.search_read(
+            rows = client.models.execute_kw(
+                client.db,
+                client.uid,
+                client.apikey,
                 "res.users",
-                [],
-                ["id", "name", "login", "active"],
-                limit=batch,
-                offset=offset,
+                "search_read",
+                [[]],
+                {
+                    "fields": ["id", "name", "login", "active"],
+                    "limit": batch,
+                    "offset": offset,
+                    "context": {"active_test": False},
+                },
             )
             if not rows:
                 break
@@ -1164,11 +1217,17 @@ def sync_local(args: argparse.Namespace) -> int:
             odoo_cust_by_name.setdefault(name, []).append(r)
 
     odoo_item_by_code: Dict[str, List[Dict[str, str]]] = {}
+    odoo_item_by_template_ext_short: Dict[str, List[Dict[str, str]]] = {}
     odoo_item_by_id: Dict[str, Dict[str, str]] = {}
     for r in odoo_item_rows:
         code = (r.get("OdooItemCode") or "").strip()
         if code:
             odoo_item_by_code.setdefault(code, []).append(r)
+        tmpl_ext = (r.get("OdooTemplateExternalId") or "").strip()
+        if tmpl_ext.startswith("__import__."):
+            tmpl_ext = tmpl_ext.split(".", 1)[1]
+        if tmpl_ext:
+            odoo_item_by_template_ext_short.setdefault(tmpl_ext, []).append(r)
         oid = str(r.get("OdooVariantId") or "").strip()
         if oid:
             odoo_item_by_id[oid] = r
@@ -1184,6 +1243,16 @@ def sync_local(args: argparse.Namespace) -> int:
         customer_fields.append("CustomerMismatchFields")
     if "OdooExternalId" not in customer_fields:
         customer_fields.append("OdooExternalId")
+    if "PriceLevel" not in customer_fields:
+        customer_fields.append("PriceLevel")
+    if "OdooPricelistId" not in customer_fields:
+        customer_fields.append("OdooPricelistId")
+    if "OdooPricelist" not in customer_fields:
+        customer_fields.append("OdooPricelist")
+    if "ExpectedOdooPricelistId" not in customer_fields:
+        customer_fields.append("ExpectedOdooPricelistId")
+    if "ExpectedOdooPricelist" not in customer_fields:
+        customer_fields.append("ExpectedOdooPricelist")
     if "LastLookupAt" not in item_fields:
         item_fields.append("LastLookupAt")
     if "OdooTemplateId" not in item_fields:
@@ -1193,11 +1262,39 @@ def sync_local(args: argparse.Namespace) -> int:
 
     updated_customers = 0
 
+    # Sage PriceLevel -> Odoo pricelist parity
+    pricelist_parity = {}
+    parity_path = os.path.join(os.path.dirname(customer_sync), "_parity_customer_pricelist.csv")
+    if not os.path.exists(parity_path):
+        parity_path = os.path.join(os.path.dirname(customer_sync), "_parity_pricelist.csv")
+    if os.path.exists(parity_path):
+        _, parity_rows = read_csv(parity_path)
+        for p in parity_rows:
+            level = (p.get("sage_price_level") or "").strip()
+            if not level:
+                continue
+            pname = (p.get("odoo_pricelist_name") or "").strip()
+            if "(" in pname:
+                pname = pname.split("(", 1)[0].strip()
+            pricelist_parity[level] = {
+                "id": (p.get("odoo_pricelist_id") or "").strip(),
+                "name": pname,
+            }
+
     def _norm_text(value: str) -> str:
         return " ".join((value or "").strip().upper().split())
 
     def _norm_phone(value: str) -> str:
         return "".join(ch for ch in (value or "") if ch.isdigit())
+
+    def _normalize_pricelist_name(value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        # "UK (GBP)" -> "UK", keep "Price Level 2" as-is.
+        if "(" in raw:
+            raw = raw.split("(", 1)[0].strip()
+        return _norm_text(raw)
 
     def _customer_mismatches(row: Dict[str, str], record: Dict[str, str]) -> List[str]:
         checks = [
@@ -1212,6 +1309,11 @@ def sync_local(args: argparse.Namespace) -> int:
         mismatches = [name for name, left, right in checks if _norm_text(left) != _norm_text(right)]
         if _norm_phone(row.get("Phone", "")) != _norm_phone(record.get("OdooPhone", "")):
             mismatches.append("phone")
+        expected_pricelist = _normalize_pricelist_name(row.get("ExpectedOdooPricelist", ""))
+        odoo_pricelist = _normalize_pricelist_name(record.get("OdooPricelist", ""))
+        if expected_pricelist:
+            if not odoo_pricelist or expected_pricelist != odoo_pricelist:
+                mismatches.append("pricelist")
         return mismatches
 
     for row in customer_rows:
@@ -1236,12 +1338,18 @@ def sync_local(args: argparse.Namespace) -> int:
                 record = matches[0]
                 match_source = "name"
         row["LastLookupAt"] = now
+        level = (row.get("PriceLevel") or "").strip()
+        expected = pricelist_parity.get(level, {})
+        row["ExpectedOdooPricelistId"] = expected.get("id", "")
+        row["ExpectedOdooPricelist"] = expected.get("name", "")
         if record:
             strict_match = match_source in {"id", "ref"}
             if strict_match:
                 row["OdooId"] = str(record.get("OdooId", ""))
                 row["OdooExternalId"] = record.get("OdooExternalId", "") or ""
                 row["OdooName"] = record.get("OdooName", "") or ""
+                row["OdooPricelistId"] = str(record.get("OdooPricelistId", "") or "")
+                row["OdooPricelist"] = record.get("OdooPricelist", "") or ""
                 mismatches = _customer_mismatches(row, record)
                 row["CustomerSyncStatus"] = "UPDATE" if mismatches else "MATCH"
                 row["CustomerMismatchFields"] = "|".join(mismatches)
@@ -1274,6 +1382,9 @@ def sync_local(args: argparse.Namespace) -> int:
         if not item_id:
             continue
         matches = odoo_item_by_code.get(item_id, [])
+        if len(matches) != 1:
+            # Fallback for single-variant templates imported without variant default_code.
+            matches = odoo_item_by_template_ext_short.get(item_id, [])
         row["LastLookupAt"] = now
         if len(matches) == 1:
             record = matches[0]
@@ -2336,6 +2447,7 @@ def build_customers_update(args: argparse.Namespace) -> int:
                 "phone": r.get("Phone", ""),
                 "email": r.get("Email", ""),
                 "Reference": r.get("CustomerID", ""),
+                "Pricelist": r.get("ExpectedOdooPricelist", ""),
                 "Notes": "",
                 "Language": "en_US",
             }
