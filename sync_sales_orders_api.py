@@ -30,7 +30,10 @@ def profile_env(env: Dict[str, str], profile: str, key_suffix: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Create Sage Sales Orders in Odoo via API")
+    p = argparse.ArgumentParser(
+        description="Create Sage Sales Orders in Odoo via API",
+        allow_abbrev=False,
+    )
     p.add_argument("--root-dir", default=r"ENZO-Sage50")
     p.add_argument("--profile", default="STUDIOOPTYX")
     p.add_argument("--env-file", default=".env")
@@ -91,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Process only Sage sales orders missing in Odoo. "
             "Stops automatically before the first trailing never-imported block."
+        ),
+    )
+    p.add_argument(
+        "--shipping-relaxed",
+        action="store_true",
+        help=(
+            "Keep strict mode by default. When enabled, allow a slightly relaxed "
+            "shipping match (state parity + street synonyms like #/SUITE/STE)."
         ),
     )
     return p
@@ -307,7 +318,7 @@ def _fetch_existing_sale_orders_by_name(
         rows = client.search_read(
             "sale.order",
             [("name", "in", chunk)],
-            ["id", "name", "state"],
+            ["id", "name", "state", "partner_shipping_id"],
             limit=10000,
             offset=0,
         )
@@ -482,6 +493,7 @@ def resolve_shipping_partner_id(
     ship_to_city: str,
     ship_to_state: str,
     ship_to_zip: str,
+    relaxed: bool = False,
 ) -> tuple[int, bool, str]:
     deliveries = client.search_read(
         "res.partner",
@@ -497,6 +509,35 @@ def resolve_shipping_partner_id(
     tgt_city = norm_text(ship_to_city)
     tgt_state = norm_text(ship_to_state)
     tgt_zip = norm_text(ship_to_zip)
+
+    us_state_by_code = {
+        "AL": "ALABAMA", "AK": "ALASKA", "AZ": "ARIZONA", "AR": "ARKANSAS", "CA": "CALIFORNIA",
+        "CO": "COLORADO", "CT": "CONNECTICUT", "DE": "DELAWARE", "FL": "FLORIDA", "GA": "GEORGIA",
+        "HI": "HAWAII", "ID": "IDAHO", "IL": "ILLINOIS", "IN": "INDIANA", "IA": "IOWA",
+        "KS": "KANSAS", "KY": "KENTUCKY", "LA": "LOUISIANA", "ME": "MAINE", "MD": "MARYLAND",
+        "MA": "MASSACHUSETTS", "MI": "MICHIGAN", "MN": "MINNESOTA", "MS": "MISSISSIPPI",
+        "MO": "MISSOURI", "MT": "MONTANA", "NE": "NEBRASKA", "NV": "NEVADA", "NH": "NEW HAMPSHIRE",
+        "NJ": "NEW JERSEY", "NM": "NEW MEXICO", "NY": "NEW YORK", "NC": "NORTH CAROLINA",
+        "ND": "NORTH DAKOTA", "OH": "OHIO", "OK": "OKLAHOMA", "OR": "OREGON", "PA": "PENNSYLVANIA",
+        "RI": "RHODE ISLAND", "SC": "SOUTH CAROLINA", "SD": "SOUTH DAKOTA", "TN": "TENNESSEE",
+        "TX": "TEXAS", "UT": "UTAH", "VT": "VERMONT", "VA": "VIRGINIA", "WA": "WASHINGTON",
+        "WV": "WEST VIRGINIA", "WI": "WISCONSIN", "WY": "WYOMING",
+    }
+    ca_state_by_code = {
+        "AB": "ALBERTA", "BC": "BRITISH COLUMBIA", "MB": "MANITOBA", "NB": "NEW BRUNSWICK",
+        "NL": "NEWFOUNDLAND AND LABRADOR", "NS": "NOVA SCOTIA", "NT": "NORTHWEST TERRITORIES",
+        "NU": "NUNAVUT", "ON": "ONTARIO", "PE": "PRINCE EDWARD ISLAND", "QC": "QUEBEC",
+        "SK": "SASKATCHEWAN", "YT": "YUKON",
+    }
+
+    def _soft_street(value: str) -> str:
+        s = norm_text(value)
+        # Normalize common suite tokens to reduce false negatives.
+        s = s.replace("SUITE", "STE")
+        s = s.replace(" APARTMENT ", " APT ")
+        s = s.replace("#", " STE ")
+        s = " ".join(s.split())
+        return s
 
     def score(row: Dict[str, object]) -> int:
         st = row.get("state_id") or []
@@ -523,6 +564,20 @@ def resolve_shipping_partner_id(
             points += 1
         if tgt_street2 and norm_text(row.get("street2", "")) == tgt_street2:
             points += 1
+        if relaxed:
+            # Slightly relaxed extras (do not apply in strict mode).
+            row_street_soft = _soft_street(str(row.get("street", "")))
+            tgt_street_soft = _soft_street(ship_to_address1)
+            if tgt_street_soft and row_street_soft and row_street_soft == tgt_street_soft and not (
+                tgt_street and norm_text(row.get("street", "")) == tgt_street
+            ):
+                points += 2
+
+            row_state_name_norm = norm_text(row_state_name)
+            tgt_state_name = us_state_by_code.get(tgt_state) or ca_state_by_code.get(tgt_state) or ""
+            if tgt_state_name and row_state_name_norm == norm_text(tgt_state_name):
+                # Small boost only when parity maps code->name exactly.
+                points += 1
         return points
 
     candidates = list(deliveries)
@@ -546,8 +601,9 @@ def resolve_shipping_partner_id(
     best_state = ""
     if isinstance(st, list) and len(st) > 1:
         best_state = str(st[1] or "").strip()
+    max_score = 12 if relaxed else 9
     best_summary = (
-        f"id={best.get('id')} type={best.get('type')} score={best_score}/9 "
+        f"id={best.get('id')} type={best.get('type')} score={best_score}/{max_score} "
         f"name='{(best.get('name') or '').strip()}' "
         f"street='{(best.get('street') or '').strip()}' "
         f"street2='{(best.get('street2') or '').strip()}' "
@@ -556,7 +612,8 @@ def resolve_shipping_partner_id(
         f"zip='{(best.get('zip') or '').strip()}'"
     )
     # Require strong address match; otherwise keep parent customer address.
-    if best_score >= 9:
+    threshold = 8 if relaxed else 9
+    if best_score >= threshold:
         return int(best["id"]), True, best_summary
     return partner_id, False, best_summary
 
@@ -786,7 +843,16 @@ def _print_order_progress(entry: Dict[str, str], index: int) -> None:
     normalized = details.strip().lower()
     suppress = normalized in {"no changes in content", "no changes in content; confirmed"}
     if details and not suppress:
-        parts = [p.strip() for p in details.split(";") if p.strip() and p.strip().lower() != "no sales rep"]
+        details_for_parts = details
+        pretty_shipping = _pretty_shipping_mismatch(details)
+        if pretty_shipping:
+            for ln in pretty_shipping:
+                print(ln)
+            consumed = _shipping_mismatch_raw(details)
+            if consumed:
+                details_for_parts = details.replace(consumed, "")
+                details_for_parts = details_for_parts.strip(" ;")
+        parts = [p.strip() for p in details_for_parts.split(";") if p.strip() and p.strip().lower() != "no sales rep"]
         for part in parts:
             wrapped = textwrap.fill(
                 part,
@@ -796,6 +862,78 @@ def _print_order_progress(entry: Dict[str, str], index: int) -> None:
             )
             print(wrapped)
     print("")
+
+
+def _pretty_shipping_mismatch(part: str) -> Optional[List[str]]:
+    if "Missing exact shipping address match in Odoo " not in part:
+        return None
+    pattern = re.compile(
+        r"Missing exact shipping address match in Odoo\s*\(\s*"
+        r"customer_odoo_id=(?P<cid>\d+);\s*"
+        r"(?:customer_name='(?P<cname>[^']*)';\s*)?"
+        r"sage_ship_to=name='(?P<s_name>[^']*)',\s*street='(?P<s_street>[^']*)',\s*street2='(?P<s_street2>[^']*)',\s*"
+        r"city='(?P<s_city>[^']*)',\s*state='(?P<s_state>[^']*)',\s*zip='(?P<s_zip>[^']*)';\s*"
+        r"best_candidate=id=(?P<b_id>\d+)\s*type=(?P<b_type>\S+)\s*score=(?P<b_score>\d+/\d+)\s*"
+        r"name='(?P<b_name>[^']*)'\s*street='(?P<b_street>[^']*)'\s*street2='(?P<b_street2>[^']*)'\s*"
+        r"city='(?P<b_city>[^']*)'\s*state='(?P<b_state>[^']*)'\s*zip='(?P<b_zip>[^']*)'\s*\)"
+    )
+    m = pattern.search(part)
+    if not m:
+        return None
+    g = m.groupdict()
+
+    sage_line3 = f"{g['s_city']} - {g['s_state']} ({g['s_zip']})".strip()
+    odoo_line3 = f"{g['b_city']} - {g['b_state']} ({g['b_zip']})".strip()
+    score_raw = (g.get("b_score") or "").strip()
+    score_num = -1
+    try:
+        score_num = int(score_raw.split("/", 1)[0])
+    except Exception:
+        score_num = -1
+
+    lines = [
+        "        - Shipping address mismatch",
+        "",
+        f"          Customer: {((g.get('cname') or '').strip() or (g.get('b_name') or '').strip() or 'Unknown')} (odoo id: {g['cid']})",
+        "",
+        "          Sage Ship To:",
+        "",
+        f"            {g['s_name']}",
+        f"            {g['s_street']}" + (f", {g['s_street2']}" if g["s_street2"] else ""),
+        f"            {sage_line3}",
+        "",
+    ]
+    if score_num == 0:
+        lines.extend([
+            "          No best candidate found in Odoo",
+            "",
+        ])
+    else:
+        lines.extend([
+            "          Best candidate in Odoo:",
+            "",
+            f"            {g['b_name']} [id: {g['b_id']}, type: {g['b_type']}, score: {g['b_score']}]",
+            f"            {g['b_street']}" + (f", {g['b_street2']}" if g["b_street2"] else ""),
+            f"            {odoo_line3}",
+        ])
+    return lines
+
+
+def _shipping_mismatch_raw(part: str) -> Optional[str]:
+    if "Missing exact shipping address match in Odoo " not in part:
+        return None
+    pattern = re.compile(
+        r"Missing exact shipping address match in Odoo\s*\(\s*"
+        r"customer_odoo_id=\d+;\s*"
+        r"(?:customer_name='[^']*';\s*)?"
+        r"sage_ship_to=name='[^']*',\s*street='[^']*',\s*street2='[^']*',\s*"
+        r"city='[^']*',\s*state='[^']*',\s*zip='[^']*';\s*"
+        r"best_candidate=id=\d+\s*type=\S+\s*score=\d+/\d+\s*"
+        r"name='[^']*'\s*street='[^']*'\s*street2='[^']*'\s*"
+        r"city='[^']*'\s*state='[^']*'\s*zip='[^']*'\s*\)"
+    )
+    m = pattern.search(part)
+    return m.group(0) if m else None
 
 
 def _confirm_order_if_needed(client: OdooClient, order_id: int, target_date_order: str) -> bool:
@@ -939,7 +1077,7 @@ def run(args: argparse.Namespace) -> int:
     processed_count = 0
     current_no_sales_rep = False
     invoice_partner_cache: Dict[int, int] = {}
-    shipping_partner_cache: Dict[Tuple[int, str, str, str, str, str, str], Tuple[int, bool, str]] = {}
+    shipping_partner_cache: Dict[Tuple[int, str, str, str, str, str, str, bool], Tuple[int, bool, str]] = {}
     product_variant_exists_cache: Dict[int, bool] = {}
 
     def push_log(entry: Dict[str, str]) -> None:
@@ -952,6 +1090,8 @@ def run(args: argparse.Namespace) -> int:
         _print_order_progress(entry, processed_index)
 
     for header_index, h in enumerate(headers):
+        if max_orders is not None and processed_count >= max_orders:
+            break
         post_order = (h.get("PostOrder") or "").strip()
         reference = (h.get("Reference") or "").strip()
         if args.reference and reference != args.reference.strip():
@@ -1049,6 +1189,10 @@ def run(args: argparse.Namespace) -> int:
                 )
         customer_sync = customers_map.get(customer_record) or {}
         customer_odoo_id = (customer_sync.get("OdooId") or "").strip()
+        customer_odoo_name = (
+            (customer_sync.get("OdooName") or "").strip()
+            or (customer_sync.get("CustomerName") or "").strip()
+        )
         if not customer_odoo_id:
             push_log({
                 "Timestamp": now,
@@ -1093,11 +1237,18 @@ def run(args: argparse.Namespace) -> int:
             exists = client.search_read(
                 "sale.order",
                 [("name", "=", reference)],
-                ["id", "name", "state"],
+                ["id", "name", "state", "partner_shipping_id"],
                 limit=1,
                 offset=0,
             )
         order_state = str(exists[0].get("state") or "").strip() if exists else ""
+        existing_shipping_id = 0
+        if exists:
+            raw_existing_shipping = exists[0].get("partner_shipping_id")
+            if isinstance(raw_existing_shipping, list) and raw_existing_shipping:
+                existing_shipping_id = int(raw_existing_shipping[0] or 0)
+            elif isinstance(raw_existing_shipping, int):
+                existing_shipping_id = raw_existing_shipping
 
         pricelist_id = (customer_sync.get("OdooPricelistId") or "").strip()
         term_name = (h.get("TermsDescription") or "").strip()
@@ -1118,6 +1269,7 @@ def run(args: argparse.Namespace) -> int:
             (h.get("ShipToCity") or "").strip(),
             (h.get("ShipToState") or "").strip(),
             (h.get("ShipToZIP") or "").strip(),
+            bool(args.shipping_relaxed),
         )
         if ship_key in shipping_partner_cache:
             shipping_partner_id, shipping_exact, shipping_debug = shipping_partner_cache[ship_key]
@@ -1131,6 +1283,7 @@ def run(args: argparse.Namespace) -> int:
                 ship_to_city=ship_key[4],
                 ship_to_state=ship_key[5],
                 ship_to_zip=ship_key[6],
+                relaxed=bool(args.shipping_relaxed),
             )
             shipping_partner_cache[ship_key] = (shipping_partner_id, shipping_exact, shipping_debug)
 
@@ -1166,14 +1319,25 @@ def run(args: argparse.Namespace) -> int:
                 critical_errors.append(f"Missing Odoo user for employee login {sales_login}")
         no_sales_rep = emp_record == "0"
         current_no_sales_rep = no_sales_rep
+        shipping_preserved_from_existing = False
         if not shipping_exact:
-            critical_errors.append(
-                "Missing exact shipping address match in Odoo "
-                f"(customer_odoo_id={partner_id_int}; "
-                f"sage_ship_to=name='{ship_key[1]}', street='{ship_key[2]}', street2='{ship_key[3]}', "
-                f"city='{ship_key[4]}', state='{ship_key[5]}', zip='{ship_key[6]}'; "
-                f"best_candidate={shipping_debug})"
-            )
+            # Strict-mode re-runs: if this order already exists with a concrete
+            # shipping contact/address, keep it and avoid failing the whole row.
+            if exists and existing_shipping_id and existing_shipping_id != partner_id_int and not args.shipping_relaxed:
+                shipping_partner_id = existing_shipping_id
+                shipping_preserved_from_existing = True
+            else:
+                customer_name_part = f"customer_name='{customer_odoo_name}'; " if customer_odoo_name else ""
+                critical_errors.append(
+                    "Missing exact shipping address match in Odoo "
+                    f"(customer_odoo_id={partner_id_int}; "
+                    f"{customer_name_part}"
+                    f"sage_ship_to=name='{ship_key[1]}', street='{ship_key[2]}', street2='{ship_key[3]}', "
+                    f"city='{ship_key[4]}', state='{ship_key[5]}', zip='{ship_key[6]}'; "
+                    f"best_candidate={shipping_debug})"
+                )
+        if shipping_preserved_from_existing:
+            warning_parts.append("Shipping preserved from existing Odoo order (strict mode)")
 
         if critical_errors:
             push_log({

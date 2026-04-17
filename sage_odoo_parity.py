@@ -996,7 +996,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
         while True:
             rows = client.search_read(
                 "product.product",
-                [],
+                [["active", "=", True]],
                 ["id", "name", "display_name", "default_code", "active", "product_template_attribute_value_ids", "product_tmpl_id"],
                 limit=batch,
                 offset=offset,
@@ -1462,6 +1462,8 @@ def sync_local(args: argparse.Namespace) -> int:
     odoo_item_by_template_ext_short: Dict[str, List[Dict[str, str]]] = {}
     odoo_item_by_id: Dict[str, Dict[str, str]] = {}
     for r in odoo_item_rows:
+        if str(r.get("Active") or "").strip().lower() not in {"true", "1", "yes"}:
+            continue
         code = (r.get("OdooItemCode") or "").strip()
         if code:
             odoo_item_by_code.setdefault(code, []).append(r)
@@ -1673,7 +1675,10 @@ def sync_local(args: argparse.Namespace) -> int:
                     row["OdooVariantExternalId"] = existing.get("OdooVariantExternalId", "") or ""
                 if not row.get("OdooTemplateExternalId"):
                     row["OdooTemplateExternalId"] = existing.get("OdooTemplateExternalId", "") or ""
-            continue
+                continue
+            # Stale OdooVariantId (record deleted/recreated in Odoo): clear and rematch by code/template.
+            row["OdooVariantId"] = ""
+            row["OdooVariantExternalId"] = ""
         if truthy(row.get("Exclude")):
             continue
         item_id = (row.get("ItemID") or "").strip()

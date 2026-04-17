@@ -243,11 +243,18 @@ Flags CLI (`sync_sales_orders_api.py`):
 - `--gaps`: procesa solo SO de Sage que faltan en Odoo (`sale.order.name` no existe).
   - Además, se detiene automáticamente al llegar al primer bloque final de órdenes nunca importadas (trailing block).
   - Útil para reintentar “huecos” sin meterse en un intervalo completo pendiente.
+- `--shipping-relaxed`: relaja ligeramente el match de shipping address.
+  - Mantiene el modo estricto por defecto si no se pasa este flag.
+  - Permite equivalencias de calle tipo `#`/`SUITE`/`STE`.
+  - Aplica paridad simple de estado (ej. `TX` <-> `Texas`, `ON` <-> `Ontario`).
 
 Notas operativas de flags:
 - Cualquier flag desconocido hace que el script falle inmediatamente (comportamiento estándar de `argparse`).
 - Si se usa `--load`, el script ignora `--headers-path` y `--lines-path` para ese run.
 - `--gaps --skip` = reintenta huecos y continúa aunque haya errores, para revisar todos en una pasada.
+- Re-ejecución estricta (sin `--shipping-relaxed`) sobre SO ya existente:
+  - Si no hay match exacto nuevo de shipping pero la SO ya tiene `partner_shipping_id` en Odoo, se preserva ese shipping y no se bloquea la orden.
+  - En ese caso se registra warning: `Shipping preserved from existing Odoo order (strict mode)`.
 
 Modo estricto (por defecto):
 - El proceso se detiene al primer error crítico de datos.
@@ -293,7 +300,13 @@ Resolución de Customer / Invoice / Delivery (regla actual):
 - `partner_shipping_id` se resuelve por `ShipToName/Address/City/State/ZIP` contra child partners de Odoo:
   - primero delivery,
   - y como fallback contactos child con misma dirección.
-- Si no hay match fiable para shipping, fallback al partner padre.
+- En modo estricto, si no hay match exacto de shipping, la SO falla.
+- Excepción de re-ejecución estricta: si la SO ya existe en Odoo y ya tiene `partner_shipping_id` válido, se preserva ese valor y no se bloquea por shipping.
+- `--shipping-relaxed` permite equivalencias leves (`#`/`SUITE`/`STE` y código/nombre de estado).
+
+Importante (modelo Odoo):
+- El campo `Ship To` en `sale.order` no es texto libre.
+- Odoo requiere una dirección/contacto real en `res.partner` (`partner_shipping_id`); no se puede “escribir a pelo” una dirección nueva en la orden.
 
 Limitación conocida:
 - Sin un `AddressRecordNumber` explícito en la Order de Sage, shipping/billing se resuelven por la mejor coincidencia disponible (no perfecto, pero actualmente es el mejor criterio operativo).
