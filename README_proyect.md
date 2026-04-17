@@ -182,7 +182,7 @@
 - **UPS / Shipping connector** finalisation: WorldShip replacement assessment pending.
 - **Basys IQPro+** payment gateway integration feasibility to be evaluated.
 - **ODBC automated extraction** from Sage 50 — user permissions confirmed; migration scripts to be developed.
-- **Sales Orders taxes:** Define and implement final Odoo strategy for Sage tax lines (`SO`, CA, TN, Pacific, ILLINOIS) to avoid total mismatches.
+- **Sales Orders taxes:** Review with client (validation of final Odoo strategy for Sage tax lines: `SO`, CA, TN, Pacific, ILLINOIS).
 - **Shipping method normalization (future phase):** move from legacy Sage labels to agreed target set after historical replication is complete.
 - **Vendor pricelist UPDATE pipeline:** `vendor_pricelist_sync_UPDATE` detects price mismatches, but many existing `product.supplierinfo` rows have no External ID; update import strategy must be finalized (ID-based path).
 - **Vendor pricelist conflicts:** unresolved `CONFLICTS` remain where vendor/template match is missing and require master-data cleanup/parity.
