@@ -1,7 +1,7 @@
 # Studio Optyx / Red Eye Europe — Odoo ERP Implementation
 
 ## Project Activity Report — Month by Month
-**Period:** July 2025 – March 2026  
+**Period:** July 2025 – April 2026  
 **Prepared by:** Fernando Plaza Mesas — ENZO NEXT, SL  
 
 
@@ -121,17 +121,71 @@
     - **Bill To contacts** (primary contacts + address, Odoo type = invoice)
     - **Delivery addresses** (non‑primary contacts + address, external ID `CustomerID_ContactRecordNumber`)
     - **Products** (products sync, NEW lists, and simplified Odoo import template)
+- **Delivery/BillTo operational hardening (late March):**
+  - Added strict matching rules for UPDATE files (no fallback matching for updates).
+  - Added duplicate-address detection and cleanup support after imports.
+  - Added visibility files for conflicts and non-importable records (missing parent in Odoo).
+- **Products no-barcode strategy (Mar 20–31):**
+  - Created dedicated no-barcode workflow and escalation list for Ally.
+  - Prioritized items invoiced in 2026 and key frame brands (ERKERS, MONOQOOL, NW 77TH, TOCCO).
+  - Built operational logs to track processed/skipped/error records in API-assisted product completion.
+- **Documentation and process standardization:**
+  - Standardized NEW/UPDATE logic across multiple entities (customers, bill-to, delivery addresses, pricelists).
+  - Expanded project documentation with parity logic, matching criteria, and import/update runbooks.
 
 
 ---
 
-## Open Items (as of March 25, 2026)
+## April 2026
+
+**Studio Optyx USA — API integration phase (Orders) and tax/shipping alignment**
+
+- **Sales Orders API migration started (Apr 15–17):**
+  - Implemented `sync_sales_orders_api.py` to create/update draft Sales Orders directly in Odoo (no file import step).
+  - Included order lines, customer mapping, delivery/invoice partner resolution, payment terms, and salesperson mapping.
+  - Added strict validations and execution logs (`orders_api_log.csv`) with `OK/UPDATE/WARN/ERROR` statuses.
+- **Historical order replication from Sage:**
+  - Processed all Sales Orders for **Feb 2, 2026** and updated previously created records with latest sync parameters.
+  - Preserved Sage numbering in Odoo (`sale.order.name`).
+- **Date logic update for Orders:**
+  - Mapped Sage `ShipByDate` to Odoo **Delivery Date** (`commitment_date`).
+  - Kept `date_order` from Sage transaction date.
+- **Salesperson edge case handling:**
+  - For orders with `EmpRecordNumber = 0`, system now clears salesperson in Odoo (`user_id = False`) instead of failing.
+- **Shipping method handling (current phase):**
+  - Replication-first policy: keep Sage `ShipVia` values exactly as historical data.
+  - If shipping line exists, append method in shipping line description.
+  - If shipping line does not exist, add an Odoo note line with shipping method.
+- **Tax analysis for Sales Orders:**
+  - Identified tax-line cases (`SALES TAX`, authority code `SO`) causing header/line total mismatches in strict mode.
+  - Confirmed need for explicit strategy to replicate Sage tax lines in Odoo without double taxation.
+- **Master data refresh and imports support:**
+  - Refreshed Odoo masters after customer/bill-to/delivery imports and regenerated dependent sync files.
+  - Exported current Odoo sale taxes to `_master_odoo/taxes_sale_odoo.csv` for reconciliation.
+- **Vendors sync standardization (Sage -> Odoo):**
+  - Added recurring Vendors flow to the parity pipeline (refresh Sage, refresh Odoo, sync, NEW/UPDATE files).
+  - Aligned partner `Reference` with Sage `VendorID` for stable future matching.
+  - Regenerated vendor NEW/UPDATE files after Odoo updates.
+- **Vendor pricelist sync (Sage purchase history -> Odoo supplierinfo):**
+  - Added dedicated sync outputs: `vendor_pricelist_sync`, `_NEW`, `_UPDATE`, `_CONFLICTS`.
+  - Updated import templates to use `Product Variant / Database ID` and `product_uom_id = Units`.
+  - Applied defaults in NEW imports (`USD`, `min_qty=1`, `delay=120`).
+  - After import of NEW vendor pricelist rows, NEW dropped to zero on re-sync.
+
+
+---
+
+## Open Items (as of April 17, 2026)
 
 - **78 priority SKUs** pending import from Sage reconciliation file (confirmed by Ally, Mar 19).
 - **Studio Optyx USA Accounting module:** Full Chart of Accounts, opening balances and journal entries still pending from Jack Jr. / Jack III (YTD-only extract received was insufficient).
 - **UPS / Shipping connector** finalisation: WorldShip replacement assessment pending.
 - **Basys IQPro+** payment gateway integration feasibility to be evaluated.
 - **ODBC automated extraction** from Sage 50 — user permissions confirmed; migration scripts to be developed.
+- **Sales Orders taxes:** Define and implement final Odoo strategy for Sage tax lines (`SO`, CA, TN, Pacific, ILLINOIS) to avoid total mismatches.
+- **Shipping method normalization (future phase):** move from legacy Sage labels to agreed target set after historical replication is complete.
+- **Vendor pricelist UPDATE pipeline:** `vendor_pricelist_sync_UPDATE` detects price mismatches, but many existing `product.supplierinfo` rows have no External ID; update import strategy must be finalized (ID-based path).
+- **Vendor pricelist conflicts:** unresolved `CONFLICTS` remain where vendor/template match is missing and require master-data cleanup/parity.
 
 
 ---

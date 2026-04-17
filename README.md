@@ -205,10 +205,49 @@ Objetivo:
 - Mantener numeración Sage en `sale.order.name` (campo `Reference` de Sage).
 - Crear también las líneas de pedido (`sale.order.line`).
 
-Comando base:
+Comandos base:
 ```
-python sync_sales_orders_api.py --limit 1
+python sync_sales_orders_api.py --load 02/02/2026
+python sync_sales_orders_api.py --load 02/2026
+python sync_sales_orders_api.py --load 2026
+python sync_sales_orders_api.py --load 02/02/2026 --limit 100
+python sync_sales_orders_api.py --load 02/02/2026 --limit 12,1
+python sync_sales_orders_api.py --load 02/02/2026-03/02/2026
+python sync_sales_orders_api.py --load 02/2026-03/02/2026
 ```
+
+Flags CLI (`sync_sales_orders_api.py`):
+- `--root-dir`: raíz del proyecto de datos Sage/Odoo. Default: `ENZO-Sage50`.
+- `--profile`: perfil Odoo para leer variables del `.env`. Default: `STUDIOOPTYX`.
+- `--env-file`: ruta al `.env`. Default: `.env`.
+- `--headers-path`: CSV de headers (modo manual, sin `--load`).
+- `--lines-path`: CSV de líneas (modo manual, sin `--load`).
+- `--customers-sync`: ruta a `customers_sync.csv`.
+- `--products-sync`: ruta a `products_sync.csv`.
+- `--employees-sync`: ruta a `employees_sync.csv`.
+- `--load`: auto-descubre ficheros de sales orders por periodo/fecha. Formatos:
+  - `DD/MM/YYYY`
+  - `MM/YYYY`
+  - `YYYY` (año fiscal Sage: Febrero -> Enero siguiente)
+  - rango `inicio-fin` (ej: `02/02/2026-03/02/2026`, `02/2026-03/02/2026`)
+- `--reference`: procesa solo una SO de Sage (ej: `357702`).
+- `--limit`: límite de procesado:
+  - `N` = primeras `N` candidatas
+  - `start,count` = empieza en ordinal `start` y procesa `count` (ej: `12,1`)
+  - vacío = sin límite
+- `--offset`: salta N candidatas antes de procesar (acumulable con `--limit`).
+- `--log-path`: salida del log CSV.
+- `--dry-run`: valida/matchea todo sin crear/actualizar en Odoo.
+- `--allow-partial`: no parar en el primer error crítico; sigue con el resto.
+- `--skip`: alias de `--allow-partial` (continúa tras errores).
+- `--gaps`: procesa solo SO de Sage que faltan en Odoo (`sale.order.name` no existe).
+  - Además, se detiene automáticamente al llegar al primer bloque final de órdenes nunca importadas (trailing block).
+  - Útil para reintentar “huecos” sin meterse en un intervalo completo pendiente.
+
+Notas operativas de flags:
+- Cualquier flag desconocido hace que el script falle inmediatamente (comportamiento estándar de `argparse`).
+- Si se usa `--load`, el script ignora `--headers-path` y `--lines-path` para ese run.
+- `--gaps --skip` = reintenta huecos y continúa aunque haya errores, para revisar todos en una pasada.
 
 Modo estricto (por defecto):
 - El proceso se detiene al primer error crítico de datos.
@@ -468,6 +507,92 @@ Campos clave:
 
 Filtro:
 - En el XLSX se incluyen solo empleados con `Invoiced2026 = X`.
+
+### (7) VENDORS
+Objetivo:
+- Homogeneizar proveedores de Sage con vendors de Odoo antes de cargar vendor pricelist.
+
+Flujo:
+```
+python sage_odoo_parity.py refresh_sage
+python sage_odoo_parity.py refresh_odoo
+python sage_odoo_parity.py sync
+python sage_odoo_parity.py build_vendors
+python sage_odoo_parity.py build_vendors_update
+```
+
+Entradas:
+- Sage: `ENZO-Sage50/_master_sage/vendors.csv`
+- Sage: `ENZO-Sage50/_master_sage/address.csv` (AddressTypeNumber `0`, por `VendorRecordNumber`)
+- Odoo: `ENZO-Sage50/_master_odoo/vendors_odoo.csv`
+
+Salidas:
+- `ENZO-Sage50/_master/vendors_sync.csv`
+- `ENZO-Sage50/_master/vendors_sync_NEW.csv`
+- `ENZO-Sage50/_master/vendors_sync_UPDATE.csv`
+- `ENZO-Sage50/_master/vendors_NEW.xlsx`
+- `ENZO-Sage50/_master/vendors_UPDATE.xlsx`
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_vendors_NEW.xlsx`
+- `ENZO-Sage50/_master/odoo_UPDATE/YYYYMMDD_vendors_UPDATE.xlsx`
+
+Match:
+- Estricto por `VendorID` (Sage) ↔ `OdooRef` (Odoo vendor).
+- Si ya hay `OdooId`, se reutiliza para consolidar.
+- Fallback por nombre solo para descubrimiento (`--vendor-match-name`), nunca para UPDATE seguro.
+
+Estados:
+- `MATCH`: existe y coincide.
+- `UPDATE`: existe pero hay diferencias (name/ref/phone/email/street/street2/city/zip/country).
+- `NEW`: no encontrado en Odoo.
+
+Notas operativas:
+- `Reference` en Odoo se alinea con `VendorID` de Sage (misma filosofía que Customers).
+- En `NEW_vendors.xlsx` se rellena `Reference` con `Vendor_ID`.
+- Si Sage trae address vacío y Odoo tiene dirección cargada, puede aparecer `UPDATE` por `street/country`.
+
+### (8) VENDOR PRICELIST
+Objetivo:
+- Construir precios de compra por proveedor desde histórico de Sage y compararlos contra `product.supplierinfo` en Odoo.
+
+Flujo:
+```
+python sage_odoo_parity.py refresh_odoo
+python sage_odoo_parity.py build_vendor_pricelist_sync
+python sage_odoo_parity.py build_vendor_pricelist_import
+python sage_odoo_parity.py build_vendor_pricelist_update
+```
+
+Entradas:
+- Sage: `ENZO-Sage50/_master_sage/JrnlHdr.csv`, `ENZO-Sage50/_master_sage/JrnlRow.csv`
+- Sync: `ENZO-Sage50/_master/vendors_sync.csv`, `ENZO-Sage50/_master/products_sync.csv`
+- Odoo: `ENZO-Sage50/_master_odoo/vendor_pricelist_odoo.csv` (exportado en `refresh_odoo`)
+
+Salidas:
+- `ENZO-Sage50/_master/vendor_pricelist_sync.csv`
+- `ENZO-Sage50/_master/vendor_pricelist_sync_NEW.csv`
+- `ENZO-Sage50/_master/vendor_pricelist_sync_UPDATE.csv`
+- `ENZO-Sage50/_master/vendor_pricelist_sync_CONFLICTS.csv`
+- `ENZO-Sage50/_master/odoo_imports/YYYYMMDD_vendor_pricelist_NEW.xlsx`
+- `ENZO-Sage50/_master/odoo_UPDATE/YYYYMMDD_vendor_pricelist_UPDATE.xlsx`
+
+Estados:
+- `MATCH`: vendor+template ya existe y precio coincide.
+- `UPDATE`: vendor+template ya existe pero precio difiere.
+- `NEW`: no existe línea en Odoo.
+- `CONFLICT`: falta match previo de vendor o template en Odoo (se revisa antes de importar precios).
+
+Reglas de plantilla/import (estado actual):
+- Se usa `Product Variant/Database ID` (no External ID).
+- `product_uom_id` se exporta como `Units`.
+- Para `NEW`, se fija por defecto:
+  - `Currency = USD`
+  - `min_qty = 1`
+  - `delay = 120`
+- `Vendor` se envía por nombre visible de partner (evita errores de lookup con `__import__...`).
+
+Limitación actual de UPDATE:
+- En muchos `product.supplierinfo` existentes no hay External ID (`OdooSupplierinfoExternalId` vacío).
+- Sin ese identificador, el XLSX de UPDATE puede salir vacío aunque existan filas `UPDATE` en sync.
 
 ### Parity común (estado / país)
 Para evitar duplicar lógica, usamos `parity_utils.py`:
