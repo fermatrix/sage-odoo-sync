@@ -903,7 +903,7 @@ def _pretty_shipping_mismatch(part: str) -> Optional[List[str]]:
         f"            {sage_line3}",
         "",
     ]
-    if score_num == 0:
+    if score_num <= 2:
         lines.extend([
             "          No best candidate found in Odoo",
             "",
