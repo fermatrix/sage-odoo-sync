@@ -247,6 +247,10 @@ Flags CLI (`sync_sales_orders_api.py`):
   - Mantiene el modo estricto por defecto si no se pasa este flag.
   - Permite equivalencias de calle tipo `#`/`SUITE`/`STE`.
   - Aplica paridad simple de estado (ej. `TX` <-> `Texas`, `ON` <-> `Ontario`).
+- `--create-shipping-address`: cuando falla el match de shipping, crea una dirección `delivery` en Odoo bajo el customer (`res.partner`) y la usa en la SO.
+  - Usa paridades de `state/country` (`_master/_parity_state.csv`, `_master/_parity_country.csv`) para mapear correctamente.
+- `--freight-variant-id`: `product.product` ID para usar en líneas de `Freight Amount`/`Shipping` de Sage cuando vienen con `ItemRecordNumber=0`.
+- `--freight-product-name`: fallback por nombre para localizar el producto de freight si no se indica `--freight-variant-id`. Default: `Freight`.
 
 Notas operativas de flags:
 - Cualquier flag desconocido hace que el script falle inmediatamente (comportamiento estándar de `argparse`).
@@ -255,6 +259,7 @@ Notas operativas de flags:
 - Re-ejecución estricta (sin `--shipping-relaxed`) sobre SO ya existente:
   - Si no hay match exacto nuevo de shipping pero la SO ya tiene `partner_shipping_id` en Odoo, se preserva ese shipping y no se bloquea la orden.
   - En ese caso se registra warning: `Shipping preserved from existing Odoo order (strict mode)`.
+- Con `--create-shipping-address`, la creación on-the-fly de dirección se registra como info en el detalle y no detiene el proceso.
 
 Modo estricto (por defecto):
 - El proceso se detiene al primer error crítico de datos.
@@ -303,10 +308,20 @@ Resolución de Customer / Invoice / Delivery (regla actual):
 - En modo estricto, si no hay match exacto de shipping, la SO falla.
 - Excepción de re-ejecución estricta: si la SO ya existe en Odoo y ya tiene `partner_shipping_id` válido, se preserva ese valor y no se bloquea por shipping.
 - `--shipping-relaxed` permite equivalencias leves (`#`/`SUITE`/`STE` y código/nombre de estado).
+- `--create-shipping-address` permite crear el shipping faltante “on the fly” cuando no hay match exacto.
 
 Importante (modelo Odoo):
 - El campo `Ship To` en `sale.order` no es texto libre.
 - Odoo requiere una dirección/contacto real en `res.partner` (`partner_shipping_id`); no se puede “escribir a pelo” una dirección nueva en la orden.
+
+BOGO Transaction (líneas de SO):
+- Cuando en Sage aparece `BOGO TRANSACTION` (incluyendo `ItemRecordNumber=8521`), no se trata como línea de producto.
+- Se crea una `line_note` en Odoo con ese mismo texto y se coloca al principio de las líneas de la SO.
+
+Freight Amount (líneas técnicas de Sage):
+- Algunas SO traen líneas con `ItemRecordNumber=0` y descripción tipo `Freight Amount` (no son taxes).
+- Esas líneas ahora se convierten en `sale.order.line` real en Odoo usando producto `Freight` (por ID o por nombre configurable).
+- Esto evita falsos `Order total mismatch` cuando la cabecera de Sage incluye solo coste de envío.
 
 Limitación conocida:
 - Sin un `AddressRecordNumber` explícito en la Order de Sage, shipping/billing se resuelven por la mejor coincidencia disponible (no perfecto, pero actualmente es el mejor criterio operativo).

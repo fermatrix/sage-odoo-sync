@@ -9,6 +9,12 @@ from typing import Dict, List, Optional, Tuple
 
 from sync_customers import DELIMITER, get_env_value, load_env_file, read_csv
 from sync_parity import OdooClient
+from parity_utils import (
+    load_country_name_to_code,
+    load_country_parity,
+    load_state_parity,
+    normalize_country,
+)
 
 
 def parse_decimal(raw: str) -> float:
@@ -103,6 +109,25 @@ def build_parser() -> argparse.ArgumentParser:
             "Keep strict mode by default. When enabled, allow a slightly relaxed "
             "shipping match (state parity + street synonyms like #/SUITE/STE)."
         ),
+    )
+    p.add_argument(
+        "--create-shipping-address",
+        action="store_true",
+        help=(
+            "When shipping address does not match, create a delivery address under "
+            "the customer in Odoo (using state/country parity) and use it in the order."
+        ),
+    )
+    p.add_argument(
+        "--freight-variant-id",
+        type=int,
+        default=0,
+        help="Odoo product.product id to use for Sage freight/shipping amount lines (ItemRecordNumber=0).",
+    )
+    p.add_argument(
+        "--freight-product-name",
+        default="Freight",
+        help="Fallback product name lookup for freight when --freight-variant-id is not provided.",
     )
     return p
 
@@ -387,8 +412,10 @@ def resolve_term_id(terms_map: Dict[str, int], sage_term: str) -> Optional[int]:
 def build_order_lines(
     source_lines: List[Dict[str, str]],
     products_map: Dict[str, Dict[str, str]],
+    freight_variant_id: int = 0,
 ) -> Dict[str, object]:
     out: List[Dict[str, object]] = []
+    note_lines: List[Dict[str, object]] = []
     source_total = 0.0
     skipped_reasons: List[str] = []
     has_shipping_line = False
@@ -400,9 +427,19 @@ def build_order_lines(
     variant_debug_rows: List[Dict[str, str]] = []
     for line in source_lines:
         source_row_count += 1
+        row_desc_raw = (line.get("RowDescription") or "").strip()
+        row_desc_upper = row_desc_raw.upper()
         item_record = (line.get("ItemRecordNumber") or "").strip()
+        is_bogo_transaction = item_record == "8521" or row_desc_upper.startswith("BOGO TRANSACTION")
+        if is_bogo_transaction:
+            # Keep BOGO marker as top note in Odoo, not as product line.
+            note_lines.append({
+                "display_type": "line_note",
+                "name": row_desc_raw or "BOGO TRANSACTION",
+            })
+            continue
         if not item_record or item_record == "0":
-            row_desc = (line.get("RowDescription") or "").strip().upper()
+            row_desc = row_desc_upper
             code = (line.get("TaxAuthorityCode") or "").strip().upper()
             looks_like_tax = bool(code) or ("TAX" in row_desc)
             if looks_like_tax:
@@ -411,6 +448,33 @@ def build_order_lines(
                     tax_total_source += tax_amount
                     if code and code not in tax_authority_codes:
                         tax_authority_codes.append(code)
+                continue
+            # Non-tax technical rows can still carry freight amount.
+            amount = abs(parse_decimal(line.get("Amount") or ""))
+            is_freight_amount = amount > 0 and ("FREIGHT" in row_desc or "SHIPPING" in row_desc)
+            if is_freight_amount:
+                if freight_variant_id:
+                    source_total += amount
+                    source_product_row_count += 1
+                    out.append({
+                        "product_id": int(freight_variant_id),
+                        "name": row_desc_raw or "Freight Amount",
+                        "product_uom_qty": 1.0,
+                        "price_unit": round(amount, 2),
+                        "tax_ids": [(5, 0, 0)],
+                    })
+                    variant_debug_rows.append({
+                        "product_id": str(freight_variant_id),
+                        "item_record": "0",
+                        "item_id": "FREIGHT_AMOUNT",
+                        "row_desc": row_desc_raw,
+                    })
+                    has_shipping_line = True
+                    shipping_line_indexes.append(len(out) - 1)
+                else:
+                    skipped_reasons.append(
+                        f"Freight line ({row_desc_raw}): missing freight variant id configuration"
+                    )
             continue
         source_amount = abs(parse_decimal(line.get("Amount") or ""))
         if source_amount > 0:
@@ -418,7 +482,7 @@ def build_order_lines(
         source_product_row_count += 1
         product_sync = products_map.get(item_record)
         if not product_sync:
-            row_desc = (line.get("RowDescription") or "").strip()
+            row_desc = row_desc_raw
             skipped_reasons.append(
                 f"ItemRecordNumber {item_record} ({row_desc}): not found in products_sync"
             )
@@ -441,7 +505,7 @@ def build_order_lines(
             price_unit = amount / qty if qty else 0
         item_id = (product_sync.get("ItemID") or "").strip().upper()
         item_desc = (product_sync.get("ItemDescription") or "").strip().upper()
-        row_desc = (line.get("RowDescription") or "").strip().upper()
+        row_desc = row_desc_upper
         is_shipping = (
             "SHIPPING" in item_id
             or "SHIPPING" in item_desc
@@ -449,7 +513,7 @@ def build_order_lines(
         )
         out.append({
             "product_id": variant_id,
-            "name": (line.get("RowDescription") or "").strip(),
+            "name": row_desc_raw,
             "product_uom_qty": qty,
             "price_unit": round(price_unit, 2),
             # Always set taxes explicitly: avoid implicit product default taxes in Odoo.
@@ -464,7 +528,19 @@ def build_order_lines(
         if is_shipping:
             has_shipping_line = True
             shipping_line_indexes.append(len(out) - 1)
-    prepared_total = round(sum((l["product_uom_qty"] * l["price_unit"]) for l in out), 2)
+    # Put notes first (BOGO marker requested by business).
+    if note_lines:
+        out = note_lines + out
+        shipping_line_indexes = [idx + len(note_lines) for idx in shipping_line_indexes]
+    prepared_product_line_count = len([l for l in out if not str(l.get("display_type") or "").strip()])
+    prepared_total = round(
+        sum(
+            (float(l.get("product_uom_qty") or 0.0) * float(l.get("price_unit") or 0.0))
+            for l in out
+            if not str(l.get("display_type") or "").strip()
+        ),
+        2,
+    )
     return {
         "lines": out,
         "source_total": round(source_total, 2),
@@ -476,6 +552,7 @@ def build_order_lines(
         "tax_authority_codes": tax_authority_codes,
         "source_row_count": source_row_count,
         "source_product_row_count": source_product_row_count,
+        "prepared_product_line_count": prepared_product_line_count,
         "variant_debug_rows": variant_debug_rows,
     }
 
@@ -630,6 +707,142 @@ def resolve_invoice_partner_id(client: OdooClient, partner_id: int) -> int:
         return partner_id
     invoice_contacts = sorted(invoice_contacts, key=lambda r: int(r.get("id") or 0))
     return int(invoice_contacts[0]["id"])
+
+
+def load_address_parity_maps(root_dir: str) -> Dict[str, Dict[str, object]]:
+    master = os.path.join(root_dir, "_master")
+    master_odoo = os.path.join(root_dir, "_master_odoo")
+    country_parity_path = os.path.join(master, "_parity_country.csv")
+    state_parity_path = os.path.join(master, "_parity_state.csv")
+    countries_odoo_path = os.path.join(master_odoo, "countries_odoo.csv")
+    country_parity = load_country_parity(country_parity_path)
+    country_name_to_code = load_country_name_to_code(countries_odoo_path)
+    state_parity = load_state_parity(state_parity_path)
+    return {
+        "country_parity": country_parity,
+        "country_name_to_code": country_name_to_code,
+        "state_parity": state_parity,
+    }
+
+
+def fetch_country_state_indexes(client: OdooClient) -> Dict[str, Dict[str, int]]:
+    countries = client.search_read("res.country", [], ["id", "code", "name"], limit=9999, offset=0)
+    by_code: Dict[str, int] = {}
+    for c in countries:
+        code = (c.get("code") or "").strip().upper()
+        cid = int(c.get("id") or 0)
+        if code and cid:
+            by_code[code] = cid
+
+    states = client.search_read("res.country.state", [], ["id", "name", "code", "country_id"], limit=9999, offset=0)
+    by_country_code_and_state: Dict[Tuple[str, str], int] = {}
+    by_state_only: Dict[str, int] = {}
+    for s in states:
+        sid = int(s.get("id") or 0)
+        if not sid:
+            continue
+        code = (s.get("code") or "").strip().upper()
+        name = (s.get("name") or "").strip().upper()
+        country = s.get("country_id") or []
+        country_label = (country[1] if isinstance(country, list) and len(country) > 1 else "").strip()
+        country_code = ""
+        if "(" in country_label and ")" in country_label:
+            country_code = country_label.split("(", 1)[1].split(")", 1)[0].strip().upper()
+        if not country_code:
+            # fallback from country id
+            country_id = country[0] if isinstance(country, list) and country else 0
+            for cc, cid in by_code.items():
+                if int(cid) == int(country_id):
+                    country_code = cc
+                    break
+        if code and country_code:
+            by_country_code_and_state[(country_code, code)] = sid
+        if name and country_code:
+            by_country_code_and_state[(country_code, name)] = sid
+        if code:
+            by_state_only.setdefault(code, sid)
+    return {
+        "country_by_code": by_code,
+        "state_by_country_and_state": by_country_code_and_state,
+        "state_by_state": by_state_only,
+    }
+
+
+def create_shipping_address_on_the_fly(
+    client: OdooClient,
+    parent_id: int,
+    ship_to_name: str,
+    ship_to_address1: str,
+    ship_to_address2: str,
+    ship_to_city: str,
+    ship_to_state: str,
+    ship_to_zip: str,
+    ship_to_country: str,
+    parity_maps: Dict[str, Dict[str, object]],
+    indexes: Dict[str, Dict[str, int]],
+) -> tuple[Optional[int], str]:
+    country_parity = parity_maps.get("country_parity", {})
+    country_name_to_code = parity_maps.get("country_name_to_code", {})
+    state_parity = parity_maps.get("state_parity", {})
+    country_by_code = indexes.get("country_by_code", {})
+    state_by_country_and_state = indexes.get("state_by_country_and_state", {})
+    state_by_state = indexes.get("state_by_state", {})
+
+    raw_state = (ship_to_state or "").strip()
+    raw_country = (ship_to_country or "").strip()
+
+    normalized_country = normalize_country(raw_country, country_parity, country_name_to_code)
+    state_info = state_parity.get(raw_state, {})
+    state_name = (state_info.get("state_name") or raw_state).strip()
+    inferred_country_name = (state_info.get("country_name") or "").strip()
+    if not normalized_country and inferred_country_name:
+        normalized_country = normalize_country(inferred_country_name, country_parity, country_name_to_code)
+
+    country_code = (normalized_country or "").strip().upper()
+    country_id = country_by_code.get(country_code) if country_code else None
+    state_id = None
+    if state_name:
+        key_code = state_name.strip().upper()
+        if country_code:
+            state_id = state_by_country_and_state.get((country_code, key_code))
+            if not state_id and raw_state:
+                state_id = state_by_country_and_state.get((country_code, raw_state.strip().upper()))
+        if not state_id:
+            state_id = state_by_state.get(raw_state.strip().upper()) if raw_state else None
+
+    vals: Dict[str, object] = {
+        "parent_id": int(parent_id),
+        "type": "delivery",
+        "name": (ship_to_name or "").strip() or "Shipping Address",
+        "street": (ship_to_address1 or "").strip(),
+        "street2": (ship_to_address2 or "").strip(),
+        "city": (ship_to_city or "").strip(),
+        "zip": (ship_to_zip or "").strip(),
+    }
+    if country_id:
+        vals["country_id"] = int(country_id)
+    if state_id:
+        vals["state_id"] = int(state_id)
+
+    new_id = client.models.execute_kw(
+        client.db,
+        client.uid,
+        client.apikey,
+        "res.partner",
+        "create",
+        [vals],
+    )
+    return int(new_id), (
+        "Shipping address created on the fly "
+        f"(id={new_id}; "
+        f"name='{(vals.get('name') or '')}'; "
+        f"street='{(vals.get('street') or '')}'; "
+        f"street2='{(vals.get('street2') or '')}'; "
+        f"city='{(vals.get('city') or '')}'; "
+        f"state='{raw_state}'; "
+        f"zip='{(vals.get('zip') or '')}'; "
+        f"country='{country_code or ''}')"
+    )
 
 
 def to_login(employee_id: str) -> str:
@@ -860,7 +1073,12 @@ def _print_order_progress(entry: Dict[str, str], index: int) -> None:
                 initial_indent="        - ",
                 subsequent_indent="          ",
             )
-            print(wrapped)
+            pretty_created = _pretty_shipping_created(part)
+            if pretty_created:
+                for ln in pretty_created:
+                    print(ln)
+            else:
+                print(wrapped)
     print("")
 
 
@@ -934,6 +1152,38 @@ def _shipping_mismatch_raw(part: str) -> Optional[str]:
     )
     m = pattern.search(part)
     return m.group(0) if m else None
+
+
+def _pretty_shipping_created(part: str) -> Optional[List[str]]:
+    if "Shipping address created on the fly" not in part:
+        return None
+    pattern = re.compile(
+        r"Shipping address created on the fly\s*\("
+        r"id=(?P<id>\d+);\s*"
+        r"name='(?P<name>[^']*)';\s*"
+        r"street='(?P<street>[^']*)';\s*"
+        r"street2='(?P<street2>[^']*)';\s*"
+        r"city='(?P<city>[^']*)';\s*"
+        r"state='(?P<state>[^']*)';\s*"
+        r"zip='(?P<zip>[^']*)';\s*"
+        r"country='(?P<country>[^']*)'\)"
+    )
+    m = pattern.search(part)
+    if not m:
+        return None
+    g = m.groupdict()
+    line3 = f"{g['city']} - {g['state']} ({g['zip']})".strip()
+    if g.get("country"):
+        line3 += f" [{g['country']}]"
+    return [
+        "        - Shipping address created on the fly",
+        "",
+        f"          Odoo delivery id: {g['id']}",
+        "",
+        f"            {g['name']}",
+        f"            {g['street']}" + (f", {g['street2']}" if g["street2"] else ""),
+        f"            {line3}",
+    ]
 
 
 def _confirm_order_if_needed(client: OdooClient, order_id: int, target_date_order: str) -> bool:
@@ -1069,6 +1319,31 @@ def run(args: argparse.Namespace) -> int:
         for u in users_all
         if (u.get("login") or "").strip()
     }
+    freight_variant_id = int(args.freight_variant_id or 0)
+    if freight_variant_id <= 0:
+        wanted_name = (args.freight_product_name or "Freight").strip()
+        if wanted_name:
+            candidates = client.search_read(
+                "product.product",
+                [("name", "=", wanted_name)],
+                ["id", "name", "active"],
+                limit=20,
+                offset=0,
+            )
+            if not candidates:
+                candidates = client.search_read(
+                    "product.product",
+                    [("name", "ilike", wanted_name)],
+                    ["id", "name", "active"],
+                    limit=20,
+                    offset=0,
+                )
+            if candidates:
+                active = [c for c in candidates if bool(c.get("active", True))]
+                pick = active[0] if active else candidates[0]
+                freight_variant_id = int(pick.get("id") or 0)
+    address_parity_maps = load_address_parity_maps(args.root_dir)
+    country_state_indexes = fetch_country_state_indexes(client)
 
     logs: List[Dict[str, str]] = []
     created = 0
@@ -1114,12 +1389,12 @@ def run(args: argparse.Namespace) -> int:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         source_lines = lines_by_postorder.get(post_order, [])
-        prepared_info = build_order_lines(source_lines, products_map)
+        prepared_info = build_order_lines(source_lines, products_map, freight_variant_id=freight_variant_id)
         prepared_lines = prepared_info["lines"]
         source_row_count = int(prepared_info.get("source_row_count") or 0)
         source_product_row_count = int(prepared_info.get("source_product_row_count") or 0)
         variant_debug_rows = prepared_info.get("variant_debug_rows") or []
-        has_product_lines = bool(prepared_lines)
+        has_product_lines = int(prepared_info.get("prepared_product_line_count") or 0) > 0
         tax_total_source = float(prepared_info.get("tax_total_source") or 0.0)
         tax_codes = [str(c).strip().upper() for c in (prepared_info.get("tax_authority_codes") or []) if str(c).strip()]
         tax_code = tax_codes[0] if tax_codes else ""
@@ -1222,6 +1497,7 @@ def run(args: argparse.Namespace) -> int:
         skipped_reasons = prepared_info["skipped_reasons"]
         total_mismatch = abs(header_total - prepared_total_with_tax) > 0.02
         warning_parts = []
+        info_parts: List[str] = []
         if total_mismatch:
             warning_parts.append(
                 f"Total mismatch header={header_total:.2f} prepared={prepared_total_with_tax:.2f} "
@@ -1271,6 +1547,7 @@ def run(args: argparse.Namespace) -> int:
             (h.get("ShipToZIP") or "").strip(),
             bool(args.shipping_relaxed),
         )
+        ship_to_country = (h.get("ShipToCountry") or "").strip()
         if ship_key in shipping_partner_cache:
             shipping_partner_id, shipping_exact, shipping_debug = shipping_partner_cache[ship_key]
         else:
@@ -1320,12 +1597,36 @@ def run(args: argparse.Namespace) -> int:
         no_sales_rep = emp_record == "0"
         current_no_sales_rep = no_sales_rep
         shipping_preserved_from_existing = False
+        shipping_created_on_the_fly = False
+        shipping_created_detail = ""
         if not shipping_exact:
             # Strict-mode re-runs: if this order already exists with a concrete
             # shipping contact/address, keep it and avoid failing the whole row.
             if exists and existing_shipping_id and existing_shipping_id != partner_id_int and not args.shipping_relaxed:
                 shipping_partner_id = existing_shipping_id
                 shipping_preserved_from_existing = True
+            elif args.create_shipping_address:
+                try:
+                    new_shipping_id, created_detail = create_shipping_address_on_the_fly(
+                        client=client,
+                        parent_id=partner_id_int,
+                        ship_to_name=ship_key[1],
+                        ship_to_address1=ship_key[2],
+                        ship_to_address2=ship_key[3],
+                        ship_to_city=ship_key[4],
+                        ship_to_state=ship_key[5],
+                        ship_to_zip=ship_key[6],
+                        ship_to_country=ship_to_country,
+                        parity_maps=address_parity_maps,
+                        indexes=country_state_indexes,
+                    )
+                    if new_shipping_id:
+                        shipping_partner_id = int(new_shipping_id)
+                        shipping_exact = True
+                        shipping_created_on_the_fly = True
+                        shipping_created_detail = created_detail
+                except Exception as exc:
+                    critical_errors.append(f"Failed to create shipping address on the fly: {exc}")
             else:
                 customer_name_part = f"customer_name='{customer_odoo_name}'; " if customer_odoo_name else ""
                 critical_errors.append(
@@ -1338,6 +1639,15 @@ def run(args: argparse.Namespace) -> int:
                 )
         if shipping_preserved_from_existing:
             warning_parts.append("Shipping preserved from existing Odoo order (strict mode)")
+        if shipping_created_on_the_fly:
+            info_parts.append(shipping_created_detail)
+
+        def merge_details(base: str) -> str:
+            parts: List[str] = []
+            if base:
+                parts.append(base)
+            parts.extend(info_parts)
+            return "; ".join([p for p in parts if p])
 
         if critical_errors:
             push_log({
@@ -1426,10 +1736,10 @@ def run(args: argparse.Namespace) -> int:
                     "LineCount": str(len(prepared_lines)),
                     "Details": (
                         (
-                            (detail if no_changes else f"Would update: {', '.join(update_reasons)}")
+                            merge_details(detail if no_changes else f"Would update: {', '.join(update_reasons)}")
                         )
                         if not warning_parts
-                        else "; ".join(warning_parts)
+                        else merge_details("; ".join(warning_parts))
                     ),
                 })
                 created += 1
@@ -1450,11 +1760,13 @@ def run(args: argparse.Namespace) -> int:
                             "LineCount": str(len(prepared_lines)),
                             "Details": (
                                 (
-                                    "No changes in content"
+                                    merge_details(
+                                        "No changes in content"
                                     + ("; confirmed" if confirmed else "")
+                                    )
                                 )
                                 if not warning_parts
-                                else "; ".join(warning_parts)
+                                else merge_details("; ".join(warning_parts))
                             ),
                         })
                     elif order_state not in {"draft", "sent"}:
@@ -1478,7 +1790,7 @@ def run(args: argparse.Namespace) -> int:
                                 "OrderOdooId": str(order_id),
                                 "OrderState": order_state,
                                 "LineCount": str(len(prepared_lines)),
-                                "Details": "Updated: date_order on confirmed order",
+                                "Details": merge_details("Updated: date_order on confirmed order"),
                             })
                         else:
                             push_log({
@@ -1518,10 +1830,12 @@ def run(args: argparse.Namespace) -> int:
                             "OrderState": ("sale" if confirmed else order_state),
                             "LineCount": str(len(prepared_lines)),
                             "Details": (
-                                f"Updated: {', '.join(update_reasons)}"
+                                merge_details(
+                                    f"Updated: {', '.join(update_reasons)}"
                                 + ("; confirmed" if confirmed else "")
+                                )
                                 if not warning_parts
-                                else f"Updated: {', '.join(update_reasons)}; " + "; ".join(warning_parts)
+                                else merge_details(f"Updated: {', '.join(update_reasons)}; " + "; ".join(warning_parts))
                             ),
                         })
                     created += 1
@@ -1566,9 +1880,9 @@ def run(args: argparse.Namespace) -> int:
                     "OrderState": "draft",
                     "LineCount": str(len(prepared_lines)),
                     "Details": (
-                        ("Validated and ready to create")
+                        merge_details("Validated and ready to create")
                         if not warning_parts
-                        else "; ".join(warning_parts)
+                        else merge_details("; ".join(warning_parts))
                     ),
                 })
                 created += 1
@@ -1596,11 +1910,13 @@ def run(args: argparse.Namespace) -> int:
                         "LineCount": str(len(prepared_lines)),
                         "Details": (
                             (
-                                "Created sale.order"
+                                merge_details(
+                                    "Created sale.order"
                                 + ("; confirmed" if confirmed else "")
+                                )
                             )
                             if not warning_parts
-                            else "; ".join(warning_parts)
+                            else merge_details("; ".join(warning_parts))
                         ),
                     })
                     created += 1
