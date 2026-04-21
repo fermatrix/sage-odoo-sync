@@ -196,6 +196,27 @@ Ficheros generados (Feb/Mar/Abr 2026):
 - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_sales_orders_headers.csv`
 - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_sales_orders_lines.csv`
 
+### Money Received (Customer Receipts)
+Identificación confirmada:
+- `JrnlHdr` con `Module = R` y `JournalEx = 3` contiene la cabecera de recibos de cliente.
+- `JrnlRow` enlazado por `PostOrder` contiene el detalle de aplicación.
+
+Estructura funcional:
+- Cabecera (`money_received`): `DepositTicketID`, `CustVendId` (customer), `Reference` (check/reference no), `ReceiptNum`, `TransactionDate`, `MainAmount`, `PaymentMethod`, `GLAcntNumber` (cash account).
+- `apply_to_invoices`: líneas con `InvNumForThisTrx` informado.
+- `apply_to_revenue`: líneas sin `InvNumForThisTrx` y con importe negativo (ajustes no aplicados a factura concreta).
+
+Extracción generada (2026-02/03/04):
+- `ENZO-Sage50/13_2026/01_02_Feb/2026_02_money_received.csv`
+- `ENZO-Sage50/13_2026/01_02_Feb/2026_02_money_received_apply_to_invoices.csv`
+- `ENZO-Sage50/13_2026/01_02_Feb/2026_02_money_received_apply_to_revenue.csv`
+- `ENZO-Sage50/13_2026/02_03_Mar/2026_03_money_received.csv`
+- `ENZO-Sage50/13_2026/02_03_Mar/2026_03_money_received_apply_to_invoices.csv`
+- `ENZO-Sage50/13_2026/02_03_Mar/2026_03_money_received_apply_to_revenue.csv`
+- `ENZO-Sage50/13_2026/03_04_Apr/2026_04_money_received.csv`
+- `ENZO-Sage50/13_2026/03_04_Apr/2026_04_money_received_apply_to_invoices.csv`
+- `ENZO-Sage50/13_2026/03_04_Apr/2026_04_money_received_apply_to_revenue.csv`
+
 ### Sales Orders API Sync (draft)
 Script nuevo:
 - `sync_sales_orders_api.py`
