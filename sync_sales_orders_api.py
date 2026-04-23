@@ -3,6 +3,7 @@ import csv
 import os
 import re
 import textwrap
+from collections import Counter
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -52,7 +53,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"ENZO-Sage50\13_2026\01_02_Feb\2026_02_sales_orders_lines.csv",
     )
     p.add_argument("--customers-sync", default=r"ENZO-Sage50\_master\customers_sync.csv")
-    p.add_argument("--products-sync", default=r"ENZO-Sage50\_master\products_sync.csv")
+    p.add_argument(
+        "--products-sync",
+        default=r"ENZO-Sage50\_master\products_sync.csv",
+        help="Deprecated/ignored. Sales orders mapping never uses products_sync.",
+    )
+    p.add_argument("--items-master", default=r"ENZO-Sage50\_master_sage\items.csv")
+    p.add_argument(
+        "--items-odoo",
+        default=r"ENZO-Sage50\_master_odoo\items_odoo.csv",
+        help="Deprecated/ignored. Odoo variants are read live from API.",
+    )
     p.add_argument("--employees-sync", default=r"ENZO-Sage50\_master\employees_sync.csv")
     p.add_argument(
         "--limit",
@@ -73,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--reference",
         default="",
-        help="Process only one Sage order reference (example: 357702)",
+        help="Process one or many Sage references separated by comma (example: 357702 or 357702,357703)",
     )
     p.add_argument(
         "--load",
@@ -128,6 +139,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--freight-product-name",
         default="Freight",
         help="Fallback product name lookup for freight when --freight-variant-id is not provided.",
+    )
+    p.add_argument(
+        "--content-verify",
+        action="store_true",
+        help=(
+            "Verify existing Odoo order line SKUs against Sage SKUs (via ItemRecordNumber -> ItemID) "
+            "without creating/updating orders."
+        ),
+    )
+    p.add_argument(
+        "--content-repair",
+        action="store_true",
+        help=(
+            "When used with --content-verify, auto-repair mismatches by reopening ORDER to QUOTE, "
+            "updating order_lines and pricelist_id, then re-confirming."
+        ),
     )
     return p
 
@@ -247,6 +274,13 @@ def _parse_limit_offset(limit_arg: str, offset_arg: int) -> Tuple[Optional[int],
     return max(1, int(raw)), max(0, int(offset_arg or 0))
 
 
+def _parse_reference_filter(raw: str) -> set:
+    text = (raw or "").strip()
+    if not text:
+        return set()
+    return {part.strip() for part in text.split(",") if part.strip()}
+
+
 def _iter_sales_order_pairs(root_dir: str) -> List[Tuple[str, str]]:
     base_dir = os.path.join(root_dir, "13_2026")
     fallback_root = os.path.join(root_dir)
@@ -351,6 +385,100 @@ def _fetch_existing_sale_orders_by_name(
             name = str(row.get("name") or "").strip()
             if name and name not in out:
                 out[name] = row
+    return out
+
+
+def load_products_map_from_masters(
+    items_master_path: str,
+    client: OdooClient,
+) -> Dict[str, Dict[str, str]]:
+    if not os.path.exists(items_master_path):
+        return {}
+
+    _, sage_rows = read_csv(items_master_path)
+    sage_by_record: Dict[str, Dict[str, str]] = {}
+    for r in sage_rows:
+        rec = (r.get("ItemRecordNumber") or "").strip()
+        if rec:
+            sage_by_record[rec] = r
+
+    # Live read from Odoo to avoid stale local snapshots.
+    odoo_rows: List[Dict[str, object]] = []
+    offset = 0
+    limit = 2000
+    while True:
+        batch = client.models.execute_kw(
+            client.db,
+            client.uid,
+            client.apikey,
+            "product.product",
+            "search_read",
+            [[]],
+            {
+                "fields": ["id", "default_code", "name", "active", "product_tmpl_id"],
+                "limit": limit,
+                "offset": offset,
+                "context": {"active_test": False},
+            },
+        )
+        if not batch:
+            break
+        odoo_rows.extend(batch)
+        offset += len(batch)
+
+    odoo_by_code: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for r in odoo_rows:
+        code = str(r.get("default_code") or "").strip().upper()
+        if code:
+            odoo_by_code[code].append({
+                "OdooVariantId": str(r.get("id") or ""),
+                "OdooVariantExternalId": "",
+                "OdooName": str(r.get("name") or "").strip(),
+                "OdooItemCode": code,
+                "OdooColor": "",
+                "OdooTemplateId": (
+                    str((r.get("product_tmpl_id") or [None])[0] or "")
+                    if isinstance(r.get("product_tmpl_id"), list)
+                    else ""
+                ),
+                "OdooTemplateExternalId": "",
+                "Active": str(bool(r.get("active", True))),
+            })
+
+    def _pick_variant(rows: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return rows[0]
+        active = [r for r in rows if str(r.get("Active") or "").strip().lower() in {"true", "1"}]
+        if len(active) == 1:
+            return active[0]
+        if active:
+            rows = active
+        return rows[0]
+
+    out: Dict[str, Dict[str, str]] = {}
+    for rec, sage in sage_by_record.items():
+        item_id = (sage.get("ItemID") or "").strip().upper()
+        if not item_id:
+            continue
+        picked = _pick_variant(odoo_by_code.get(item_id, []))
+        if not picked:
+            continue
+        out[rec] = {
+            "ItemRecordNumber": rec,
+            "ItemID": (sage.get("ItemID") or "").strip(),
+            "ItemDescription": (sage.get("ItemDescription") or "").strip(),
+            "ItemDescriptionForSale": (sage.get("ItemDescriptionForSale") or "").strip(),
+            "OdooVariantId": (picked.get("OdooVariantId") or "").strip(),
+            "OdooVariantExternalId": (picked.get("OdooVariantExternalId") or "").strip(),
+            "OdooName": (picked.get("OdooName") or "").strip(),
+            "OdooItemCode": (picked.get("OdooItemCode") or "").strip(),
+            "OdooColor": (picked.get("OdooColor") or "").strip(),
+            "OdooTemplateId": (picked.get("OdooTemplateId") or "").strip(),
+            "OdooTemplateExternalId": (picked.get("OdooTemplateExternalId") or "").strip(),
+            "MapSource": "master_sage_odoo",
+        }
     return out
 
 
@@ -484,7 +612,7 @@ def build_order_lines(
         if not product_sync:
             row_desc = row_desc_raw
             skipped_reasons.append(
-                f"ItemRecordNumber {item_record} ({row_desc}): not found in products_sync"
+                f"ItemRecordNumber {item_record} ({row_desc}): not found in master mapping (items.csv -> items_odoo.csv)"
             )
             continue
         variant_id = int((product_sync.get("OdooVariantId") or "0").strip() or 0)
@@ -861,6 +989,7 @@ def append_log(path: str, rows: List[Dict[str, str]]) -> None:
         "CustomerOdooId",
         "OrderOdooId",
         "OrderState",
+        "OrderPath",
         "NoSalesRep",
         "LineCount",
         "Details",
@@ -1022,6 +1151,7 @@ def _print_order_progress(entry: Dict[str, str], index: int) -> None:
     details = (entry.get("Details") or "").strip()
     has_no_sales_rep = str(entry.get("NoSalesRep") or "").strip().lower() in {"1", "true", "yes", "y"}
     raw_state = str(entry.get("OrderState") or "").strip().lower()
+    explicit_path = str(entry.get("OrderPath") or "").strip()
     state_label = ""
     if raw_state in {"sale", "done"}:
         state_label = "ORDER"
@@ -1033,7 +1163,7 @@ def _print_order_progress(entry: Dict[str, str], index: int) -> None:
         and "confirmed" in details_lower
         and state_label == "ORDER"
     )
-    shown_state = "QUOTE > ORDER" if just_confirmed else state_label
+    shown_state = explicit_path or ("QUOTE > ORDER" if just_confirmed else state_label)
 
     tx_date = _fmt_date(entry.get("TransactionDate") or "")
     tx_date_out = tx_date
@@ -1214,6 +1344,86 @@ def _confirm_order_if_needed(client: OdooClient, order_id: int, target_date_orde
     return False
 
 
+def _reopen_order_to_draft_if_needed(client: OdooClient, order_id: int) -> bool:
+    rows = client.search_read("sale.order", [("id", "=", order_id)], ["id", "state"], limit=1, offset=0)
+    if not rows:
+        return False
+    state = (rows[0].get("state") or "").strip()
+    if state in {"draft", "sent"}:
+        return True
+    # Standard safe flow to edit a confirmed SO.
+    client.models.execute_kw(
+        client.db,
+        client.uid,
+        client.apikey,
+        "sale.order",
+        "action_cancel",
+        [[order_id]],
+    )
+    client.models.execute_kw(
+        client.db,
+        client.uid,
+        client.apikey,
+        "sale.order",
+        "action_draft",
+        [[order_id]],
+    )
+    # Cleanup cancelled deliveries immediately so if repair fails later
+    # the order does not keep stale cancelled pickings attached.
+    _cleanup_cancelled_pickings_for_order(
+        client=client,
+        order_id=order_id,
+        delete_when_no_active=True,
+    )
+    rows_after = client.search_read("sale.order", [("id", "=", order_id)], ["id", "state"], limit=1, offset=0)
+    if not rows_after:
+        return False
+    return (rows_after[0].get("state") or "").strip() in {"draft", "sent"}
+
+
+def _cleanup_cancelled_pickings_for_order(
+    client: OdooClient,
+    order_id: int,
+    delete_when_no_active: bool = False,
+) -> Tuple[int, int]:
+    pickings = client.search_read(
+        "stock.picking",
+        [("sale_id", "=", int(order_id))],
+        ["id", "state", "name"],
+        limit=500,
+        offset=0,
+    )
+    if not pickings:
+        return 0, 0
+    active = [p for p in pickings if str(p.get("state") or "").strip() != "cancel"]
+    cancelled = [p for p in pickings if str(p.get("state") or "").strip() == "cancel"]
+    if not cancelled:
+        return 0, 0
+    # Default behavior: cleanup only duplicates (there is at least one active delivery).
+    # Optional behavior for repair flow: also cleanup when there is no active delivery.
+    if not active and not delete_when_no_active:
+        return 0, len(cancelled)
+    deleted = 0
+    kept = 0
+    for p in cancelled:
+        pid = int(p.get("id") or 0)
+        if pid <= 0:
+            continue
+        try:
+            client.models.execute_kw(
+                client.db,
+                client.uid,
+                client.apikey,
+                "stock.picking",
+                "unlink",
+                [[pid]],
+            )
+            deleted += 1
+        except Exception:
+            kept += 1
+    return deleted, kept
+
+
 def _diff_order_sig(current_sig: Dict[str, object], desired_sig: Dict[str, object]) -> List[str]:
     reasons: List[str] = []
     current_base = current_sig.get("base") or {}
@@ -1238,7 +1448,47 @@ def _diff_order_sig(current_sig: Dict[str, object], desired_sig: Dict[str, objec
     return reasons
 
 
+def _existing_order_skus(client: OdooClient, order_id: int) -> Dict[str, float]:
+    lines = client.search_read(
+        "sale.order.line",
+        [["order_id", "=", order_id], ["display_type", "=", False]],
+        ["product_id", "product_uom_qty"],
+        limit=5000,
+        offset=0,
+    )
+    product_ids = [
+        int((row.get("product_id") or [0])[0])
+        for row in lines
+        if isinstance(row.get("product_id"), list) and row.get("product_id")
+    ]
+    sku_by_pid: Dict[int, str] = {}
+    if product_ids:
+        for i in range(0, len(product_ids), 500):
+            chunk = product_ids[i:i + 500]
+            products = client.search_read(
+                "product.product",
+                [["id", "in", chunk]],
+                ["id", "default_code"],
+                limit=5000,
+                offset=0,
+            )
+            for p in products:
+                sku_by_pid[int(p.get("id") or 0)] = str(p.get("default_code") or "").strip().upper()
+    out: Dict[str, float] = defaultdict(float)
+    for row in lines:
+        pid = int((row.get("product_id") or [0])[0]) if isinstance(row.get("product_id"), list) and row.get("product_id") else 0
+        sku = (sku_by_pid.get(pid) or "").strip().upper()
+        qty = float(row.get("product_uom_qty") or 0.0)
+        out[sku] += qty
+    return out
+
+
 def run(args: argparse.Namespace) -> int:
+    if args.content_repair and not args.content_verify:
+        # Repair logic is implemented inside content-verify mode.
+        args.content_verify = True
+        print("INFO: --content-repair enables --content-verify automatically")
+
     max_orders, start_offset = _parse_limit_offset(args.limit, args.offset)
     continue_on_error = bool(args.allow_partial or args.skip)
     env = load_env_file(args.env_file)
@@ -1252,7 +1502,18 @@ def run(args: argparse.Namespace) -> int:
 
     client = OdooClient(url=url, db=db, user=user, apikey=apikey)
     customers_map = load_customers_map(args.customers_sync)
-    products_map = load_products_map(args.products_sync)
+    products_map_master = load_products_map_from_masters(args.items_master, client)
+    # Strict rule: sales orders mapping must come only from Sage/Odoo masters.
+    products_map = dict(products_map_master)
+    if (args.products_sync or "").strip():
+        print("INFO: --products-sync is ignored by design")
+    if (args.items_odoo or "").strip():
+        print("INFO: --items-odoo is ignored by design (live Odoo lookup)")
+    if products_map_master:
+        print("INFO: products mapping source=master_sage_odoo " f"(master={len(products_map_master)})")
+    else:
+        print("ERROR: products mapping source is empty (items.csv + items_odoo.csv required)")
+        return 2
     employees_map = load_employees_map(args.employees_sync)
     if (args.load or "").strip():
         headers, lines_by_postorder = load_order_data_auto(args.root_dir, args.load)
@@ -1350,6 +1611,7 @@ def run(args: argparse.Namespace) -> int:
     seen_candidates = 0
     processed_index = start_offset
     processed_count = 0
+    references_filter = _parse_reference_filter(args.reference)
     current_no_sales_rep = False
     invoice_partner_cache: Dict[int, int] = {}
     shipping_partner_cache: Dict[Tuple[int, str, str, str, str, str, str, bool], Tuple[int, bool, str]] = {}
@@ -1369,7 +1631,7 @@ def run(args: argparse.Namespace) -> int:
             break
         post_order = (h.get("PostOrder") or "").strip()
         reference = (h.get("Reference") or "").strip()
-        if args.reference and reference != args.reference.strip():
+        if references_filter and reference not in references_filter:
             continue
         if args.gaps:
             if args.reference:
@@ -1513,7 +1775,7 @@ def run(args: argparse.Namespace) -> int:
             exists = client.search_read(
                 "sale.order",
                 [("name", "=", reference)],
-                ["id", "name", "state", "partner_shipping_id"],
+                ["id", "name", "state", "partner_shipping_id", "pricelist_id"],
                 limit=1,
                 offset=0,
             )
@@ -1525,6 +1787,334 @@ def run(args: argparse.Namespace) -> int:
                 existing_shipping_id = int(raw_existing_shipping[0] or 0)
             elif isinstance(raw_existing_shipping, int):
                 existing_shipping_id = raw_existing_shipping
+
+        if args.content_verify:
+            if not exists:
+                push_log({
+                    "Timestamp": now,
+                    "Status": "ERROR",
+                    "Reference": reference,
+                    "PostOrder": post_order,
+                    "TransactionDate": transaction_date,
+                    "CustomerRecordNumber": customer_record,
+                    "CustomerOdooId": customer_odoo_id,
+                    "OrderOdooId": "",
+                    "OrderState": "",
+                    "LineCount": str(len(prepared_lines)),
+                    "Details": "Order not found in Odoo for content verification",
+                })
+                if not continue_on_error:
+                    break
+                continue
+
+            desired_pricelist_id = int((customer_sync.get("OdooPricelistId") or "0").strip() or 0)
+            expected_skus: Dict[str, float] = defaultdict(float)
+            missing_item_records: List[str] = []
+            for line in source_lines:
+                item_record = (line.get("ItemRecordNumber") or "").strip()
+                if not item_record or item_record == "0":
+                    continue
+                qty = parse_decimal(line.get("Quantity") or "")
+                if qty <= 0:
+                    continue
+                product_sync = products_map.get(item_record) or {}
+                sku = (product_sync.get("ItemID") or "").strip().upper()
+                if not sku:
+                    missing_item_records.append(item_record)
+                    continue
+                expected_skus[sku] += qty
+
+            order_id = int(exists[0]["id"])
+            actual_skus = _existing_order_skus(client, order_id)
+            raw_pl = exists[0].get("pricelist_id")
+            current_pricelist_id = 0
+            if isinstance(raw_pl, list) and raw_pl:
+                current_pricelist_id = int(raw_pl[0] or 0)
+            elif isinstance(raw_pl, int):
+                current_pricelist_id = int(raw_pl or 0)
+            pricelist_mismatch = bool(desired_pricelist_id and current_pricelist_id != desired_pricelist_id)
+
+            missing: List[str] = []
+            extra: List[str] = []
+            all_skus = sorted(set(expected_skus.keys()) | set(actual_skus.keys()))
+            for sku in all_skus:
+                exp_qty = float(expected_skus.get(sku, 0.0))
+                got_qty = float(actual_skus.get(sku, 0.0))
+                if abs(exp_qty - got_qty) <= 0.0001:
+                    continue
+                if exp_qty > got_qty:
+                    missing.append(f"{sku or '<blank>'} exp={exp_qty:g} got={got_qty:g}")
+                else:
+                    extra.append(f"{sku or '<blank>'} exp={exp_qty:g} got={got_qty:g}")
+
+            has_content_issues = bool(missing_item_records or missing or extra or pricelist_mismatch)
+            if has_content_issues and args.content_repair and not args.dry_run:
+                try:
+                    if not _reopen_order_to_draft_if_needed(client, order_id):
+                        raise RuntimeError("Could not move order to draft for repair")
+
+                    # Same guardrails as create/update flow: if any critical check fails,
+                    # stop before confirmation and leave the order in QUOTE for manual review.
+                    repair_blockers: List[str] = []
+                    if skipped_reasons:
+                        preview = " | ".join(skipped_reasons[:5])
+                        suffix = "" if len(skipped_reasons) <= 5 else f" | ... (+{len(skipped_reasons)-5} more)"
+                        repair_blockers.append(f"Missing product mapping: {preview}{suffix}")
+                    if total_mismatch:
+                        repair_blockers.append(
+                            f"Order total mismatch (header={header_total:.2f}, prepared={prepared_total_with_tax:.2f}, "
+                            f"lines={prepared_total:.2f}, source_tax={tax_total_source:.2f}, source_lines={source_total:.2f}; "
+                            f"source_rows={source_row_count}, source_product_rows={source_product_row_count}, prepared_rows={len(prepared_lines)})"
+                        )
+                    if stale_variant_details:
+                        preview = " | ".join(stale_variant_details[:5])
+                        suffix = "" if len(stale_variant_details) <= 5 else f" | ... (+{len(stale_variant_details)-5} more)"
+                        repair_blockers.append(
+                            "Products mapped to deleted/missing Odoo variants: " + preview + suffix
+                        )
+                    if tax_total_source > 0 and not tax_id:
+                        repair_blockers.append(
+                            f"Missing sales tax mapping for Sage TaxAuthorityCode {tax_code or '(blank)'}"
+                        )
+                    if repair_blockers:
+                        order_path = "QUOTE"
+                        if order_state not in {"draft", "sent"}:
+                            order_path = "ORDER > CANCEL > QUOTE"
+                        push_log({
+                            "Timestamp": now,
+                            "Status": "ERROR",
+                            "Reference": reference,
+                            "PostOrder": post_order,
+                            "TransactionDate": transaction_date,
+                            "CustomerRecordNumber": customer_record,
+                            "CustomerOdooId": customer_odoo_id,
+                            "OrderOdooId": str(order_id),
+                            "OrderState": "draft",
+                            "OrderPath": order_path,
+                            "LineCount": str(len(prepared_lines)),
+                            "Details": "Repair blocked before confirmation (left as QUOTE): " + "; ".join(repair_blockers),
+                        })
+                        if not continue_on_error:
+                            break
+                        created += 1
+                        continue
+
+                    repair_vals: Dict[str, object] = {}
+                    repaired_fields: List[str] = []
+                    if missing or extra:
+                        repair_vals["order_line"] = [(5, 0, 0)] + [(0, 0, line_vals) for line_vals in prepared_lines]
+                        repaired_fields.append("order_lines")
+                    if pricelist_mismatch:
+                        repair_vals["pricelist_id"] = int(desired_pricelist_id)
+                        repaired_fields.append("pricelist_id")
+
+                    if not repair_vals:
+                        raise RuntimeError("No repairable fields found for content mismatch")
+
+                    client.models.execute_kw(
+                        client.db,
+                        client.uid,
+                        client.apikey,
+                        "sale.order",
+                        "write",
+                        [[order_id], repair_vals],
+                    )
+                    confirmed = _confirm_order_if_needed(client, order_id, transaction_date.strip())
+
+                    # Re-check after repair to guarantee content is aligned.
+                    actual_skus_after = _existing_order_skus(client, order_id)
+                    missing_after: List[str] = []
+                    extra_after: List[str] = []
+                    all_skus_after = sorted(set(expected_skus.keys()) | set(actual_skus_after.keys()))
+                    for sku in all_skus_after:
+                        exp_qty = float(expected_skus.get(sku, 0.0))
+                        got_qty = float(actual_skus_after.get(sku, 0.0))
+                        if abs(exp_qty - got_qty) <= 0.0001:
+                            continue
+                        if exp_qty > got_qty:
+                            missing_after.append(f"{sku or '<blank>'} exp={exp_qty:g} got={got_qty:g}")
+                        else:
+                            extra_after.append(f"{sku or '<blank>'} exp={exp_qty:g} got={got_qty:g}")
+
+                    row_after = client.search_read(
+                        "sale.order",
+                        [("id", "=", order_id)],
+                        ["id", "state", "pricelist_id"],
+                        limit=1,
+                        offset=0,
+                    )
+                    state_after = order_state
+                    pricelist_after = current_pricelist_id
+                    if row_after:
+                        state_after = str(row_after[0].get("state") or "").strip()
+                        pl_after = row_after[0].get("pricelist_id")
+                        if isinstance(pl_after, list) and pl_after:
+                            pricelist_after = int(pl_after[0] or 0)
+                        elif isinstance(pl_after, int):
+                            pricelist_after = int(pl_after or 0)
+
+                    pricelist_after_mismatch = bool(
+                        desired_pricelist_id and pricelist_after != desired_pricelist_id
+                    )
+                    if missing_after or extra_after or pricelist_after_mismatch:
+                        order_path = ""
+                        if order_state not in {"draft", "sent"}:
+                            order_path = "ORDER > CANCEL > QUOTE"
+                        details = []
+                        if missing_after:
+                            details.append(
+                                "Missing in Odoo after repair: "
+                                + " | ".join(missing_after[:8])
+                                + (f" | ... (+{len(missing_after)-8} more)" if len(missing_after) > 8 else "")
+                            )
+                        if extra_after:
+                            details.append(
+                                "Extra in Odoo after repair: "
+                                + " | ".join(extra_after[:8])
+                                + (f" | ... (+{len(extra_after)-8} more)" if len(extra_after) > 8 else "")
+                            )
+                        if pricelist_after_mismatch:
+                            details.append(
+                                f"Pricelist mismatch after repair (expected={desired_pricelist_id}, got={pricelist_after})"
+                            )
+                        push_log({
+                            "Timestamp": now,
+                            "Status": "ERROR",
+                            "Reference": reference,
+                            "PostOrder": post_order,
+                            "TransactionDate": transaction_date,
+                            "CustomerRecordNumber": customer_record,
+                            "CustomerOdooId": customer_odoo_id,
+                            "OrderOdooId": str(order_id),
+                            "OrderState": state_after,
+                            "OrderPath": order_path,
+                            "LineCount": str(len(prepared_lines)),
+                            "Details": "; ".join(details),
+                        })
+                        if not continue_on_error:
+                            break
+                    else:
+                        mismatch_labels: List[str] = []
+                        if missing:
+                            mismatch_labels.append("missing_sku_lines")
+                        if extra:
+                            mismatch_labels.append("extra_sku_lines")
+                        if pricelist_mismatch:
+                            mismatch_labels.append("pricelist_mismatch")
+                        deleted_pickings = 0
+                        kept_pickings = 0
+                        if confirmed:
+                            deleted_pickings, kept_pickings = _cleanup_cancelled_pickings_for_order(
+                                client, order_id
+                            )
+                        order_path = ""
+                        if order_state not in {"draft", "sent"} and confirmed:
+                            order_path = "ORDER > CANCEL > QUOTE > ORDER"
+                        elif confirmed:
+                            order_path = "QUOTE > ORDER"
+                        push_log({
+                            "Timestamp": now,
+                            "Status": "OK_UPDATE_WARN",
+                            "Reference": reference,
+                            "PostOrder": post_order,
+                            "TransactionDate": transaction_date,
+                            "CustomerRecordNumber": customer_record,
+                            "CustomerOdooId": customer_odoo_id,
+                            "OrderOdooId": str(order_id),
+                            "OrderState": ("sale" if confirmed else state_after),
+                            "OrderPath": order_path,
+                            "LineCount": str(len(prepared_lines)),
+                            "Details": (
+                                (
+                                    f"Content repaired from detected mismatch ({', '.join(mismatch_labels)}): {', '.join(repaired_fields)}"
+                                    + ("; confirmed" if confirmed else "")
+                                )
+                                + (
+                                    (
+                                        f"; removed canceled deliveries={deleted_pickings}"
+                                        + (f"; canceled deliveries kept={kept_pickings}" if kept_pickings else "")
+                                    )
+                                    if confirmed and (deleted_pickings or kept_pickings)
+                                    else ""
+                                )
+                            ),
+                        })
+                except Exception as exc:
+                    order_path = ""
+                    if order_state not in {"draft", "sent"}:
+                        order_path = "ORDER > CANCEL > QUOTE"
+                    push_log({
+                        "Timestamp": now,
+                        "Status": "ERROR",
+                        "Reference": reference,
+                        "PostOrder": post_order,
+                        "TransactionDate": transaction_date,
+                        "CustomerRecordNumber": customer_record,
+                        "CustomerOdooId": customer_odoo_id,
+                        "OrderOdooId": str(order_id),
+                        "OrderState": order_state,
+                        "OrderPath": order_path,
+                        "LineCount": str(len(prepared_lines)),
+                        "Details": f"Content repair failed: {exc}",
+                    })
+                    if not continue_on_error:
+                        break
+            elif has_content_issues:
+                details = []
+                if missing_item_records:
+                    uniq = sorted(set(missing_item_records))
+                    details.append(
+                        "Missing SKU mapping from Sage ItemRecordNumber: "
+                        + ", ".join(uniq[:10])
+                        + (f" ... (+{len(uniq)-10} more)" if len(uniq) > 10 else "")
+                    )
+                if missing:
+                    details.append(
+                        "Missing in Odoo: "
+                        + " | ".join(missing[:8])
+                        + (f" | ... (+{len(missing)-8} more)" if len(missing) > 8 else "")
+                    )
+                if extra:
+                    details.append(
+                        "Extra in Odoo: "
+                        + " | ".join(extra[:8])
+                        + (f" | ... (+{len(extra)-8} more)" if len(extra) > 8 else "")
+                    )
+                if pricelist_mismatch:
+                    details.append(
+                        f"Pricelist mismatch expected={desired_pricelist_id} got={current_pricelist_id}"
+                    )
+                push_log({
+                    "Timestamp": now,
+                    "Status": "ERROR",
+                    "Reference": reference,
+                    "PostOrder": post_order,
+                    "TransactionDate": transaction_date,
+                    "CustomerRecordNumber": customer_record,
+                    "CustomerOdooId": customer_odoo_id,
+                    "OrderOdooId": str(order_id),
+                    "OrderState": order_state,
+                    "LineCount": str(len(prepared_lines)),
+                    "Details": "; ".join(details),
+                })
+                if not continue_on_error:
+                    break
+            else:
+                push_log({
+                    "Timestamp": now,
+                    "Status": "NO_CHANGES",
+                    "Reference": reference,
+                    "PostOrder": post_order,
+                    "TransactionDate": transaction_date,
+                    "CustomerRecordNumber": customer_record,
+                    "CustomerOdooId": customer_odoo_id,
+                    "OrderOdooId": str(order_id),
+                    "OrderState": order_state,
+                    "LineCount": str(len(prepared_lines)),
+                    "Details": "Content verified (SKU/qty)",
+                })
+            created += 1
+            continue
 
         pricelist_id = (customer_sync.get("OdooPricelistId") or "").strip()
         term_name = (h.get("TermsDescription") or "").strip()
@@ -1846,7 +2436,7 @@ def run(args: argparse.Namespace) -> int:
                         missing_vid = m.group(1) if m else "?"
                         exc_text = (
                             f"Missing Odoo variant id {missing_vid} (deleted in Odoo). "
-                            "Run refresh_odoo + sync to rebuild products_sync and retry this order."
+                            "Run refresh_odoo to rebuild items_odoo and retry this order."
                         )
                     push_log({
                         "Timestamp": now,
@@ -1927,7 +2517,7 @@ def run(args: argparse.Namespace) -> int:
                         missing_vid = m.group(1) if m else "?"
                         exc_text = (
                             f"Missing Odoo variant id {missing_vid} (deleted in Odoo). "
-                            "Run refresh_odoo + sync to rebuild products_sync and retry this order."
+                            "Run refresh_odoo to rebuild items_odoo and retry this order."
                         )
                     push_log({
                         "Timestamp": now,

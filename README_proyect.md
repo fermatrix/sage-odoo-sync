@@ -156,6 +156,25 @@
   - Replication-first policy: keep Sage `ShipVia` values exactly as historical data.
   - If shipping line exists, append method in shipping line description.
   - If shipping line does not exist, add an Odoo note line with shipping method.
+- **Shipping address resolution hardening (Apr 18):**
+  - Added `--shipping-relaxed` mode for controlled tolerance on address matching (`#` vs `SUITE/STE`, state code/name parity).
+  - Added `--create-shipping-address` to create missing `delivery` addresses on-the-fly in Odoo when required by business scenarios.
+  - Improved console logging to display shipping mismatches in a human-readable format (Sage target vs Odoo candidate).
+- **Special Sales Order lines (Apr 18):**
+  - `BOGO TRANSACTION` is now imported as a top `line_note` (not as a product line), preserving the business marker for commissions.
+  - `Freight Amount` rows from Sage with `ItemRecordNumber = 0` are now converted into real Odoo order lines using the `Freight` service product.
+  - Added freight configuration flags to the API flow (`--freight-variant-id`, `--freight-product-name`) to avoid total mismatch false positives.
+- **One-shot billing contacts review file for data cleanup (Apr 18):**
+  - Generated consolidated Odoo billing contacts review base for ERKERS:
+    - `ENZO-Sage50/_master/odoo_UPDATE/20260418_billing_contacts_odoo_review.xlsx`
+    - `ENZO-Sage50/_master/odoo_UPDATE/20260418_billing_contacts_odoo_review.csv`
+  - Includes parent company identification (`ParentCompanyName`, `ParentCompanyOdooId`), contact IDs, and `NeedsEmailUpdate` flag to facilitate Sage corrections before re-sync.
+  - Summary: **3,784** billing contacts in Odoo; **1,389** missing email.
+- **Capacity/timeline proposal sent to client (Apr 18):**
+  - Fernando communicated that April had already reached the contracted **35h/month** allocation.
+  - Proposal shared:
+    - If targeting **June go-live**: increase to **70h/month** for April, May and June, with a monthly fee of **€3,400**.
+    - If keeping current monthly fee: set a more realistic go-live target around **September**.
 - **Tax analysis for Sales Orders:**
   - Identified tax-line cases (`SALES TAX`, authority code `SO`) causing header/line total mismatches in strict mode.
   - Confirmed need for explicit strategy to replicate Sage tax lines in Odoo without double taxation.

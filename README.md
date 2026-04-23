@@ -244,14 +244,14 @@ Flags CLI (`sync_sales_orders_api.py`):
 - `--headers-path`: CSV de headers (modo manual, sin `--load`).
 - `--lines-path`: CSV de líneas (modo manual, sin `--load`).
 - `--customers-sync`: ruta a `customers_sync.csv`.
-- `--products-sync`: ruta a `products_sync.csv`.
+- `--products-sync`: **deprecated/ignorado** en este script.
 - `--employees-sync`: ruta a `employees_sync.csv`.
 - `--load`: auto-descubre ficheros de sales orders por periodo/fecha. Formatos:
   - `DD/MM/YYYY`
   - `MM/YYYY`
   - `YYYY` (año fiscal Sage: Febrero -> Enero siguiente)
   - rango `inicio-fin` (ej: `02/02/2026-03/02/2026`, `02/2026-03/02/2026`)
-- `--reference`: procesa solo una SO de Sage (ej: `357702`).
+- `--reference`: procesa una o varias SO de Sage separadas por coma (ej: `357702` o `357702,357703`).
 - `--limit`: límite de procesado:
   - `N` = primeras `N` candidatas
   - `start,count` = empieza en ordinal `start` y procesa `count` (ej: `12,1`)
@@ -272,11 +272,21 @@ Flags CLI (`sync_sales_orders_api.py`):
   - Usa paridades de `state/country` (`_master/_parity_state.csv`, `_master/_parity_country.csv`) para mapear correctamente.
 - `--freight-variant-id`: `product.product` ID para usar en líneas de `Freight Amount`/`Shipping` de Sage cuando vienen con `ItemRecordNumber=0`.
 - `--freight-product-name`: fallback por nombre para localizar el producto de freight si no se indica `--freight-variant-id`. Default: `Freight`.
+- `--content-verify`: verifica contenido de SO existentes en Odoo contra Sage (SKU/qty por línea) sin crear/actualizar.
+- `--content-repair`: repara automáticamente diferencias detectadas por `--content-verify`:
+  - reabre `ORDER` -> `CANCEL` -> `QUOTE`
+  - actualiza `order_lines` y/o `pricelist_id`
+  - vuelve a confirmar (`QUOTE -> ORDER`) si pasan validaciones críticas.
+  - Si se usa `--content-repair` sin `--content-verify`, el script activa verify automáticamente.
+- `--items-odoo`: **deprecated/ignorado** en este script.
 
 Notas operativas de flags:
 - Cualquier flag desconocido hace que el script falle inmediatamente (comportamiento estándar de `argparse`).
 - Si se usa `--load`, el script ignora `--headers-path` y `--lines-path` para ese run.
+- `sync_sales_orders_api.py` no usa `products_sync.csv` ni `items_odoo.csv` para mapear líneas.
+  - Mapea por `items.csv` (Sage) + consulta live de productos en Odoo (`default_code`).
 - `--gaps --skip` = reintenta huecos y continúa aunque haya errores, para revisar todos en una pasada.
+- `--content-repair` no necesita `--skip` para funcionar; `--skip` solo controla si continúa tras un error.
 - Re-ejecución estricta (sin `--shipping-relaxed`) sobre SO ya existente:
   - Si no hay match exacto nuevo de shipping pero la SO ya tiene `partner_shipping_id` en Odoo, se preserva ese shipping y no se bloquea la orden.
   - En ese caso se registra warning: `Shipping preserved from existing Odoo order (strict mode)`.
@@ -289,11 +299,17 @@ Modo estricto (por defecto):
 
 Log de ejecución:
 - `ENZO-Sage50/_master/orders_api_log.csv`
-- Estados principales: `OK`, `OK_WARN`, `SKIP`, `ERROR`, `DRY_RUN`, `DRY_RUN_WARN`.
+- Estados principales: `OK`, `OK_WARN`, `OK_UPDATE`, `OK_UPDATE_WARN`, `NO_CHANGES`, `NO_CHANGES_WARN`, `ERROR`, `DRY_RUN`, `DRY_RUN_WARN`, `DRY_RUN_UPDATE`, `DRY_RUN_UPDATE_WARN`.
+- Campo `OrderPath` (nuevo) muestra la transición real de estado cuando aplica:
+  - `QUOTE > ORDER`
+  - `ORDER > CANCEL > QUOTE`
+  - `ORDER > CANCEL > QUOTE > ORDER`
 
 Validaciones implementadas:
 - Match de customer (`CustVendId` -> `customers_sync.csv` -> `OdooId`).
-- Match de producto por línea (`ItemRecordNumber` -> `products_sync.csv` -> `OdooVariantId`).
+- Match de producto por línea:
+  - `items.csv` (Sage master) + lookup live en Odoo por `default_code` (SKU).
+  - no usa `products_sync.csv`.
 - Intento de match de términos de pago (`TermsDescription` de Sage con `account.payment.term` de Odoo).
 - Control de totales (`MainAmount` vs total de líneas preparadas).
 - Si hay inconsistencias, la order se puede crear igual en draft y se marca como `OK_WARN`.
@@ -301,6 +317,21 @@ Validaciones implementadas:
 - Caso especial `EmpRecordNumber = 0`:
   - No se bloquea la SO por falta de rep.
   - Se limpia explícitamente el salesperson en Odoo (`user_id = False`).
+
+Validaciones antes de confirmar en `--content-repair`:
+- Se aplican las mismas precauciones que en creación/update:
+  - `total mismatch`
+  - líneas con mapping de producto inválido
+  - variantes borradas/no válidas
+  - tax de Sage sin mapping en Odoo
+- Si falla alguna validación:
+  - no se confirma
+  - la SO queda en `QUOTE`
+  - log: `Repair blocked before confirmation (left as QUOTE): ...`
+
+Limpieza de deliveries en `--content-repair`:
+- Después de reparar y confirmar, se eliminan automáticamente `stock.picking` cancelados duplicados de esa SO cuando ya existe una delivery activa.
+- Objetivo: evitar quedar con una entrega activa + otra cancelada duplicada tras el ciclo `ORDER -> CANCEL -> QUOTE -> ORDER`.
 
 Fechas en Odoo (estado actual):
 - `date_order` = `TransactionDate` (Sage).
@@ -335,6 +366,50 @@ Importante (modelo Odoo):
 - El campo `Ship To` en `sale.order` no es texto libre.
 - Odoo requiere una dirección/contacto real en `res.partner` (`partner_shipping_id`); no se puede “escribir a pelo” una dirección nueva en la orden.
 
+### Delivery Orders API Sync (draft)
+Script nuevo:
+- `sync_delivery_orders_api.py`
+
+Objetivo:
+- Generar/validar `stock.picking` (delivery orders) en Odoo a partir de `invoice.csv` + `invoice_lines.csv` de Sage.
+- Regla funcional validada con Ally: **cada invoice de Sage representa una delivery**.
+- Trazabilidad: se mantiene el código de Odoo en `stock.picking.name` y se guarda la referencia Sage en `stock.picking.note` como:
+  - `Sage Invoice: <InvoiceRef>`
+
+Comando base:
+```
+python sync_delivery_orders_api.py --load 02/2026 --dry-run --limit 20
+```
+
+Flags principales:
+- `--load`: igual que Sales Orders (`DD/MM/YYYY`, `MM/YYYY`, `YYYY`, rangos).
+- `--reference`: una o varias Sales Orders de Sage separadas por coma.
+- `--limit`, `--offset`: igual que Sales Orders.
+- `--skip`: continuar tras errores.
+- `--dry-run`: simula sin validar deliveries en Odoo.
+- `--validate`: valida (marca enviada) la delivery tras aplicar cantidades.
+  - Por defecto **NO** valida (prepara la delivery sin marcarla como enviada).
+- `--items-master`: mapping `ItemRecordNumber -> ItemID` desde Sage master.
+
+Flujo actual:
+- Recorre invoices del periodo (`invoice.csv`) y agrupa por `INV_POSOOrderNumber`.
+- Esto permite procesar invoices de meses posteriores para Sales Orders creadas en meses anteriores.
+- Verifica que la SO existe y está confirmada en Odoo.
+- Busca **picking abierto existente** de esa SO (no crea deliveries nuevas).
+- Aplica cantidades de invoice por SKU sobre `stock.move.quantity`.
+- Si se usa `--validate`, valida picking (manejando wizards de immediate transfer / backorder).
+- Escribe la referencia de invoice Sage en `stock.picking.note`.
+- Asigna `carrier_id` en la delivery con acuerdo a `ShipVia` de la Sales Order (si existe mapping en `delivery.carrier`).
+- Las invoices de una misma SO se procesan en orden para respetar parciales/backorders:
+  - por `TransactionDate`
+  - luego por sufijo de invoice (`-A`, `-B`, ... `-Z`)
+- Ignora filas técnicas duplicadas en `invoice_lines` (`JournalRowEx=0` y `Amount=0`) para no inflar cantidades.
+- Cuando la invoice ya está vinculada por note:
+  - sin `--validate`: `NO_CHANGES`.
+  - con `--validate`: valida la misma picking si está pendiente (incluye contexto `skip_sms` para evitar wizard SMS).
+- Log de delivery muestra estado legible:
+  - `Already linked to picking WHMO/OUT/xxxxx delivered|not delivered (SAGE <invoice>)`
+
 BOGO Transaction (líneas de SO):
 - Cuando en Sage aparece `BOGO TRANSACTION` (incluyendo `ItemRecordNumber=8521`), no se trata como línea de producto.
 - Se crea una `line_note` en Odoo con ese mismo texto y se coloca al principio de las líneas de la SO.
@@ -346,6 +421,53 @@ Freight Amount (líneas técnicas de Sage):
 
 Limitación conocida:
 - Sin un `AddressRecordNumber` explícito en la Order de Sage, shipping/billing se resuelven por la mejor coincidencia disponible (no perfecto, pero actualmente es el mejor criterio operativo).
+
+### Invoice API Sync (draft)
+Script nuevo:
+- `sync_invoice_api.py`
+
+Objetivo:
+- Crear/actualizar facturas de cliente (`account.move`, `move_type=out_invoice`) en Odoo a partir de invoices de Sage.
+- Regla operativa: **una invoice de Sage = una invoice de Odoo**, ligada a su delivery correspondiente.
+- Las facturas se dejan en **draft** (no se confirman/postean).
+
+Comando base:
+```
+python sync_invoice_api.py --load 02/2026 --limit 10
+```
+
+Flujo actual:
+- Recorre invoices de Sage por `--load`, con `--reference`, `--limit`, `--offset`.
+- Verifica SO en Odoo y que esté confirmada (`sale/done`).
+- Verifica que exista delivery vinculada por `Sage Invoice: <ref>` y que esté `done`.
+- Crea líneas de factura con vínculo real a `sale.order.line` (`sale_line_ids`) y `product_id` real (no texto libre).
+- Solo factura cantidades disponibles: `qty_delivered - qty_invoiced`.
+- Replica notas operativas de SO en invoice como `line_note`:
+  - `Shipping Method: ...`
+  - `BOGO ...`
+- Añade `Freight` cuando Sage trae `Freight Amount` (`ItemRecordNumber=0` + descripción freight).
+- Ignora filas técnicas de Sage con `Amount=0` para evitar duplicados/sombras.
+
+Validaciones y autocorrección:
+- Compara total Sage (`MainAmount`) vs total Odoo (`amount_total`).
+- Si hay mismatch:
+  - factura existente `draft`: se repara en sitio (reconstruye líneas), no se borra.
+  - factura existente `posted`: error (no se toca automáticamente).
+  - factura nueva creada con mismatch: error (no se confirma y se informa en log).
+- En facturas existentes, sincroniza también:
+  - `invoice_user_id` (Sales Person)
+  - `team_id` (Sales Team)
+- Normaliza líneas de freight existentes a nombre `Freight`.
+
+Campos relevantes:
+- Número Sage preservado en factura Odoo:
+  - `name = <Sage Invoice Ref>`
+  - `ref = <Sage Invoice Ref>`
+- No se escribe `Sage Invoice: ...` en `Terms and Conditions` (`narration`).
+
+Formato de log:
+- Header compacto: `SO/Invoice <ref>` cuando SO e invoice comparten referencia.
+- En detalle, una línea por delivery de la SO para visibilidad de parciales/backorders.
 
 Orden de procesado:
 - Cronológico real: `TransactionDate` ascendente (y desempate por `Reference`, `PostOrder`).

@@ -2,7 +2,7 @@ import argparse
 import csv
 import os
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from difflib import SequenceMatcher
 from collections import defaultdict
 
@@ -1545,7 +1545,7 @@ def sync_local(args: argparse.Namespace) -> int:
     if os.path.exists(parity_path):
         _, parity_rows = read_csv(parity_path)
         for p in parity_rows:
-            level = (p.get("sage_price_level") or "").strip()
+            level = (p.get("sage_price_level") or p.get("\ufeffsage_price_level") or "").strip()
             if not level:
                 continue
             pname = (p.get("odoo_pricelist_name") or "").strip()
@@ -1555,6 +1555,20 @@ def sync_local(args: argparse.Namespace) -> int:
                 "id": (p.get("odoo_pricelist_id") or "").strip(),
                 "name": pname,
             }
+
+    def _resolve_price_level_for_parity(raw_level: str) -> Tuple[str, bool]:
+        level = (raw_level or "").strip()
+        if not level:
+            return "", False
+        if level in pricelist_parity:
+            return level, True
+        # Sage customers store PriceLevel as 0-based index (0..9),
+        # while parity file is maintained as UI levels (1..10).
+        if level.isdigit():
+            shifted = str(int(level) + 1)
+            if shifted in pricelist_parity:
+                return shifted, True
+        return level, False
 
     def _norm_text(value: str) -> str:
         return " ".join((value or "").strip().upper().split())
@@ -1580,6 +1594,10 @@ def sync_local(args: argparse.Namespace) -> int:
         return _norm_text(raw)
 
     def _customer_mismatches(row: Dict[str, str], record: Dict[str, str]) -> List[str]:
+        # Inactive Sage customers are excluded from UPDATE exports;
+        # avoid flagging them as mismatches to keep sync output actionable.
+        if (row.get("CustomerIsInactive") or "").strip() == "1":
+            return []
         checks = [
             ("name", row.get("Customer_Bill_Name", ""), record.get("OdooName", "")),
             ("reference", row.get("CustomerID", ""), record.get("OdooRef", "")),
@@ -1594,7 +1612,12 @@ def sync_local(args: argparse.Namespace) -> int:
             mismatches.append("phone")
         expected_pricelist = _normalize_pricelist_name(row.get("ExpectedOdooPricelist", ""))
         odoo_pricelist = _normalize_pricelist_name(record.get("OdooPricelist", ""))
-        if expected_pricelist:
+        level_parity_found = (row.get("_PriceLevelParityFound") or "").strip() == "1"
+        if level_parity_found:
+            # Exact parity expected (including explicit "no pricelist").
+            if expected_pricelist != odoo_pricelist:
+                mismatches.append("pricelist")
+        elif expected_pricelist:
             if not odoo_pricelist or expected_pricelist != odoo_pricelist:
                 mismatches.append("pricelist")
         return mismatches
@@ -1636,10 +1659,11 @@ def sync_local(args: argparse.Namespace) -> int:
                 record = matches[0]
                 match_source = "name"
         row["LastLookupAt"] = now
-        level = (row.get("PriceLevel") or "").strip()
-        expected = pricelist_parity.get(level, {})
+        level_key, level_parity_found = _resolve_price_level_for_parity(row.get("PriceLevel", ""))
+        expected = pricelist_parity.get(level_key, {})
         row["ExpectedOdooPricelistId"] = expected.get("id", "")
         row["ExpectedOdooPricelist"] = expected.get("name", "")
+        row["_PriceLevelParityFound"] = "1" if level_parity_found else "0"
         if record:
             strict_match = match_source in {"id", "ref", "ref_name", "ref_external"}
             if strict_match:
@@ -1665,17 +1689,36 @@ def sync_local(args: argparse.Namespace) -> int:
         if row.get("OdooVariantId"):
             existing = odoo_item_by_id.get(str(row.get("OdooVariantId")).strip())
             if existing:
-                if not row.get("OdooColor"):
-                    row["OdooColor"] = existing.get("OdooColor", "") or ""
-                if not row.get("OdooName"):
-                    row["OdooName"] = existing.get("OdooName", "") or ""
-                if not row.get("OdooTemplateId"):
-                    row["OdooTemplateId"] = existing.get("OdooTemplateId", "") or ""
-                if not row.get("OdooVariantExternalId"):
-                    row["OdooVariantExternalId"] = existing.get("OdooVariantExternalId", "") or ""
-                if not row.get("OdooTemplateExternalId"):
-                    row["OdooTemplateExternalId"] = existing.get("OdooTemplateExternalId", "") or ""
-                continue
+                # Validate stale variant links: variant id can still exist in Odoo but now
+                # belong to a different SKU after product maintenance/reimports.
+                item_id = (row.get("ItemID") or "").strip().upper()
+                existing_code = (existing.get("OdooItemCode") or "").strip().upper()
+                existing_template_short = _short_external_name(existing.get("OdooTemplateExternalId", ""))
+                code_matches = bool(item_id) and bool(existing_code) and item_id == existing_code
+                template_matches = bool(item_id) and item_id == existing_template_short
+                if item_id and not (code_matches or template_matches):
+                    row["OdooVariantId"] = ""
+                    row["OdooVariantExternalId"] = ""
+                    row["OdooTemplateId"] = ""
+                    row["OdooTemplateExternalId"] = ""
+                    row["OdooName"] = ""
+                    row["OdooColor"] = ""
+                    row["OdooItemCode"] = ""
+                    # continue to rematch by code/template below
+                else:
+                    if not row.get("OdooColor"):
+                        row["OdooColor"] = existing.get("OdooColor", "") or ""
+                    if not row.get("OdooName"):
+                        row["OdooName"] = existing.get("OdooName", "") or ""
+                    if not row.get("OdooTemplateId"):
+                        row["OdooTemplateId"] = existing.get("OdooTemplateId", "") or ""
+                    if not row.get("OdooVariantExternalId"):
+                        row["OdooVariantExternalId"] = existing.get("OdooVariantExternalId", "") or ""
+                    if not row.get("OdooTemplateExternalId"):
+                        row["OdooTemplateExternalId"] = existing.get("OdooTemplateExternalId", "") or ""
+                    if not row.get("OdooItemCode"):
+                        row["OdooItemCode"] = existing.get("OdooItemCode", "") or ""
+                    continue
             # Stale OdooVariantId (record deleted/recreated in Odoo): clear and rematch by code/template.
             row["OdooVariantId"] = ""
             row["OdooVariantExternalId"] = ""
@@ -1692,6 +1735,7 @@ def sync_local(args: argparse.Namespace) -> int:
         if len(matches) == 1:
             record = matches[0]
             row["OdooVariantId"] = str(record.get("OdooVariantId", ""))
+            row["OdooItemCode"] = record.get("OdooItemCode", "") or ""
             row["OdooName"] = record.get("OdooName", "") or ""
             row["OdooColor"] = record.get("OdooColor", "") or ""
             row["OdooTemplateId"] = record.get("OdooTemplateId", "") or ""
@@ -2244,7 +2288,7 @@ def build_pricelist_lines(args: argparse.Namespace) -> int:
     parity_map = {}
     _, parity_rows = read_csv(parity_pricelist_path)
     for r in parity_rows:
-        level = (r.get("sage_price_level") or "").strip()
+        level = (r.get("sage_price_level") or r.get("\ufeffsage_price_level") or "").strip()
         if not level:
             continue
         parity_map[level] = r
