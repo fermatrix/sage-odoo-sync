@@ -108,6 +108,116 @@ Otras tablas de items (no usadas por ahora):
 - `InventoryChains`
 - `InventoryCosts`
 
+### Tabla `LineItem` / `items.csv` (campos clave)
+Verificación sobre:
+- `ENZO-Sage50/_master_sage/items.csv`
+
+Equivalencias funcionales (Sage UI -> export ODBC):
+- `Item ID` -> `ItemID`
+- `Description` -> `ItemDescription`
+- `Item Class` -> `ItemClass`
+- `Inactive` -> `ItemIsInactive`
+- `Subject to Commission` -> `HasCommission`
+
+Apartado **General**:
+- `Description for Sales` -> `SalesDescription`
+- `Description for Purchases` -> `PurchaseDescription`
+- `GL Sales Acct` -> `SaleAcctRecordNumber`
+- `GL Inventory Acct` -> `InvAcctRecordNumber`
+- `GL Cost of Sales Acct` -> `COGSAcctRecordNumber`
+- `Item Tax Type` -> `TaxFlag`
+- `Weight` -> `Weight`
+- `Last Unit Cost` -> no aparece con nombre literal en `items.csv` (no confirmado en esta extracción)
+
+Apartado **Custom Fields**:
+- `1.COLLECTION` -> `CustomField1`
+- `2.MODEL` -> `CustomField2`
+- `3.COLOR` -> `CustomField3`
+- `4.RELEASE DATE` -> `CustomField4`
+- `5.GENDER` -> `CustomField5`
+
+Nota de calidad de dato:
+- Los `CustomField1..5` existen en la tabla, pero su contenido puede no estar siempre normalizado/cargado en el campo esperado.
+
+### Tabla `Customers` / `customers.csv` (campos clave)
+Verificación sobre:
+- `ENZO-Sage50/_master_sage/customers.csv`
+
+Pestaña **General** (Customizable Fields):
+- `1. VARA NUMBER` -> `CustomField1`
+- `2. DISCOUNT` -> `CustomField2`
+- `3. Statement EMAIL` -> `CustomField3`
+- `4. 2ND CREDIT CARD` -> `CustomField4`
+- `5. CREDIT CARD INFO` -> `CustomField5`
+
+Pestaña **Sales Info**:
+- `Sales Rep` -> `EmpRecordNumber`
+- `GL Sales Account` -> `GLAcntNumber`
+- `Open PO Number` -> `OpenPO`
+- `Ship Via` -> `WhichShipVia`
+- `Resale Number` -> `SalesTaxResaleNum`
+- `Pricing Level` -> `PriceLevel`
+- `Batch Delivery Method (Printed Form / Email)` -> `FlagsFormDelivery`
+
+Pestaña **History / Sales Info**:
+- `Customer Since` -> `CustomerSince`
+
+Pestaña **Payment & Credit**:
+- `Cardholder Name` -> `Cardholder_Name`
+- `Address Line 1` -> `Cardholder_Address1`
+- `Address Line 2` -> `Cardholder_Address2`
+- `City` -> `Cardholder_City`
+- `ST` -> `Cardholder_State`
+- `Zip` -> `Cardholder_ZIP`
+- `Country` -> `Cardholder_Country`
+- `Credit Card Number` -> `CcMaskedNumber` (enmascarado)
+- `Expiration Date` -> `CcExpireDate`
+- `ACH / Bank Account No` -> `MaskedBankAcctNum` (enmascarado)
+- `Use payment method and cash account from default setting` -> `UsePMAndCAPaymentDef`
+- `Payment method` -> `DefaultPaymentMethod`
+- `Cash account` -> `DefCashAcct_RecNum`
+
+Notas:
+- En `customers.csv` también aparecen referencias tokenizadas a pasarelas (`CcStoredAcctRef`, `ACHStoredAcctRef`), sin exponer PAN completo ni cuenta bancaria completa.
+- `PriceLevel` (Sage) se usa en nuestros procesos para mapear a la Pricelist de Odoo según parities.
+
+### Defaults de SAGE (Customer) confirmados por negocio
+Valores por defecto observados en Sage (pantalla de configuración de cliente):
+
+`TERMS AND CREDIT`
+- `Standard Terms`: `Due in a number of days`
+- `Net due in`: `30 days`
+- `Credit Limit`: `2,500`
+- `Credit Status`: `Notify over limit`
+- `Discount in`: `0 days`
+- `Discount Percent`: `0.00`
+- `GL Sales Account`: `800-4110 (SALES FRAMES)`
+- `Discount GL Account`: `800-4114 (DISCOUNT FRAMES)`
+- `Cash Account`: `800-1000 (BUSEY BANK 227-0000202)`
+
+`ACCOUNT AGING`
+- `Age Invoices by`: `Due date`
+- `Aging categories`:
+- `1st Column`: `30 days` -> `0-30`
+- `2nd Column`: `60 days` -> `31-60`
+- `3rd Column`: `90 days` -> `61-90`
+- `4th Column`: `Over 90 days`
+
+`FINANCE CHARGES`
+- Texto mostrado en invoice/statement: `Late Charge`
+- Regla: `Overdue invoices are subject to finance charges`
+
+`PAY METHODS`
+- `1`: `Cash`
+- `2`: `Check`
+- `3`: `VISA`
+- `4`: `MasterCard`
+- `5`: `AMEX`
+- `6`: `Discover`
+
+`Receipts`
+- `Assign Deposit Ticket IDs`: `In Receipts`
+
 ### Sage 50 Data (.DAT) Files (ODBC/Crystal Reports)
 Fuente: lista de archivos .DAT disponibles en Sage 50 (para Crystal/ODBC).  
 Hemos marcado si ya los hemos descargado por ODBC (**Sí**) o no (**No**).
@@ -216,6 +326,52 @@ Extracción generada (2026-02/03/04):
 - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_money_received.csv`
 - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_money_received_apply_to_invoices.csv`
 - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_money_received_apply_to_revenue.csv`
+
+### Accounting Extracts (Chart + Daily Ledger)
+Nuevas descargas contables realizadas:
+
+- Master Sage (Chart of Accounts):
+  - `ENZO-Sage50/_master_sage/chart_of_accounts.csv`
+
+- Daily Ledger por mes (headers + lines):
+  - `ENZO-Sage50/13_2026/01_02_Feb/2026_02_daily_ledger_headers.csv`
+  - `ENZO-Sage50/13_2026/01_02_Feb/2026_02_daily_ledger_lines.csv`
+  - `ENZO-Sage50/13_2026/02_03_Mar/2026_03_daily_ledger_headers.csv`
+  - `ENZO-Sage50/13_2026/02_03_Mar/2026_03_daily_ledger_lines.csv`
+  - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_daily_ledger_headers.csv`
+  - `ENZO-Sage50/13_2026/03_04_Apr/2026_04_daily_ledger_lines.csv`
+
+Comandos usados (remoto, vía jobs `odbc_query_runner.exe`):
+- Headers (ejemplo mes):
+  - `SELECT * FROM JrnlHdr WHERE TransactionDate >= {d 'YYYY-MM-01'} AND TransactionDate < {d 'YYYY-MM-01(next)'}`
+- Lines enlazadas a esos headers:
+  - `SELECT r.* FROM JrnlRow r INNER JOIN JrnlHdr h ON r.PostOrder = h.PostOrder WHERE h.TransactionDate >= {d 'YYYY-MM-01'} AND h.TransactionDate < {d 'YYYY-MM-01(next)'}`
+
+Importante (`odbc_query_runner.exe`):
+- El argumento de `--query` debe pasarse como **un único argumento** (entre comillas), por ejemplo:
+  - `--query`
+  - `"SELECT ..."`
+- Si no se cita así, el watcher/runner trocea la query y falla con:
+  - `unrecognized arguments: * FROM ...`
+
+Validación contable (ejemplo real Invoice `357697`):
+- Header en `JrnlHdr`:
+  - `Module = R`
+  - `Reference = 357697`
+  - `PostOrder = 505338`
+  - `MainAmount = 90,95`
+- Líneas en `JrnlRow` (`PostOrder=505338`):
+  - `GLAcntNumber=8` (`A/R-CUSTOMER`) -> `+90,95`
+  - `GLAcntNumber=187` (`SALES FRAMES - ERKERS 1879`) -> `-79,95`
+  - `GLAcntNumber=163` (`SHIPPING INCOME`) -> `-11,00`
+- Cuadre: `79,95 + 11,00 = 90,95`.
+
+Interpretación para Odoo:
+- El impacto contable relevante en Sage está en la **Invoice** (`Module=R`, `IncludeInGL=1`), no en la SO de origen.
+- La factura equivalente en Odoo debe cuadrar como:
+  - `Accounts Receivable` (debe) `90,95`
+  - `Product Sales` (haber) `79,95`
+  - `Freight/Shipping` (haber) `11,00`
 
 ### Sales Orders API Sync (draft)
 Script nuevo:
