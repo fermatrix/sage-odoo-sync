@@ -297,6 +297,7 @@ def refresh_sage(args: argparse.Namespace) -> int:
     out_customers.sort(key=lambda r: int(r["CustomerRecordNumber"]))
     out_items.sort(key=lambda r: int(r["ItemRecordNumber"]))
     out_vendors.sort(key=lambda r: int(r["VendorRecordNumber"]))
+    inactive_items = sum(1 for r in out_items if (r.get("ItemIsInactive") or "").strip() == "1")
 
     write_csv(customer_out, customer_fields, out_customers)
     write_csv(items_out, item_fields, out_items)
@@ -539,7 +540,7 @@ def refresh_sage(args: argparse.Namespace) -> int:
         wb_min.save(customers_new_min_xlsx)
 
     print(f"OK: customers sync rows: {len(out_customers)} -> {customer_out}")
-    print(f"OK: products sync rows: {len(out_items)} -> {items_out}")
+    print(f"OK: products sync rows: {len(out_items)} -> {items_out} (inactive from Sage: {inactive_items})")
     print(f"OK: vendors sync rows: {len(out_vendors)} -> {vendors_out}")
     return 0
 
@@ -568,6 +569,10 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     os.makedirs(os.path.dirname(vendors_out), exist_ok=True)
 
     batch = args.batch_size
+    chart_out = args.chart_out
+    if not os.path.isabs(chart_out):
+        chart_out = os.path.normpath(chart_out)
+    os.makedirs(os.path.dirname(chart_out), exist_ok=True)
 
     customer_fields = [
         "OdooId",
@@ -1263,6 +1268,78 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 })
             offset += len(rows)
     print(f"OK: odoo currencies exported -> {currencies_out}")
+
+    # Export Odoo chart of accounts (account.account)
+    try:
+        account_external_ids = _load_external_ids("account.account")
+        account_fields_requested = [
+            "id",
+            "code",
+            "name",
+            "account_type",
+            "deprecated",
+            "reconcile",
+            "company_id",
+            "currency_id",
+        ]
+        available_fields = client.models.execute_kw(
+            client.db,
+            client.uid,
+            client.apikey,
+            "account.account",
+            "fields_get",
+            [],
+            {"attributes": ["string", "type"]},
+        ) or {}
+        account_fields = [f for f in account_fields_requested if f in available_fields]
+        chart_fields = [
+            "OdooId",
+            "OdooExternalId",
+            "Code",
+            "Name",
+            "AccountType",
+            "Deprecated",
+            "Reconcile",
+            "CompanyId",
+            "CompanyName",
+            "CurrencyId",
+            "CurrencyName",
+        ]
+        with open(chart_out, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=chart_fields, delimiter=DELIMITER)
+            writer.writeheader()
+            offset = 0
+            while True:
+                rows = client.search_read(
+                    "account.account",
+                    [],
+                    account_fields,
+                    limit=batch,
+                    offset=offset,
+                )
+                if not rows:
+                    break
+                for r in rows:
+                    company = r.get("company_id") or []
+                    currency = r.get("currency_id") or []
+                    writer.writerow({
+                        "OdooId": r.get("id", ""),
+                        "OdooExternalId": account_external_ids.get(str(r.get("id", "")), ""),
+                        "Code": r.get("code", "") or "",
+                        "Name": r.get("name", "") or "",
+                        "AccountType": r.get("account_type", "") or "",
+                        "Deprecated": r.get("deprecated", ""),
+                        "Reconcile": r.get("reconcile", ""),
+                        "CompanyId": company[0] if isinstance(company, list) and company else "",
+                        "CompanyName": company[1] if isinstance(company, list) and len(company) > 1 else "",
+                        "CurrencyId": currency[0] if isinstance(currency, list) and currency else "",
+                        "CurrencyName": currency[1] if isinstance(currency, list) and len(currency) > 1 else "",
+                    })
+                offset += len(rows)
+        print(f"OK: odoo chart of accounts exported -> {chart_out}")
+    except Exception as e:
+        print(f"WARNING: failed to export Odoo chart of accounts -> {e}")
+
     # Export Odoo pricelist items (master + per-pricelist)
     pricelist_items_out = os.path.join(odoo_root, "pricelist_items_odoo.csv")
     pricelists_by_id = {}
@@ -3443,6 +3520,10 @@ def build_parser() -> argparse.ArgumentParser:
     p2.add_argument(
         "--vendors-out",
         default=r"ENZO-Sage50\_master_odoo\vendors_odoo.csv",
+    )
+    p2.add_argument(
+        "--chart-out",
+        default=r"ENZO-Sage50\_master_odoo\chart_of_accounts_odoo.csv",
     )
     p2.add_argument(
         "--env-file",

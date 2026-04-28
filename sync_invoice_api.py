@@ -2,6 +2,7 @@ import argparse
 from collections import defaultdict
 from datetime import date
 from typing import Dict, List, Optional, Tuple
+import re
 
 from sync_customers import get_env_value, load_env_file, read_csv
 from sync_delivery_orders_api import (
@@ -108,23 +109,37 @@ def _attach_invoice_status(detail_lines: List[str], invoice_status_text: str) ->
 
 
 def _existing_invoice_for_sage(client: OdooClient, so_ref: str, inv_ref: str) -> Optional[Dict[str, object]]:
+    # We keep Sage invoice number in Odoo invoice "name".
+    # Customer reference ("ref") is used for Sage PO number, so it cannot be
+    # used to identify invoices.
     rows = client.search_read(
         "account.move",
         [
             ("move_type", "=", "out_invoice"),
             ("invoice_origin", "=", so_ref),
-            ("ref", "=", inv_ref),
             ("state", "in", ["draft", "posted"]),
         ],
         ["id", "name", "state", "ref", "invoice_user_id", "team_id", "amount_total"],
-        limit=1,
+        limit=50,
         offset=0,
     )
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    ref_norm = (inv_ref or "").strip().upper()
+    for r in rows:
+        name_norm = str(r.get("name") or "").strip().upper()
+        old_ref_norm = str(r.get("ref") or "").strip().upper()
+        if name_norm == ref_norm or old_ref_norm == ref_norm:
+            return r
+    return None
 
 
 def _sage_invoice_total(inv_header: Dict[str, str]) -> float:
     return round(abs(parse_decimal(inv_header.get("MainAmount") or "")), 2)
+
+
+def _sage_customer_po(inv_header: Dict[str, str]) -> str:
+    return str(inv_header.get("PurchOrder") or "").strip()
 
 
 def _normalize_freight_line_labels(client: OdooClient, move_id: int, freight_product_id: int) -> bool:
@@ -181,13 +196,15 @@ def _build_invoice_line_commands(
     sku_to_product_info: Dict[str, Dict[str, object]],
     so_lines: List[Dict[str, object]],
     freight_product_id: int,
-) -> Tuple[List[Tuple[int, int, Dict[str, object]]], List[str]]:
+    allow_already_invoiced: bool = False,
+) -> Tuple[List[Tuple[int, int, Dict[str, object]]], List[str], List[str]]:
     errors: List[str] = []
     commands: List[Tuple[int, int, Dict[str, object]]] = []
+    sage_descriptions: List[str] = []
     post = (inv_header.get("PostOrder") or "").strip()
     src_rows = invoice_lines_by_postorder.get(post, [])
     if not src_rows:
-        return [], [f"No invoice lines found in Sage for PostOrder {post}"]
+        return [], [f"No invoice lines found in Sage for PostOrder {post}"], []
 
     so_by_product: Dict[int, List[Dict[str, object]]] = defaultdict(list)
     for line in so_lines:
@@ -237,19 +254,34 @@ def _build_invoice_line_commands(
             delivered = float(sol.get("qty_delivered") or 0.0)
             invoiced = float(sol.get("qty_invoiced") or 0.0)
             available = round(delivered - invoiced, 6)
+            if allow_already_invoiced and available <= 0:
+                # Resync mode for existing draft invoices: allow rebuilding
+                # lines from Sage even if SO line is already considered invoiced.
+                # This keeps product linkage but refreshes description/content.
+                available = remaining
             if available <= 0:
                 continue
             take = min(remaining, available)
             if take <= 0:
                 continue
             tax_ids = sol.get("tax_ids") or []
+            raw_desc = str(r.get("RowDescription") or sol.get("name") or "").strip()
+            paren_parts = re.findall(r"\([^()]*\)", raw_desc)
+            second_line = " | ".join([p.strip() for p in paren_parts if p.strip()])
+            line1 = raw_desc
+            for part in paren_parts:
+                line1 = line1.replace(part, " ")
+            line1 = re.sub(r"\s{2,}", " ", line1).strip()
+            line_desc = line1 or raw_desc
+            if second_line:
+                line_desc = f"{line_desc}\n{second_line}"
             commands.append(
                 (
                     0,
                     0,
                     {
                         "product_id": pid,
-                        "name": str(sol.get("name") or r.get("RowDescription") or "").strip(),
+                        "name": line_desc,
                         "quantity": float(take),
                         "price_unit": float(sol.get("price_unit") or 0.0),
                         "sale_line_ids": [(4, int(sol.get("id") or 0))],
@@ -257,6 +289,7 @@ def _build_invoice_line_commands(
                     },
                 )
             )
+            sage_descriptions.append(line_desc)
             remaining = round(remaining - take, 6)
             if remaining <= 0:
                 break
@@ -268,6 +301,7 @@ def _build_invoice_line_commands(
 
     # Freight lines in Sage usually come with ItemRecordNumber=0 and RowDescription='Freight Amount'.
     freight_total = 0.0
+    freight_desc = ""
     for r in src_rows:
         item_record = (r.get("ItemRecordNumber") or "").strip()
         if item_record not in {"", "0"}:
@@ -278,24 +312,32 @@ def _build_invoice_line_commands(
         amt = parse_decimal(r.get("Amount") or "")
         if abs(amt) <= 0.0001:
             continue
+        if not freight_desc:
+            freight_desc = str(r.get("RowDescription") or "").strip()
         freight_total += abs(amt)
     freight_total = round(freight_total, 2)
     if freight_total > 0:
         if freight_product_id <= 0:
             errors.append("Freight Amount found in Sage but FREIGHT product is missing in Odoo")
         else:
+            freight_label = (freight_desc or "Freight").strip()
+            # Sage often exports "Freight Amount"; in Odoo line description we
+            # keep it cleaner as just "Freight".
+            if freight_label.upper() == "FREIGHT AMOUNT":
+                freight_label = "Freight"
             commands.append(
                 (
                     0,
                     0,
                     {
                         "product_id": int(freight_product_id),
-                        "name": "Freight",
+                        "name": freight_label,
                         "quantity": 1.0,
                         "price_unit": float(freight_total),
                     },
                 )
             )
+            sage_descriptions.append(freight_label)
 
     # Carry key SO contextual notes into invoice (no accounting impact).
     so_notes = []
@@ -328,7 +370,52 @@ def _build_invoice_line_commands(
 
     if not commands and not errors:
         errors.append("No invoiceable lines generated")
-    return commands, errors
+    return commands, errors, sage_descriptions
+
+
+def _force_invoice_line_descriptions(
+    client: OdooClient,
+    move_id: int,
+    desired_descriptions: List[str],
+) -> bool:
+    """
+    Enforce Sage descriptions in invoice line Description (name).
+    Odoo can override line names from sale/product defaults; this forces the
+    final line label to match Sage export order.
+    """
+    if int(move_id or 0) <= 0 or not desired_descriptions:
+        return False
+    lines = client.search_read(
+        "account.move.line",
+        [("move_id", "=", int(move_id))],
+        ["id", "name", "display_type", "product_id"],
+        limit=500,
+        offset=0,
+    )
+    product_lines = [
+        ln for ln in sorted(lines, key=lambda x: int(x.get("id") or 0))
+        if str(ln.get("display_type") or "") in {"", "product"}
+        and isinstance(ln.get("product_id"), list)
+        and bool(ln.get("product_id"))
+    ]
+    changed = False
+    for i, desired in enumerate(desired_descriptions):
+        if i >= len(product_lines):
+            break
+        ln = product_lines[i]
+        current = str(ln.get("name") or "").strip()
+        target = str(desired or "").strip()
+        if target and current != target:
+            client.models.execute_kw(
+                client.db,
+                client.uid,
+                client.apikey,
+                "account.move.line",
+                "write",
+                [[int(ln["id"])], {"name": target}],
+            )
+            changed = True
+    return changed
 
 
 def _as_invoice_datetime(inv_date: str) -> str:
@@ -483,6 +570,7 @@ def run(args: argparse.Namespace) -> int:
                 changed_user_team = False
                 changed_freight_label = False
                 update_vals: Dict[str, object] = {}
+                customer_po = _sage_customer_po(inv)
                 so_user = so.get("user_id") or []
                 so_team = so.get("team_id") or []
                 inv_user = existing_inv.get("invoice_user_id") or []
@@ -495,6 +583,9 @@ def run(args: argparse.Namespace) -> int:
                     update_vals["invoice_user_id"] = so_user_id
                 if so_team_id and so_team_id != inv_team_id:
                     update_vals["team_id"] = so_team_id
+                current_ref = str(existing_inv.get("ref") or "").strip()
+                if current_ref != customer_po:
+                    update_vals["ref"] = customer_po or False
                 if update_vals:
                     client.models.execute_kw(
                         client.db,
@@ -507,11 +598,71 @@ def run(args: argparse.Namespace) -> int:
                     changed = True
                     changed_user_team = True
                 if str(existing_inv.get("state") or "") == "draft":
-                    if _normalize_freight_line_labels(client, int(existing_inv["id"]), freight_product_id):
+                    # Keep draft invoices fully aligned with Sage content:
+                    # rebuild invoice lines so line descriptions (name) and
+                    # structure are refreshed even when totals already match.
+                    commands, map_errors, sage_line_descriptions = _build_invoice_line_commands(
+                        inv,
+                        invoice_lines_by_postorder,
+                        item_record_to_sku,
+                        sku_to_product_info,
+                        so_lines,
+                        freight_product_id,
+                        allow_already_invoiced=True,
+                    )
+                    if map_errors:
+                        processed += 1
+                        status_counts["ERROR"] += 1
+                        pid = int(target_picking.get("id") or 0)
+                        other = [p for p in sorted(pickings, key=lambda x: int(x.get("id") or 0)) if int(p.get("id") or 0) != pid]
+                        detail_lines = [_picking_line(target_picking, ship_via, inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
+                        detail_lines = _attach_invoice_status(detail_lines, f"### Invoice {inv_ref} - {existing_inv.get('state')}")
+                        detail_lines.append("unable to sync draft invoice lines from Sage")
+                        detail_lines.append(" | ".join(map_errors[:5]))
+                        emit(processed, inv_date, "ERROR", so_ref, inv_ref, "\n".join(detail_lines))
+                        if not continue_on_error:
+                            break
+                        continue
+
+                    write_vals: Dict[str, object] = {
+                        "invoice_line_ids": [(5, 0, 0)] + commands,
+                        "invoice_date": inv_date or False,
+                        "invoice_date_due": inv_date or False,
+                        "ref": customer_po or False,
+                        "name": inv_ref,
+                    }
+                    if "invoice_user_id" in update_vals:
+                        write_vals["invoice_user_id"] = update_vals["invoice_user_id"]
+                    if "team_id" in update_vals:
+                        write_vals["team_id"] = update_vals["team_id"]
+                    payment_term = so.get("payment_term_id") or []
+                    if isinstance(payment_term, list) and payment_term:
+                        write_vals["invoice_payment_term_id"] = int(payment_term[0])
+                    client.models.execute_kw(
+                        client.db,
+                        client.uid,
+                        client.apikey,
+                        "account.move",
+                        "write",
+                        [[int(existing_inv["id"])], write_vals],
+                    )
+                    if _force_invoice_line_descriptions(client, int(existing_inv["id"]), sage_line_descriptions):
                         changed = True
-                        changed_freight_label = True
+                    changed = True
+
+                    # Keep exact Sage row descriptions in invoice line name.
+                    # Do not normalize freight labels.
                 sage_total = _sage_invoice_total(inv)
-                existing_total = round(float(existing_inv.get("amount_total") or 0.0), 2)
+                refreshed_inv = client.models.execute_kw(
+                    client.db,
+                    client.uid,
+                    client.apikey,
+                    "account.move",
+                    "read",
+                    [[int(existing_inv["id"])]],
+                    {"fields": ["id", "amount_total", "state"]},
+                )
+                existing_total = round(float((refreshed_inv[0] if refreshed_inv else {}).get("amount_total") or 0.0), 2)
                 pid = int(target_picking.get("id") or 0)
                 other = [p for p in sorted(pickings, key=lambda x: int(x.get("id") or 0)) if int(p.get("id") or 0) != pid]
                 detail_lines = [_picking_line(target_picking, ship_via, inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
@@ -520,13 +671,14 @@ def run(args: argparse.Namespace) -> int:
                     if str(existing_inv.get("state") or "") == "draft":
                         # Auto-heal draft invoices in-place (no delete/recreate):
                         # rebuild invoice lines from current Sage data.
-                        commands, map_errors = _build_invoice_line_commands(
+                        commands, map_errors, sage_line_descriptions = _build_invoice_line_commands(
                             inv,
                             invoice_lines_by_postorder,
                             item_record_to_sku,
                             sku_to_product_info,
                             so_lines,
                             freight_product_id,
+                            allow_already_invoiced=True,
                         )
                         if map_errors:
                             processed += 1
@@ -542,7 +694,7 @@ def run(args: argparse.Namespace) -> int:
                             "invoice_line_ids": [(5, 0, 0)] + commands,
                             "invoice_date": inv_date or False,
                             "invoice_date_due": inv_date or False,
-                            "ref": inv_ref,
+                            "ref": customer_po or False,
                             "name": inv_ref,
                         }
                         if "invoice_user_id" in update_vals:
@@ -561,6 +713,7 @@ def run(args: argparse.Namespace) -> int:
                             "write",
                             [[int(existing_inv["id"])], write_vals],
                         )
+                        _force_invoice_line_descriptions(client, int(existing_inv["id"]), sage_line_descriptions)
 
                         repaired = client.models.execute_kw(
                             client.db,
@@ -604,7 +757,7 @@ def run(args: argparse.Namespace) -> int:
                     emit(processed, inv_date, "UPDATED" if changed else "NO_CHANGES", so_ref, inv_ref, "\n".join(detail_lines))
                     continue
 
-            commands, map_errors = _build_invoice_line_commands(
+            commands, map_errors, sage_line_descriptions = _build_invoice_line_commands(
                 inv,
                 invoice_lines_by_postorder,
                 item_record_to_sku,
@@ -648,7 +801,7 @@ def run(args: argparse.Namespace) -> int:
                 "name": inv_ref,
                 "invoice_origin": so_ref,
                 "invoice_date": inv_date or False,
-                "ref": inv_ref,
+                "ref": _sage_customer_po(inv) or False,
                 "invoice_line_ids": commands,
                 "invoice_date_due": inv_date or False,
             }
@@ -679,6 +832,7 @@ def run(args: argparse.Namespace) -> int:
                 [[int(inv_id)]],
                 {"fields": ["id", "amount_total", "state"]},
             )
+            _force_invoice_line_descriptions(client, int(inv_id), sage_line_descriptions)
             created_total = round(float(created[0].get("amount_total") or 0.0), 2) if created else 0.0
             sage_total = _sage_invoice_total(inv)
             if abs(created_total - sage_total) > 0.01:

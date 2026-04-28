@@ -597,11 +597,12 @@ Flujo actual:
 - Verifica SO en Odoo y que esté confirmada (`sale/done`).
 - Verifica que exista delivery vinculada por `Sage Invoice: <ref>` y que esté `done`.
 - Crea líneas de factura con vínculo real a `sale.order.line` (`sale_line_ids`) y `product_id` real (no texto libre).
-- Solo factura cantidades disponibles: `qty_delivered - qty_invoiced`.
+- En creación normal factura cantidades disponibles: `qty_delivered - qty_invoiced`.
+- En resync de facturas `draft`, permite reconstrucción de líneas aunque la SO line ya figure como invoiced.
 - Replica notas operativas de SO en invoice como `line_note`:
   - `Shipping Method: ...`
   - `BOGO ...`
-- Añade `Freight` cuando Sage trae `Freight Amount` (`ItemRecordNumber=0` + descripción freight).
+- Añade línea `Freight` cuando Sage trae freight (`ItemRecordNumber=0` + descripción freight).
 - Ignora filas técnicas de Sage con `Amount=0` para evitar duplicados/sombras.
 
 Validaciones y autocorrección:
@@ -613,13 +614,19 @@ Validaciones y autocorrección:
 - En facturas existentes, sincroniza también:
   - `invoice_user_id` (Sales Person)
   - `team_id` (Sales Team)
-- Normaliza líneas de freight existentes a nombre `Freight`.
+- `ref` (Customer Reference) con `PurchOrder` de Sage.
 
 Campos relevantes:
 - Número Sage preservado en factura Odoo:
   - `name = <Sage Invoice Ref>`
-  - `ref = <Sage Invoice Ref>`
+  - `ref = <Sage PurchOrder>` (PO de cliente)
 - No se escribe `Sage Invoice: ...` en `Terms and Conditions` (`narration`).
+
+Descripción de líneas (`account.move.line.name`):
+- Se toma de `RowDescription` de Sage (no del nombre maestro del producto en Odoo).
+- Si hay texto entre paréntesis en `RowDescription`, se transforma en dos líneas:
+  - Línea 1: texto base sin paréntesis.
+  - Línea 2: contenido entre paréntesis, conservando los paréntesis (si hay varios, separados por ` | `).
 
 Formato de log:
 - Header compacto: `SO/Invoice <ref>` cuando SO e invoice comparten referencia.
