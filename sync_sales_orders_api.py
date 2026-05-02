@@ -30,6 +30,42 @@ def parse_decimal(raw: str) -> float:
         return 0.0
 
 
+def filter_non_importable_sage_rows(
+    source_lines: List[Dict[str, str]],
+    header: Dict[str, str],
+) -> List[Dict[str, str]]:
+    """
+    Remove Sage technical row 0 that usually repeats header description + order total.
+    Typical pattern:
+      - ItemRecordNumber = 0
+      - RowNumber = 0
+      - Quantity = 0
+      - RowDescription == header Description
+      - Amount ~= header MainAmount
+    """
+    out: List[Dict[str, str]] = []
+    header_desc = (header.get("Description") or "").strip().upper()
+    header_amount = abs(parse_decimal(header.get("MainAmount") or ""))
+    for line in source_lines:
+        item_record = (line.get("ItemRecordNumber") or "").strip()
+        row_number = (line.get("RowNumber") or "").strip()
+        qty = parse_decimal(line.get("Quantity") or "")
+        row_desc = (line.get("RowDescription") or "").strip().upper()
+        row_amount = abs(parse_decimal(line.get("Amount") or ""))
+        looks_like_header_technical_row = (
+            item_record == "0"
+            and row_number == "0"
+            and abs(qty) < 0.0001
+            and bool(row_desc)
+            and row_desc == header_desc
+            and abs(row_amount - header_amount) <= 0.02
+        )
+        if looks_like_header_technical_row:
+            continue
+        out.append(line)
+    return out
+
+
 def profile_env(env: Dict[str, str], profile: str, key_suffix: str) -> str:
     profile_key = f"ODOO_{profile.upper()}_{key_suffix}"
     generic_key = f"ODOO_{key_suffix}"
@@ -153,8 +189,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "When used with --content-verify, auto-repair mismatches by reopening ORDER to QUOTE, "
-            "updating order_lines and pricelist_id, then re-confirming."
+            "updating order_lines and pricelist_id."
         ),
+    )
+    p.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Confirm orders after create/update/repair. Default behavior leaves orders in QUOTE/draft.",
     )
     return p
 
@@ -279,6 +320,15 @@ def _parse_reference_filter(raw: str) -> set:
     if not text:
         return set()
     return {part.strip() for part in text.split(",") if part.strip()}
+
+
+def resolve_customer_reference_from_sage(header: Dict[str, str]) -> str:
+    # Primary source is PurchOrder. Some legacy flows (notably Buying Groups)
+    # use CustomerInvoiceNo as operational PO/customer reference.
+    po = (header.get("PurchOrder") or "").strip()
+    if po:
+        return po
+    return (header.get("CustomerInvoiceNo") or "").strip()
 
 
 def _iter_sales_order_pairs(root_dir: str) -> List[Tuple[str, str]]:
@@ -542,6 +592,14 @@ def build_order_lines(
     products_map: Dict[str, Dict[str, str]],
     freight_variant_id: int = 0,
 ) -> Dict[str, object]:
+    def _format_sage_line_description(raw_desc: str) -> str:
+        text = (raw_desc or "").strip()
+        if not text:
+            return ""
+        # For Sales Orders we keep Sage RAW description verbatim in second line.
+        # Odoo may render its own product label as the first line in some views.
+        return f"\n{text}"
+
     out: List[Dict[str, object]] = []
     note_lines: List[Dict[str, object]] = []
     source_total = 0.0
@@ -556,6 +614,7 @@ def build_order_lines(
     for line in source_lines:
         source_row_count += 1
         row_desc_raw = (line.get("RowDescription") or "").strip()
+        row_desc_formatted = _format_sage_line_description(row_desc_raw)
         row_desc_upper = row_desc_raw.upper()
         item_record = (line.get("ItemRecordNumber") or "").strip()
         is_bogo_transaction = item_record == "8521" or row_desc_upper.startswith("BOGO TRANSACTION")
@@ -586,7 +645,7 @@ def build_order_lines(
                     source_product_row_count += 1
                     out.append({
                         "product_id": int(freight_variant_id),
-                        "name": row_desc_raw or "Freight Amount",
+                        "name": (row_desc_formatted or "Freight"),
                         "product_uom_qty": 1.0,
                         "price_unit": round(amount, 2),
                         "tax_ids": [(5, 0, 0)],
@@ -603,6 +662,21 @@ def build_order_lines(
                     skipped_reasons.append(
                         f"Freight line ({row_desc_raw}): missing freight variant id configuration"
                     )
+            elif row_desc_raw:
+                # Preserve non-tax/non-amount operational text rows from Sage.
+                # Example: DROP SHIP / LAB routing instructions used by business.
+                note_lines.append({
+                    "display_type": "line_note",
+                    "name": row_desc_raw,
+                })
+            else:
+                # Strict rule requested by business:
+                # if this technical/comment-like row has no recognizable content,
+                # stop the process to avoid silent information loss.
+                skipped_reasons.append(
+                    "ItemRecordNumber 0 row without transferable description "
+                    f"(RowNumber={line.get('RowNumber') or ''}, PostOrder={line.get('PostOrder') or ''})"
+                )
             continue
         source_amount = abs(parse_decimal(line.get("Amount") or ""))
         if source_amount > 0:
@@ -641,7 +715,7 @@ def build_order_lines(
         )
         out.append({
             "product_id": variant_id,
-            "name": row_desc_raw,
+            "name": row_desc_formatted or row_desc_raw,
             "product_uom_qty": qty,
             "price_unit": round(price_unit, 2),
             # Always set taxes explicitly: avoid implicit product default taxes in Odoo.
@@ -1016,7 +1090,7 @@ def _line_sig_from_prepared(line_vals: Dict[str, object]) -> Dict[str, object]:
         return {
             "display_type": display_type,
             "product_id": 0,
-            "name": str(line_vals.get("name") or "").strip(),
+            "name": str(line_vals.get("name") or ""),
             "qty": 0.0,
             "price": 0.0,
             "tax_ids": [],
@@ -1030,7 +1104,7 @@ def _line_sig_from_prepared(line_vals: Dict[str, object]) -> Dict[str, object]:
     return {
         "display_type": "",
         "product_id": int(line_vals.get("product_id") or 0),
-        "name": str(line_vals.get("name") or "").strip(),
+        "name": str(line_vals.get("name") or ""),
         "qty": round(float(line_vals.get("product_uom_qty") or 0.0), 4),
         "price": round(float(line_vals.get("price_unit") or 0.0), 4),
         "tax_ids": tax_ids,
@@ -1044,7 +1118,7 @@ def _line_sig_from_existing(line_row: Dict[str, object]) -> Dict[str, object]:
     return {
         "display_type": display_type,
         "product_id": int(product[0]) if isinstance(product, list) and product else 0,
-        "name": str(line_row.get("name") or "").strip(),
+        "name": str(line_row.get("name") or ""),
         "qty": round(float(line_row.get("product_uom_qty") or 0.0), 4) if not display_type else 0.0,
         "price": round(float(line_row.get("price_unit") or 0.0), 4) if not display_type else 0.0,
         "tax_ids": sorted(int(x) for x in tax_ids) if isinstance(tax_ids, list) else [],
@@ -1064,6 +1138,7 @@ def _base_sig_from_vals(vals: Dict[str, object]) -> Dict[str, object]:
         "pricelist_id": int(vals.get("pricelist_id") or 0),
         "payment_term_id": int(vals.get("payment_term_id") or 0),
         "user_id": int(vals.get("user_id") or 0),
+        "team_id": int(vals.get("team_id") or 0),
         "partner_invoice_id": int(vals.get("partner_invoice_id") or 0),
         "partner_shipping_id": int(vals.get("partner_shipping_id") or 0),
     }
@@ -1086,6 +1161,7 @@ def _existing_order_sig(client: OdooClient, order_id: int) -> Dict[str, object]:
             "pricelist_id",
             "payment_term_id",
             "user_id",
+            "team_id",
             "partner_invoice_id",
             "partner_shipping_id",
             "order_line",
@@ -1108,6 +1184,7 @@ def _existing_order_sig(client: OdooClient, order_id: int) -> Dict[str, object]:
         "pricelist_id": int((row.get("pricelist_id") or [0])[0]) if isinstance(row.get("pricelist_id"), list) else 0,
         "payment_term_id": int((row.get("payment_term_id") or [0])[0]) if isinstance(row.get("payment_term_id"), list) else 0,
         "user_id": int((row.get("user_id") or [0])[0]) if isinstance(row.get("user_id"), list) else 0,
+        "team_id": int((row.get("team_id") or [0])[0]) if isinstance(row.get("team_id"), list) else 0,
         "partner_invoice_id": int((row.get("partner_invoice_id") or [0])[0]) if isinstance(row.get("partner_invoice_id"), list) else 0,
         "partner_shipping_id": int((row.get("partner_shipping_id") or [0])[0]) if isinstance(row.get("partner_shipping_id"), list) else 0,
     }
@@ -1424,6 +1501,53 @@ def _cleanup_cancelled_pickings_for_order(
     return deleted, kept
 
 
+def _delete_all_pickings_for_order(
+    client: OdooClient,
+    order_id: int,
+) -> Tuple[int, int]:
+    pickings = client.search_read(
+        "stock.picking",
+        [("sale_id", "=", int(order_id))],
+        ["id", "state"],
+        limit=500,
+        offset=0,
+    )
+    if not pickings:
+        return 0, 0
+    deleted = 0
+    kept = 0
+    for p in pickings:
+        pid = int(p.get("id") or 0)
+        if pid <= 0:
+            continue
+        state = str(p.get("state") or "").strip()
+        try:
+            if state != "cancel":
+                try:
+                    client.models.execute_kw(
+                        client.db,
+                        client.uid,
+                        client.apikey,
+                        "stock.picking",
+                        "action_cancel",
+                        [[pid]],
+                    )
+                except Exception:
+                    pass
+            client.models.execute_kw(
+                client.db,
+                client.uid,
+                client.apikey,
+                "stock.picking",
+                "unlink",
+                [[pid]],
+            )
+            deleted += 1
+        except Exception:
+            kept += 1
+    return deleted, kept
+
+
 def _diff_order_sig(current_sig: Dict[str, object], desired_sig: Dict[str, object]) -> List[str]:
     reasons: List[str] = []
     current_base = current_sig.get("base") or {}
@@ -1436,6 +1560,7 @@ def _diff_order_sig(current_sig: Dict[str, object], desired_sig: Dict[str, objec
         "pricelist_id",
         "payment_term_id",
         "user_id",
+        "team_id",
         "partner_invoice_id",
         "partner_shipping_id",
     ]:
@@ -1488,6 +1613,8 @@ def run(args: argparse.Namespace) -> int:
         # Repair logic is implemented inside content-verify mode.
         args.content_verify = True
         print("INFO: --content-repair enables --content-verify automatically")
+    if not args.confirm:
+        print("INFO: confirmation disabled (orders remain in QUOTE/draft unless --confirm is provided)")
 
     max_orders, start_offset = _parse_limit_offset(args.limit, args.offset)
     continue_on_error = bool(args.allow_partial or args.skip)
@@ -1580,6 +1707,35 @@ def run(args: argparse.Namespace) -> int:
         for u in users_all
         if (u.get("login") or "").strip()
     }
+    team_members_all = client.models.execute_kw(
+        client.db,
+        client.uid,
+        client.apikey,
+        "crm.team.member",
+        "search_read",
+        [[]],
+        {"fields": ["crm_team_id", "user_id"], "limit": 100000, "context": {"active_test": False}},
+    )
+    team_by_user_id: Dict[int, int] = {}
+    for tm in team_members_all:
+        user_rel = tm.get("user_id") or []
+        team_rel = tm.get("crm_team_id") or []
+        uid = int(user_rel[0]) if isinstance(user_rel, list) and user_rel else 0
+        tid = int(team_rel[0]) if isinstance(team_rel, list) and team_rel else 0
+        if uid <= 0 or tid <= 0:
+            continue
+        if uid not in team_by_user_id:
+            team_by_user_id[uid] = tid
+    generic_sales_team_id = 0
+    generic_sales_team = client.search_read(
+        "crm.team",
+        [("name", "=", "Sales")],
+        ["id", "name"],
+        limit=1,
+        offset=0,
+    )
+    if generic_sales_team:
+        generic_sales_team_id = int(generic_sales_team[0].get("id") or 0)
     freight_variant_id = int(args.freight_variant_id or 0)
     if freight_variant_id <= 0:
         wanted_name = (args.freight_product_name or "Freight").strip()
@@ -1651,6 +1807,7 @@ def run(args: argparse.Namespace) -> int:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         source_lines = lines_by_postorder.get(post_order, [])
+        source_lines = filter_non_importable_sage_rows(source_lines, h)
         prepared_info = build_order_lines(source_lines, products_map, freight_variant_id=freight_variant_id)
         prepared_lines = prepared_info["lines"]
         source_row_count = int(prepared_info.get("source_row_count") or 0)
@@ -1787,8 +1944,30 @@ def run(args: argparse.Namespace) -> int:
                 existing_shipping_id = int(raw_existing_shipping[0] or 0)
             elif isinstance(raw_existing_shipping, int):
                 existing_shipping_id = raw_existing_shipping
+        emp_record_for_verify = (h.get("EmpRecordNumber") or "").strip()
+        emp_for_verify = employees_map.get(emp_record_for_verify) or {}
+        emp_id_for_verify = (emp_for_verify.get("EmployeeID") or "").strip()
+        sales_login_for_verify = to_login(emp_id_for_verify)
+        sales_user_for_verify = user_by_login.get(sales_login_for_verify) if sales_login_for_verify else None
+        desired_user_id_for_verify = int(sales_user_for_verify["id"]) if sales_user_for_verify else 0
+        desired_team_id_for_verify = int(team_by_user_id.get(desired_user_id_for_verify) or 0) if desired_user_id_for_verify else 0
+        if desired_user_id_for_verify and not desired_team_id_for_verify and generic_sales_team_id:
+            desired_team_id_for_verify = generic_sales_team_id
 
         if args.content_verify:
+            def _force_quote_on_error_if_needed() -> tuple[str, str]:
+                if not (args.content_repair and exists):
+                    return order_state, ""
+                oid = int(exists[0].get("id") or 0)
+                if oid <= 0:
+                    return order_state, ""
+                try:
+                    if _reopen_order_to_draft_if_needed(client, oid):
+                        return "draft", "ORDER > CANCEL > QUOTE"
+                except Exception:
+                    pass
+                return order_state, ""
+
             if not exists:
                 push_log({
                     "Timestamp": now,
@@ -1806,6 +1985,16 @@ def run(args: argparse.Namespace) -> int:
                 if not continue_on_error:
                     break
                 continue
+            identity_errors: List[str] = []
+            if not emp_record_for_verify:
+                identity_errors.append("Missing EmpRecordNumber in Sage order")
+            elif emp_record_for_verify != "0":
+                if not emp_id_for_verify:
+                    identity_errors.append(f"Missing employee mapping for EmpRecordNumber {emp_record_for_verify}")
+                elif not sales_user_for_verify:
+                    identity_errors.append(f"Missing Odoo user for employee login {sales_login_for_verify}")
+                elif not desired_team_id_for_verify and not generic_sales_team_id:
+                    identity_errors.append(f"Missing sales team for Odoo user {sales_user_for_verify.get('name')}")
 
             desired_pricelist_id = int((customer_sync.get("OdooPricelistId") or "0").strip() or 0)
             expected_skus: Dict[str, float] = defaultdict(float)
@@ -1825,7 +2014,35 @@ def run(args: argparse.Namespace) -> int:
                 expected_skus[sku] += qty
 
             order_id = int(exists[0]["id"])
+            forced_cleanup_note = ""
+            if args.content_repair:
+                # Requested operational mode: always move to QUOTE and remove
+                # all existing delivery orders before validating/repairing.
+                if not _reopen_order_to_draft_if_needed(client, order_id):
+                    push_log({
+                        "Timestamp": now,
+                        "Status": "ERROR",
+                        "Reference": reference,
+                        "PostOrder": post_order,
+                        "TransactionDate": transaction_date,
+                        "CustomerRecordNumber": customer_record,
+                        "CustomerOdooId": customer_odoo_id,
+                        "OrderOdooId": str(order_id),
+                        "OrderState": order_state,
+                        "LineCount": str(len(prepared_lines)),
+                        "Details": "Could not force order to QUOTE before content repair",
+                    })
+                    if not continue_on_error:
+                        break
+                    created += 1
+                    continue
+                deleted_pickings, kept_pickings = _delete_all_pickings_for_order(client, order_id)
+                forced_cleanup_note = (
+                    f"Forced QUOTE + deleted deliveries={deleted_pickings}"
+                    + (f" (kept={kept_pickings})" if kept_pickings else "")
+                )
             actual_skus = _existing_order_skus(client, order_id)
+            order_sig = _existing_order_sig(client, order_id)
             raw_pl = exists[0].get("pricelist_id")
             current_pricelist_id = 0
             if isinstance(raw_pl, list) and raw_pl:
@@ -1833,6 +2050,30 @@ def run(args: argparse.Namespace) -> int:
             elif isinstance(raw_pl, int):
                 current_pricelist_id = int(raw_pl or 0)
             pricelist_mismatch = bool(desired_pricelist_id and current_pricelist_id != desired_pricelist_id)
+            expected_client_order_ref = resolve_customer_reference_from_sage(h)
+            current_client_order_ref = str(order_sig.get("base", {}).get("client_order_ref") or "").strip()
+            client_order_ref_mismatch = expected_client_order_ref != current_client_order_ref
+            expected_date_order = transaction_date.strip()
+            expected_validity_date = expected_date_order
+            expected_commitment_date = (h.get("ShipByDate") or "").strip() or expected_date_order
+            current_date_order = _fmt_date(order_sig.get("base", {}).get("date_order"))
+            current_validity_date = _fmt_date(order_sig.get("base", {}).get("validity_date"))
+            current_commitment_date = _fmt_date(order_sig.get("base", {}).get("commitment_date"))
+            date_order_mismatch = expected_date_order != current_date_order
+            validity_date_mismatch = expected_validity_date != current_validity_date
+            commitment_date_mismatch = expected_commitment_date != current_commitment_date
+            current_user_id = int(order_sig.get("base", {}).get("user_id") or 0)
+            current_team_id = int(order_sig.get("base", {}).get("team_id") or 0)
+            if emp_record_for_verify == "0":
+                salesperson_mismatch = current_user_id != 0
+                sales_team_mismatch = current_team_id != 0
+            else:
+                salesperson_mismatch = bool(desired_user_id_for_verify and current_user_id != desired_user_id_for_verify)
+                sales_team_mismatch = bool(desired_team_id_for_verify and current_team_id != desired_team_id_for_verify)
+
+            expected_line_sigs = [_line_sig_from_prepared(l) for l in prepared_lines]
+            actual_line_sigs = order_sig.get("lines", []) or []
+            line_content_mismatch = expected_line_sigs != actual_line_sigs
 
             missing: List[str] = []
             extra: List[str] = []
@@ -1847,7 +2088,20 @@ def run(args: argparse.Namespace) -> int:
                 else:
                     extra.append(f"{sku or '<blank>'} exp={exp_qty:g} got={got_qty:g}")
 
-            has_content_issues = bool(missing_item_records or missing or extra or pricelist_mismatch)
+            has_content_issues = bool(
+                missing_item_records
+                or missing
+                or extra
+                or pricelist_mismatch
+                or client_order_ref_mismatch
+                or date_order_mismatch
+                or validity_date_mismatch
+                or commitment_date_mismatch
+                or salesperson_mismatch
+                or sales_team_mismatch
+                or identity_errors
+                or line_content_mismatch
+            )
             if has_content_issues and args.content_repair and not args.dry_run:
                 try:
                     if not _reopen_order_to_draft_if_needed(client, order_id):
@@ -1901,14 +2155,54 @@ def run(args: argparse.Namespace) -> int:
 
                     repair_vals: Dict[str, object] = {}
                     repaired_fields: List[str] = []
-                    if missing or extra:
+                    if missing or extra or line_content_mismatch:
                         repair_vals["order_line"] = [(5, 0, 0)] + [(0, 0, line_vals) for line_vals in prepared_lines]
                         repaired_fields.append("order_lines")
                     if pricelist_mismatch:
                         repair_vals["pricelist_id"] = int(desired_pricelist_id)
                         repaired_fields.append("pricelist_id")
+                    if client_order_ref_mismatch:
+                        repair_vals["client_order_ref"] = expected_client_order_ref
+                        repaired_fields.append("client_order_ref")
+                    if date_order_mismatch:
+                        repair_vals["date_order"] = expected_date_order
+                        repaired_fields.append("date_order")
+                    if validity_date_mismatch:
+                        repair_vals["validity_date"] = expected_validity_date
+                        repaired_fields.append("validity_date")
+                    if commitment_date_mismatch:
+                        repair_vals["commitment_date"] = expected_commitment_date
+                        repaired_fields.append("commitment_date")
+                    if salesperson_mismatch:
+                        repair_vals["user_id"] = desired_user_id_for_verify if emp_record_for_verify != "0" else False
+                        repaired_fields.append("user_id")
+                    if sales_team_mismatch:
+                        repair_vals["team_id"] = desired_team_id_for_verify if emp_record_for_verify != "0" else False
+                        repaired_fields.append("team_id")
 
                     if not repair_vals:
+                        if identity_errors:
+                            order_path = ""
+                            if order_state not in {"draft", "sent"}:
+                                order_path = "ORDER > CANCEL > QUOTE"
+                            push_log({
+                                "Timestamp": now,
+                                "Status": "ERROR",
+                                "Reference": reference,
+                                "PostOrder": post_order,
+                                "TransactionDate": transaction_date,
+                                "CustomerRecordNumber": customer_record,
+                                "CustomerOdooId": customer_odoo_id,
+                                "OrderOdooId": str(order_id),
+                                "OrderState": "draft",
+                                "OrderPath": order_path,
+                                "LineCount": str(len(prepared_lines)),
+                                "Details": "; ".join(identity_errors),
+                            })
+                            if not continue_on_error:
+                                break
+                            created += 1
+                            continue
                         raise RuntimeError("No repairable fields found for content mismatch")
 
                     client.models.execute_kw(
@@ -1919,7 +2213,9 @@ def run(args: argparse.Namespace) -> int:
                         "write",
                         [[order_id], repair_vals],
                     )
-                    confirmed = _confirm_order_if_needed(client, order_id, transaction_date.strip())
+                    confirmed = False
+                    if args.confirm and not identity_errors:
+                        confirmed = _confirm_order_if_needed(client, order_id, transaction_date.strip())
 
                     # Re-check after repair to guarantee content is aligned.
                     actual_skus_after = _existing_order_skus(client, order_id)
@@ -1939,7 +2235,7 @@ def run(args: argparse.Namespace) -> int:
                     row_after = client.search_read(
                         "sale.order",
                         [("id", "=", order_id)],
-                        ["id", "state", "pricelist_id"],
+                        ["id", "state", "pricelist_id", "client_order_ref"],
                         limit=1,
                         offset=0,
                     )
@@ -1956,7 +2252,40 @@ def run(args: argparse.Namespace) -> int:
                     pricelist_after_mismatch = bool(
                         desired_pricelist_id and pricelist_after != desired_pricelist_id
                     )
-                    if missing_after or extra_after or pricelist_after_mismatch:
+                    client_order_ref_after = current_client_order_ref
+                    if row_after:
+                        client_order_ref_after = str(row_after[0].get("client_order_ref") or "").strip()
+                    client_order_ref_after_mismatch = expected_client_order_ref != client_order_ref_after
+                    order_sig_after = _existing_order_sig(client, order_id)
+                    date_order_after = _fmt_date(order_sig_after.get("base", {}).get("date_order"))
+                    validity_date_after = _fmt_date(order_sig_after.get("base", {}).get("validity_date"))
+                    commitment_date_after = _fmt_date(order_sig_after.get("base", {}).get("commitment_date"))
+                    date_order_after_mismatch = expected_date_order != date_order_after
+                    validity_date_after_mismatch = expected_validity_date != validity_date_after
+                    commitment_date_after_mismatch = expected_commitment_date != commitment_date_after
+                    user_after = int(order_sig_after.get("base", {}).get("user_id") or 0)
+                    team_after = int(order_sig_after.get("base", {}).get("team_id") or 0)
+                    if emp_record_for_verify == "0":
+                        salesperson_after_mismatch = user_after != 0
+                        sales_team_after_mismatch = team_after != 0
+                    else:
+                        salesperson_after_mismatch = bool(desired_user_id_for_verify and user_after != desired_user_id_for_verify)
+                        sales_team_after_mismatch = bool(desired_team_id_for_verify and team_after != desired_team_id_for_verify)
+                    line_content_after_mismatch = (order_sig_after.get("lines", []) or []) != expected_line_sigs
+
+                    if (
+                        missing_after
+                        or extra_after
+                        or pricelist_after_mismatch
+                        or client_order_ref_after_mismatch
+                        or date_order_after_mismatch
+                        or validity_date_after_mismatch
+                        or commitment_date_after_mismatch
+                        or salesperson_after_mismatch
+                        or sales_team_after_mismatch
+                        or identity_errors
+                        or line_content_after_mismatch
+                    ):
                         order_path = ""
                         if order_state not in {"draft", "sent"}:
                             order_path = "ORDER > CANCEL > QUOTE"
@@ -1977,6 +2306,29 @@ def run(args: argparse.Namespace) -> int:
                             details.append(
                                 f"Pricelist mismatch after repair (expected={desired_pricelist_id}, got={pricelist_after})"
                             )
+                        if client_order_ref_after_mismatch:
+                            details.append(
+                                f"Customer PO mismatch after repair (expected='{expected_client_order_ref}', got='{client_order_ref_after}')"
+                            )
+                        if date_order_after_mismatch:
+                            details.append(
+                                f"date_order mismatch after repair (expected={expected_date_order}, got={date_order_after})"
+                            )
+                        if validity_date_after_mismatch:
+                            details.append(
+                                f"validity_date mismatch after repair (expected={expected_validity_date}, got={validity_date_after})"
+                            )
+                        if commitment_date_after_mismatch:
+                            details.append(
+                                f"commitment_date mismatch after repair (expected={expected_commitment_date}, got={commitment_date_after})"
+                            )
+                        if salesperson_after_mismatch:
+                            details.append(f"Salesperson mismatch after repair (expected={desired_user_id_for_verify}, got={user_after})")
+                        if sales_team_after_mismatch:
+                            details.append(f"Sales Team mismatch after repair (expected={desired_team_id_for_verify}, got={team_after})")
+                        if line_content_after_mismatch:
+                            details.append("Order line descriptions/content mismatch after repair")
+                        details.extend(identity_errors)
                         push_log({
                             "Timestamp": now,
                             "Status": "ERROR",
@@ -2001,6 +2353,20 @@ def run(args: argparse.Namespace) -> int:
                             mismatch_labels.append("extra_sku_lines")
                         if pricelist_mismatch:
                             mismatch_labels.append("pricelist_mismatch")
+                        if client_order_ref_mismatch:
+                            mismatch_labels.append("customer_po_mismatch")
+                        if date_order_mismatch:
+                            mismatch_labels.append("date_order_mismatch")
+                        if validity_date_mismatch:
+                            mismatch_labels.append("validity_date_mismatch")
+                        if commitment_date_mismatch:
+                            mismatch_labels.append("commitment_date_mismatch")
+                        if salesperson_mismatch:
+                            mismatch_labels.append("salesperson_mismatch")
+                        if sales_team_mismatch:
+                            mismatch_labels.append("sales_team_mismatch")
+                        if line_content_mismatch:
+                            mismatch_labels.append("line_content_mismatch")
                         deleted_pickings = 0
                         kept_pickings = 0
                         if confirmed:
@@ -2084,6 +2450,33 @@ def run(args: argparse.Namespace) -> int:
                     details.append(
                         f"Pricelist mismatch expected={desired_pricelist_id} got={current_pricelist_id}"
                     )
+                if client_order_ref_mismatch:
+                    details.append(
+                        f"Customer PO mismatch expected='{expected_client_order_ref}' got='{current_client_order_ref}'"
+                    )
+                if date_order_mismatch:
+                    details.append(
+                        f"date_order mismatch expected={expected_date_order} got={current_date_order}"
+                    )
+                if validity_date_mismatch:
+                    details.append(
+                        f"validity_date mismatch expected={expected_validity_date} got={current_validity_date}"
+                    )
+                if commitment_date_mismatch:
+                    details.append(
+                        f"commitment_date mismatch expected={expected_commitment_date} got={current_commitment_date}"
+                    )
+                if salesperson_mismatch:
+                    details.append(
+                        f"Salesperson mismatch expected={desired_user_id_for_verify or 0} got={current_user_id or 0}"
+                    )
+                if sales_team_mismatch:
+                    details.append(
+                        f"Sales Team mismatch expected={desired_team_id_for_verify or 0} got={current_team_id or 0}"
+                    )
+                details.extend(identity_errors)
+                if line_content_mismatch:
+                    details.append("Order line descriptions/content mismatch")
                 push_log({
                     "Timestamp": now,
                     "Status": "ERROR",
@@ -2100,6 +2493,12 @@ def run(args: argparse.Namespace) -> int:
                 if not continue_on_error:
                     break
             else:
+                confirmed_no_changes = False
+                if args.confirm and order_state in {"draft", "sent"}:
+                    try:
+                        confirmed_no_changes = _confirm_order_if_needed(client, order_id, transaction_date.strip())
+                    except Exception:
+                        confirmed_no_changes = False
                 push_log({
                     "Timestamp": now,
                     "Status": "NO_CHANGES",
@@ -2109,10 +2508,15 @@ def run(args: argparse.Namespace) -> int:
                     "CustomerRecordNumber": customer_record,
                     "CustomerOdooId": customer_odoo_id,
                     "OrderOdooId": str(order_id),
-                    "OrderState": order_state,
+                    "OrderState": ("sale" if confirmed_no_changes else order_state),
+                    "OrderPath": ("QUOTE > ORDER" if confirmed_no_changes else ""),
                     "LineCount": str(len(prepared_lines)),
-                    "Details": "Content verified (SKU/qty)",
-                })
+                            "Details": (
+                                "Content verified (SKU/qty + PO + descriptions)"
+                                + ("; confirmed" if confirmed_no_changes else "")
+                                + (f"; {forced_cleanup_note}" if forced_cleanup_note else "")
+                            ),
+                        })
             created += 1
             continue
 
@@ -2124,6 +2528,9 @@ def run(args: argparse.Namespace) -> int:
         emp_id = (emp.get("EmployeeID") or "").strip()
         sales_login = to_login(emp_id)
         sales_user = user_by_login.get(sales_login) if sales_login else None
+        sales_team_id = int(team_by_user_id.get(int(sales_user["id"])) or 0) if sales_user else 0
+        if sales_user and not sales_team_id and generic_sales_team_id:
+            sales_team_id = generic_sales_team_id
         date_order = transaction_date.strip()
         ship_by_date = (h.get("ShipByDate") or "").strip()
         partner_id_int = int(customer_odoo_id)
@@ -2184,6 +2591,8 @@ def run(args: argparse.Namespace) -> int:
                 critical_errors.append(f"Missing employee mapping for EmpRecordNumber {emp_record}")
             elif not sales_user:
                 critical_errors.append(f"Missing Odoo user for employee login {sales_login}")
+            elif not sales_team_id and not generic_sales_team_id:
+                critical_errors.append(f"Missing sales team for Odoo user {sales_user.get('name')}")
         no_sales_rep = emp_record == "0"
         current_no_sales_rep = no_sales_rep
         shipping_preserved_from_existing = False
@@ -2264,7 +2673,7 @@ def run(args: argparse.Namespace) -> int:
             "commitment_date": ship_by_date or date_order,
             "require_signature": False,
             "origin": f"SAGE-SO-{reference}",
-            "client_order_ref": reference,
+            "client_order_ref": resolve_customer_reference_from_sage(h),
             "note": "",
         }
         if pricelist_id:
@@ -2273,9 +2682,12 @@ def run(args: argparse.Namespace) -> int:
             base_vals["payment_term_id"] = int(term_id)
         if sales_user:
             base_vals["user_id"] = int(sales_user["id"])
+            if sales_team_id:
+                base_vals["team_id"] = int(sales_team_id)
         elif emp_record == "0":
             # Explicitly clear salesperson when Sage sends EmpRecordNumber=0.
             base_vals["user_id"] = False
+            base_vals["team_id"] = False
         if partner_id_int in invoice_partner_cache:
             base_vals["partner_invoice_id"] = invoice_partner_cache[partner_id_int]
         else:
@@ -2336,7 +2748,7 @@ def run(args: argparse.Namespace) -> int:
             else:
                 try:
                     if no_changes:
-                        confirmed = _confirm_order_if_needed(client, order_id, date_order) if not warning_parts else False
+                        confirmed = _confirm_order_if_needed(client, order_id, date_order) if (args.confirm and not warning_parts) else False
                         push_log({
                             "Timestamp": now,
                             "Status": ("NO_CHANGES_WARN" if warning_parts else ("OK_UPDATE" if confirmed else "NO_CHANGES")),
@@ -2407,7 +2819,7 @@ def run(args: argparse.Namespace) -> int:
                             "write",
                             [[order_id], update_vals],
                         )
-                        confirmed = _confirm_order_if_needed(client, order_id, date_order) if not warning_parts else False
+                        confirmed = _confirm_order_if_needed(client, order_id, date_order) if (args.confirm and not warning_parts) else False
                         push_log({
                             "Timestamp": now,
                             "Status": "OK_UPDATE_WARN" if warning_parts else "OK_UPDATE",
@@ -2486,7 +2898,7 @@ def run(args: argparse.Namespace) -> int:
                         "create",
                         [create_vals],
                     )
-                    confirmed = _confirm_order_if_needed(client, int(order_id), date_order) if not warning_parts else False
+                    confirmed = _confirm_order_if_needed(client, int(order_id), date_order) if (args.confirm and not warning_parts) else False
                     push_log({
                         "Timestamp": now,
                         "Status": "OK_WARN" if warning_parts else "OK",

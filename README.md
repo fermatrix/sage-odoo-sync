@@ -428,10 +428,13 @@ Flags CLI (`sync_sales_orders_api.py`):
   - Usa paridades de `state/country` (`_master/_parity_state.csv`, `_master/_parity_country.csv`) para mapear correctamente.
 - `--freight-variant-id`: `product.product` ID para usar en líneas de `Freight Amount`/`Shipping` de Sage cuando vienen con `ItemRecordNumber=0`.
 - `--freight-product-name`: fallback por nombre para localizar el producto de freight si no se indica `--freight-variant-id`. Default: `Freight`.
-- `--content-verify`: verifica contenido de SO existentes en Odoo contra Sage (SKU/qty por línea) sin crear/actualizar.
+- `--content-verify`: verifica contenido de SO existentes en Odoo contra Sage sin crear/actualizar.
+  - Valida: `SKU/qty`, `PO (client_order_ref)`, descripciones de línea, `pricelist_id`, `salesperson (user_id)`, `sales team (team_id)`, `date_order`, `validity_date`, `commitment_date`.
+  - Si falta `salesperson` (para reps con `EmpRecordNumber != 0`), devuelve `ERROR`.
+  - Si falta `sales team`, usa fallback automático al team genérico `Sales` (si existe).
 - `--content-repair`: repara automáticamente diferencias detectadas por `--content-verify`:
   - reabre `ORDER` -> `CANCEL` -> `QUOTE`
-  - actualiza `order_lines` y/o `pricelist_id`
+  - actualiza `order_lines`, `pricelist_id`, `client_order_ref`, `user_id`, `team_id`, `date_order`, `validity_date`, `commitment_date`.
   - vuelve a confirmar (`QUOTE -> ORDER`) si pasan validaciones críticas.
   - Si se usa `--content-repair` sin `--content-verify`, el script activa verify automáticamente.
 - `--items-odoo`: **deprecated/ignorado** en este script.
@@ -443,6 +446,8 @@ Notas operativas de flags:
   - Mapea por `items.csv` (Sage) + consulta live de productos en Odoo (`default_code`).
 - `--gaps --skip` = reintenta huecos y continúa aunque haya errores, para revisar todos en una pasada.
 - `--content-repair` no necesita `--skip` para funcionar; `--skip` solo controla si continúa tras un error.
+- Consistencia esperada:
+  - Si una SO ya quedó correcta en `QUOTE` tras `--content-repair`, ejecutar después el proceso normal (sin `--content-verify`) sobre ese mismo lote debe dar `NO_CHANGES` (mismo contenido funcional).
 - Re-ejecución estricta (sin `--shipping-relaxed`) sobre SO ya existente:
   - Si no hay match exacto nuevo de shipping pero la SO ya tiene `partner_shipping_id` en Odoo, se preserva ese shipping y no se bloquea la orden.
   - En ese caso se registra warning: `Shipping preserved from existing Odoo order (strict mode)`.
@@ -1024,4 +1029,93 @@ UPDATE (precios existentes que cambiaron):
 - El fichero tiene el mismo formato que `pricelist.csv`, pero añade `item_ids/.id`.
 - Importante: para actualizar una línea existente hay que usar `item_ids/.id` con el ID interno de `product.pricelist.item`.
 - No usar `item_ids/id` para este caso: Odoo lo interpreta como External ID y puede duplicar líneas.
+
+### Special Case: Buying Groups (ADO) - Confirmed from Sage data
+Context shared by Ally and validated in Sage exports:
+- Some accounts are **buying groups** (example: `ADO`, `ADO#2`, `ADO#3`, `ADO#4`, `ADO#5`, `ADO#6`).
+- Billing is done to the group, but shipping can go to a member optical.
+- Commission/sales rep is tied to the member destination (not only to the billing group).
+
+What we found in Sage (`_master_sage`):
+- Group customers exist as separate customers due to Sage limits:
+  - `CustomerID`: `ADO`, `ADO#2`, `ADO#3`, `ADO#4`, `ADO#5`, `ADO#6`.
+  - `Customer_Bill_Name`: `ADO BUYING GROUP` / `ADO PRACTICE SOLUTIONS`.
+- Contacts under these customers are used as operational routing records:
+  - `contacts.CustomerRecord` links to the ADO customer.
+  - `FirstName` often stores the **member affiliate number** (examples: `#6220`, `7450`, `7631`).
+  - `LastName` often stores the **rep code** (examples: `JJ 339`, `BS 267`, `KC 345`).
+  - `CompanyName` stores the member optical name.
+  - `AddressRecordNumber` links each contact to one address entry.
+- Addresses under ADO customers:
+  - `address.CustomerRecordNumber` links to the ADO customer.
+  - `AddressTypeNumber=0` is the main group address.
+  - Other `AddressTypeNumber` values (1..20) represent member ship-to addresses.
+
+Important migration impact in Odoo:
+- In Odoo, these member destinations are currently represented mostly as delivery addresses under ADO parent companies.
+- The contact payload (affiliate number + rep code embedded in name fields) is not fully represented as structured data in Odoo.
+- Assigning salesperson on a delivery address does **not** auto-propagate to Sales Orders in Odoo.
+- For Sales Order sync, salesperson/team must be resolved explicitly from Sage order context (not inferred from delivery partner salesperson).
+
+Recommended handling for this scenario:
+- Keep strict Sales Order validation for `salesperson` + `sales team`.
+- Treat ADO logic as a dedicated business rule set:
+  - parse affiliate/rep markers from Sage contact fields when present,
+  - preserve source marker in SO metadata (`PO` / notes) for audit,
+  - ensure manual/explicit salesperson assignment in SO creation/update.
+
+### Buying Groups - Conflictive Casuistry (Pending Design Decision)
+This area is currently considered **conflictive** and requires explicit business definition before full automation.
+
+Conflictive case A - Lab delivery outside normal address structure:
+- Sometimes affiliate opticals request shipment to a **lab** (not to the optical itself).
+- In normal customers this is solved with an extra delivery address under the customer.
+- In Buying Groups, affiliate opticals are already represented as delivery children, so users cannot model a second nested delivery level in the same way.
+- Current Sage workaround: lab destination is typed manually in order description/notes.
+- Risk in migration: if notes/descriptions are normalized too aggressively, shipping intent can be lost.
+
+Conflictive case B - Patient marker in PO or line description:
+- In some orders, users include patient tags such as `(PT: SARAH KELLY)` in `PO Number` or product line text.
+- This marker is operationally relevant for fulfillment and traceability, but not a standard master-data field.
+- Current policy: preserve these tags verbatim in synced SO/Invoice line descriptions.
+
+Operational safeguard (strict):
+- In Sales Order sync, all non-tax comment/operational rows from Sage (`ItemRecordNumber=0`) are transferred to Odoo as `line_note`.
+- If a technical/comment-like row cannot be transferred safely (for example, blank/ambiguous row), sync stops with `ERROR` to avoid silent information loss.
+
+Conflictive case C - Buying Group reporting obligations:
+- ERKERS needs periodic reporting to Buying Groups about what affiliates purchased.
+- This requires preserving clear linkage in Odoo between:
+  - parent Buying Group,
+  - affiliate/member identifier,
+  - final salesperson assignment.
+- Reporting owner/process from customer side is still pending formal handover.
+
+Example for functional validation:
+- Customer (billing parent): `ADO PRACTICE SOLUTIONS`
+- Invoice contact: `KIM BRATCHER`
+- Delivery contact/address: `EYESITE`
+- Case: line description includes patient marker `(PT: SARAH KELLY)`
+- Odoo example URL: `https://studiooptyx.odoo.com/odoo/sales/4413`
+
+Real examples captured from 2026 Sales Orders (Sage -> Odoo):
+- Cliente: `ADO BUYING GROUP`
+  Invoice: `ADO BUYING GROUP, KIM BRATCHER`
+  Delivery: `ADO BUYING GROUP, EYECARE CENTER OF SALEM`
+  Case: Description includes patient name on Product Line
+  Example: `NW 77TH MOD 1069 C-DOT NAVY 54-22-151(PT:RICKS)`
+  URL: `https://studiooptyx.odoo.com/odoo/sales/1246`
+
+- Cliente: `ADO PRACTICE SOLUTIONS`
+  Invoice: `ADO PRACTICE SOLUTIONS, KIM BRATCHER`
+  Delivery: `ADO PRACTICE SOLUTIONS, ILLINOIS VALLEY EYE CARE`
+  Case: Buying Group split across multiple parent accounts (ADO#)
+  URL: `https://studiooptyx.odoo.com/odoo/sales/1481`
+
+- Cliente: `ADO BUYING GROUP`
+  Invoice: `ADO BUYING GROUP, KIM BRATCHER`
+  Delivery: `ADO BUYING GROUP, DOSTAL EYECARE`
+  Case: Lab destination typed manually in product line description
+  Example: `DROP SHIP: PEAK ARTISAN LABS 12302 NE MARX ST PORTLAND, OR 97230`
+  URL: `https://studiooptyx.odoo.com/odoo/sales/1042`
 
