@@ -1,7 +1,7 @@
 # Studio Optyx / Red Eye Europe — Odoo ERP Implementation
 
 ## Project Activity Report — Month by Month
-**Period:** July 2025 – April 2026  
+**Period:** July 2025 – May 2026  
 **Prepared by:** Fernando Plaza Mesas — ENZO NEXT, SL  
 
 
@@ -190,6 +190,21 @@
   - Updated import templates to use `Product Variant / Database ID` and `product_uom_id = Units`.
   - Applied defaults in NEW imports (`USD`, `min_qty=1`, `delay=120`).
   - After import of NEW vendor pricelist rows, NEW dropped to zero on re-sync.
+
+---
+
+## May 2026
+
+**Studio Optyx USA — Sales team alignment and order repair execution**
+
+- **Sales Team reassignment from Brian confirmation (May 3):**
+  - Applied Brian Stewart’s mapping in Odoo for active/inactive reps used in 2026 orders.
+  - Added missing users to existing teams (`Sales BS`, `Sales JJ`, `Sales KC`) without creating new teams.
+- **Fallback team cleanup workflow:**
+  - Defined and executed the process to identify Sales Orders assigned to fallback team `Sales`.
+  - Reprocessed those specific orders with `sync_sales_orders_api.py --content-repair` using explicit `--reference` subsets.
+- **Operational hardening documented:**
+  - Standardized recommendation to run repair only on fallback-team subsets (not full-year runs) to reduce risk and runtime.
 
 
 ---

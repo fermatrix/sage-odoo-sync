@@ -437,6 +437,11 @@ Flags CLI (`sync_sales_orders_api.py`):
   - actualiza `order_lines`, `pricelist_id`, `client_order_ref`, `user_id`, `team_id`, `date_order`, `validity_date`, `commitment_date`.
   - vuelve a confirmar (`QUOTE -> ORDER`) si pasan validaciones críticas.
   - Si se usa `--content-repair` sin `--content-verify`, el script activa verify automáticamente.
+  - Operativa recomendada para resolver fallback team `Sales`:
+    1. Consultar en Odoo las SO con `team_id = Sales`.
+    2. Construir una lista de `--reference` con esos `sale.order.name`.
+    3. Ejecutar `--content-repair --skip --reference ...` solo sobre ese subconjunto.
+    4. Repetir hasta que no queden órdenes con team fallback.
 - `--items-odoo`: **deprecated/ignorado** en este script.
 
 Notas operativas de flags:
