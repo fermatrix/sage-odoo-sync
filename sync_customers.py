@@ -65,7 +65,16 @@ def parse_date(value: str):
 
 def read_csv(path: str) -> Tuple[List[str], List[Dict[str, str]]]:
     with open(path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f, delimiter=DELIMITER)
+        sample = f.read(4096)
+        f.seek(0)
+        delimiter = DELIMITER
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+            if getattr(dialect, "delimiter", None) in {";", ","}:
+                delimiter = dialect.delimiter
+        except Exception:
+            delimiter = DELIMITER
+        reader = csv.DictReader(f, delimiter=delimiter)
         rows = [dict(r) for r in reader]
         return reader.fieldnames or [], rows
 

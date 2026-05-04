@@ -1,5 +1,13 @@
 # Autoexec: Sage 50 remote runner
 
+## CAUTION (CSV delimiter)
+
+All Sage CSV outputs in this project must be generated with **semicolon (`;`)** delimiter.
+
+- `odbc_master_export.py` and `odbc_invoice_export.py` already write `;`.
+- `odbc_query_runner.py` must be executed with default delimiter (`;`), and `--delimiter ,` must not be used.
+- If a generated file uses `,`, treat it as an extraction error and regenerate from source.
+
 This watcher runs on the remote Sage machine and executes jobs dropped into:
 
 C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec

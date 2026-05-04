@@ -162,6 +162,10 @@ def build_items_sync_new(args: argparse.Namespace) -> int:
     def is_force_nobarcode_item(r: Dict[str, str]) -> bool:
         return (r.get("ItemID") or "").strip().upper() == "NW77PLAQUE"
 
+    def is_inactive(value: str) -> bool:
+        v = (value or "").strip().lower()
+        return v in {"1", "true", "yes", "y"}
+
     filtered = []
     # Sort by Description for Sales so brands cluster together
     rows_sorted = sorted(rows, key=lambda r: (r.get("ItemDescriptionForSale") or "").upper())
@@ -174,8 +178,11 @@ def build_items_sync_new(args: argparse.Namespace) -> int:
             continue
         if is_excluded_sale_desc(r.get("ItemDescriptionForSale", "")):
             continue
-        if invoiced:
-            r["Invoiced2026"] = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""
+        invoiced_2026 = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""
+        r["Invoiced2026"] = invoiced_2026
+        # Do not send inactive Sage products unless they were sold in 2026.
+        if is_inactive(r.get("ItemIsInactive", "")) and invoiced_2026 != "X":
+            continue
         filtered.append(r)
 
     out_fields = list(fields)
@@ -246,6 +253,10 @@ def build_products_sync_nobarcode_new(args: argparse.Namespace) -> int:
     def is_force_nobarcode_item(r: Dict[str, str]) -> bool:
         return (r.get("ItemID") or "").strip().upper() == "NW77PLAQUE"
 
+    def is_inactive(value: str) -> bool:
+        v = (value or "").strip().lower()
+        return v in {"1", "true", "yes", "y"}
+
     filtered = []
     # Sort by Description for Sales so brands cluster together
     rows_sorted = sorted(rows, key=lambda r: (r.get("ItemDescriptionForSale") or "").upper())
@@ -256,8 +267,11 @@ def build_products_sync_nobarcode_new(args: argparse.Namespace) -> int:
             continue
         if is_excluded_sale_desc(r.get("ItemDescriptionForSale", "")):
             continue
-        if invoiced:
-            r["Invoiced2026"] = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""
+        invoiced_2026 = "X" if (r.get("ItemRecordNumber") or "").strip() in invoiced else ""
+        r["Invoiced2026"] = invoiced_2026
+        # Do not send inactive Sage products unless they were sold in 2026.
+        if is_inactive(r.get("ItemIsInactive", "")) and invoiced_2026 != "X":
+            continue
         filtered.append(r)
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

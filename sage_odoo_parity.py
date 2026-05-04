@@ -569,6 +569,12 @@ def refresh_odoo(args: argparse.Namespace) -> int:
     os.makedirs(os.path.dirname(vendors_out), exist_ok=True)
 
     batch = args.batch_size
+    only_raw = (getattr(args, "only", "") or "").strip()
+    only_pos = (getattr(args, "only_pos", "") or "").strip()
+    if only_pos:
+        only_raw = only_raw or only_pos
+    only_targets = {t.strip().lower() for t in only_raw.split(",") if t.strip()}
+
     chart_out = args.chart_out
     if not os.path.isabs(chart_out):
         chart_out = os.path.normpath(chart_out)
@@ -616,6 +622,128 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                     external_by_res_id[res_id] = f"{module}.{name}"
             offset += len(rows)
         return external_by_res_id
+
+    def _export_items_only() -> None:
+        item_fields = [
+            "OdooVariantId",
+            "OdooVariantExternalId",
+            "OdooName",
+            "OdooVariantName",
+            "OdooItemCode",
+            "OdooColor",
+            "Active",
+            "OdooTemplateId",
+            "OdooTemplateExternalId",
+            "OdooTemplateListPrice",
+        ]
+        with open(items_out, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=item_fields, delimiter=DELIMITER)
+            writer.writeheader()
+            variant_external = _load_external_ids("product.product")
+            offset = 0
+            while True:
+                rows = client.search_read(
+                    "product.product",
+                    [["active", "=", True]],
+                    ["id", "name", "display_name", "default_code", "active", "product_template_attribute_value_ids", "product_tmpl_id"],
+                    limit=batch,
+                    offset=offset,
+                )
+                if not rows:
+                    break
+                tmpl_ids = set()
+                attr_ids = set()
+                for r in rows:
+                    for aid in r.get("product_template_attribute_value_ids") or []:
+                        attr_ids.add(aid)
+                    tmpl = r.get("product_tmpl_id") or []
+                    if isinstance(tmpl, list) and tmpl:
+                        tmpl_ids.add(tmpl[0])
+                attr_map = {}
+                if attr_ids:
+                    ids = list(attr_ids)
+                    chunk_size = 1000
+                    for i in range(0, len(ids), chunk_size):
+                        chunk = ids[i:i + chunk_size]
+                        vals = client.models.execute_kw(
+                            client.db,
+                            client.uid,
+                            client.apikey,
+                            "product.template.attribute.value",
+                            "read",
+                            [chunk],
+                            {"fields": ["name", "attribute_id"]},
+                        )
+                        for v in vals:
+                            attr = v.get("attribute_id")
+                            attr_name = attr[1] if isinstance(attr, list) and len(attr) > 1 else ""
+                            attr_map[v.get("id")] = {
+                                "name": v.get("name", ""),
+                                "attribute": attr_name,
+                            }
+                tmpl_external = {}
+                tmpl_prices = {}
+                if tmpl_ids:
+                    ids = list(tmpl_ids)
+                    chunk_size = 1000
+                    for i in range(0, len(ids), chunk_size):
+                        chunk = ids[i:i + chunk_size]
+                        tmpl_rows = client.models.execute_kw(
+                            client.db,
+                            client.uid,
+                            client.apikey,
+                            "product.template",
+                            "read",
+                            [chunk],
+                            {"fields": ["list_price"]},
+                        )
+                        for t in tmpl_rows:
+                            if t.get("id"):
+                                tmpl_prices[t.get("id")] = t.get("list_price", "")
+                        data_rows = client.models.execute_kw(
+                            client.db,
+                            client.uid,
+                            client.apikey,
+                            "ir.model.data",
+                            "search_read",
+                            [[("model", "=", "product.template"), ("res_id", "in", chunk)]],
+                            {"fields": ["module", "name", "res_id"]},
+                        )
+                        for d in data_rows:
+                            res_id = d.get("res_id")
+                            module = d.get("module") or ""
+                            name = d.get("name") or ""
+                            if res_id and module and name:
+                                tmpl_external[res_id] = f"{module}.{name}"
+                for r in rows:
+                    color_values = []
+                    for aid in r.get("product_template_attribute_value_ids") or []:
+                        info = attr_map.get(aid)
+                        if info and (info.get("attribute") or "").lower() == "color":
+                            color_values.append(info.get("name", ""))
+                    tmpl = r.get("product_tmpl_id") or []
+                    tmpl_id = tmpl[0] if isinstance(tmpl, list) and tmpl else ""
+                    writer.writerow({
+                        "OdooVariantId": r.get("id", ""),
+                        "OdooVariantExternalId": variant_external.get(str(r.get("id", "")), ""),
+                        "OdooName": r.get("name", "") or "",
+                        "OdooVariantName": r.get("display_name", "") or "",
+                        "OdooItemCode": r.get("default_code", "") or "",
+                        "OdooColor": " / ".join([c for c in color_values if c]),
+                        "Active": r.get("active", ""),
+                        "OdooTemplateId": tmpl_id,
+                        "OdooTemplateExternalId": tmpl_external.get(tmpl_id, ""),
+                        "OdooTemplateListPrice": tmpl_prices.get(tmpl_id, ""),
+                    })
+                offset += len(rows)
+
+    if only_targets and not only_targets.issubset({"items", "items_odoo"}):
+        print("ERROR: --only currently supports: items_odoo")
+        return 2
+    if only_targets:
+        _export_items_only()
+        print(f"OK: odoo items exported -> {items_out}")
+        return 0
 
     partner_external_ids = _load_external_ids("res.partner")
 
@@ -981,118 +1109,7 @@ def refresh_odoo(args: argparse.Namespace) -> int:
                 })
             offset += len(rows)
 
-    item_fields = [
-        "OdooVariantId",
-        "OdooVariantExternalId",
-        "OdooName",
-        "OdooVariantName",
-        "OdooItemCode",
-        "OdooColor",
-        "Active",
-        "OdooTemplateId",
-        "OdooTemplateExternalId",
-        "OdooTemplateListPrice",
-    ]
-    with open(items_out, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=item_fields, delimiter=DELIMITER)
-        writer.writeheader()
-        variant_external = _load_external_ids("product.product")
-        offset = 0
-        while True:
-            rows = client.search_read(
-                "product.product",
-                [["active", "=", True]],
-                ["id", "name", "display_name", "default_code", "active", "product_template_attribute_value_ids", "product_tmpl_id"],
-                limit=batch,
-                offset=offset,
-            )
-            if not rows:
-                break
-            tmpl_ids = set()
-            attr_ids = set()
-            for r in rows:
-                for aid in r.get("product_template_attribute_value_ids") or []:
-                    attr_ids.add(aid)
-                tmpl = r.get("product_tmpl_id") or []
-                if isinstance(tmpl, list) and tmpl:
-                    tmpl_ids.add(tmpl[0])
-            attr_map = {}
-            if attr_ids:
-                ids = list(attr_ids)
-                chunk_size = 1000
-                for i in range(0, len(ids), chunk_size):
-                    chunk = ids[i:i + chunk_size]
-                    vals = client.models.execute_kw(
-                        client.db,
-                        client.uid,
-                        client.apikey,
-                        "product.template.attribute.value",
-                        "read",
-                        [chunk],
-                        {"fields": ["name", "attribute_id"]},
-                    )
-                    for v in vals:
-                        attr = v.get("attribute_id")
-                        attr_name = attr[1] if isinstance(attr, list) and len(attr) > 1 else ""
-                        attr_map[v.get("id")] = {
-                            "name": v.get("name", ""),
-                            "attribute": attr_name,
-                        }
-            tmpl_external = {}
-            tmpl_prices = {}
-            if tmpl_ids:
-                ids = list(tmpl_ids)
-                chunk_size = 1000
-                for i in range(0, len(ids), chunk_size):
-                    chunk = ids[i:i + chunk_size]
-                    tmpl_rows = client.models.execute_kw(
-                        client.db,
-                        client.uid,
-                        client.apikey,
-                        "product.template",
-                        "read",
-                        [chunk],
-                        {"fields": ["list_price"]},
-                    )
-                    for t in tmpl_rows:
-                        if t.get("id"):
-                            tmpl_prices[t.get("id")] = t.get("list_price", "")
-                    data_rows = client.models.execute_kw(
-                        client.db,
-                        client.uid,
-                        client.apikey,
-                        "ir.model.data",
-                        "search_read",
-                        [[("model", "=", "product.template"), ("res_id", "in", chunk)]],
-                        {"fields": ["module", "name", "res_id"]},
-                    )
-                    for d in data_rows:
-                        res_id = d.get("res_id")
-                        module = d.get("module") or ""
-                        name = d.get("name") or ""
-                        if res_id and module and name:
-                            tmpl_external[res_id] = f"{module}.{name}"
-            for r in rows:
-                color_values = []
-                for aid in r.get("product_template_attribute_value_ids") or []:
-                    info = attr_map.get(aid)
-                    if info and (info.get("attribute") or "").lower() == "color":
-                        color_values.append(info.get("name", ""))
-                tmpl = r.get("product_tmpl_id") or []
-                tmpl_id = tmpl[0] if isinstance(tmpl, list) and tmpl else ""
-                writer.writerow({
-                    "OdooVariantId": r.get("id", ""),
-                    "OdooVariantExternalId": variant_external.get(str(r.get("id", "")), ""),
-                    "OdooName": r.get("name", "") or "",
-                    "OdooVariantName": r.get("display_name", "") or "",
-                    "OdooItemCode": r.get("default_code", "") or "",
-                    "OdooColor": " / ".join([c for c in color_values if c]),
-                    "Active": r.get("active", ""),
-                    "OdooTemplateId": tmpl_id,
-                    "OdooTemplateExternalId": tmpl_external.get(tmpl_id, ""),
-                    "OdooTemplateListPrice": tmpl_prices.get(tmpl_id, ""),
-                })
-            offset += len(rows)
+    _export_items_only()
 
     print(f"OK: odoo customers exported -> {customers_out}")
     print(f"OK: odoo contacts exported -> {contacts_out}")
@@ -3534,6 +3551,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1000,
         help="Batch size for Odoo export",
+    )
+    p2.add_argument(
+        "--only",
+        default="",
+        help="Optional subset export. Supported: items_odoo",
+    )
+    p2.add_argument(
+        "only_pos",
+        nargs="?",
+        default="",
+        help=argparse.SUPPRESS,
     )
     p2.set_defaults(func=refresh_odoo)
 

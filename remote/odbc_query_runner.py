@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--sql-file", default=None)
     parser.add_argument("--out-dir", default=os.environ.get("SAGE_OUTPUT_DIR", r"C:\Users\soadmin\Dropbox\ENZO-Sage50\autoexec_output"))
     parser.add_argument("--out-name", default=None)
+    parser.add_argument("--delimiter", default=";", help="CSV delimiter (default ';').")
     parser.add_argument("--max-rows", type=int, default=0, help="0 = no limit")
     args = parser.parse_args()
 
@@ -58,8 +59,9 @@ def main():
         cur.execute(query)
         columns = [d[0] for d in cur.description] if cur.description else []
 
+        delim = args.delimiter if args.delimiter in {";", ","} else ";"
         with open(out_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
+            writer = csv.writer(f, delimiter=delim)
             if columns:
                 writer.writerow(columns)
             while True:

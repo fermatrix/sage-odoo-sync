@@ -1,5 +1,13 @@
 # Sage 50 ODBC probe (remote)
 
+## CAUTION
+
+All Sage-generated CSV files **must use semicolon (`;`)** as delimiter.
+
+- Required for all pipelines in this project (`_master_sage`, monthly `13_2026`, API sync inputs).
+- Do **not** generate Sage files with comma delimiter.
+- For `odbc_query_runner.py`, keep default delimiter (`;`) and do not pass `--delimiter ,`.
+
 This folder contains a minimal ODBC connectivity probe for Sage 50.
 It lists available tables and writes them to a CSV in the Dropbox folder.
 

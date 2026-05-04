@@ -349,6 +349,28 @@ def _iter_sales_order_pairs(root_dir: str) -> List[Tuple[str, str]]:
     return sorted(pairs, key=lambda p: p[0])
 
 
+def _assert_semicolon_csv(path: str) -> None:
+    """Fail fast when a CSV is not semicolon-delimited.
+
+    Sage source files must be generated with ';' to keep the pipeline stable
+    and auditable. We never auto-rewrite delimiters here.
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        sample = f.read(4096)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+            detected = dialect.delimiter
+        except Exception:
+            detected = ";"
+    if detected != ";":
+        raise ValueError(
+            "Invalid delimiter detected in Sage Sales Orders file. "
+            f"Expected ';' but got '{detected}' in: {path}"
+        )
+
+
 def _matches_load(transaction_date: str, mode: str, value: object) -> bool:
     if not mode:
         return True
@@ -378,6 +400,8 @@ def load_order_data_auto(root_dir: str, load_spec: str):
     matched_files = 0
 
     for headers_path, lines_path in pairs:
+        _assert_semicolon_csv(headers_path)
+        _assert_semicolon_csv(lines_path)
         _, header_rows = read_csv(headers_path)
         selected_headers = []
         post_orders = set()
