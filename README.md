@@ -24,6 +24,11 @@
     - Hay que volver a **crear** los `.job.txt` (borrar y re-copiar) para que cuenten como nuevos.
   - Al detectar un job, lo renombra a `processing_...` en la misma carpeta.
     - Luego lo mueve a `done/` con prefijo `executed_...` o `failed_...`.
+  - Ejecutar exports **de forma secuencial (1 job cada vez)**:
+    - Crear 1 job.
+    - Esperar a que termine (`executed_*` o `failed_*`).
+    - Solo entonces crear el siguiente.
+  - No encolar varios jobs pesados a la vez (invoices/credit notes/sales orders), porque el watcher puede quedarse bloqueado con jobs pendientes sin procesar.
 
 ### Watcher: cómo arrancarlo
 En la máquina remota:
@@ -401,7 +406,8 @@ Flags CLI (`sync_sales_orders_api.py`):
 - `--lines-path`: CSV de líneas (modo manual, sin `--load`).
 - `--customers-sync`: ruta a `customers_sync.csv`.
 - `--products-sync`: **deprecated/ignorado** en este script.
-- `--employees-sync`: ruta a `employees_sync.csv`.
+- `--employees-sync`: **deprecated/ignorado** en este script.
+- `--employees-master`: ruta a `employees.csv` de Sage. Default: `ENZO-Sage50\_master_sage\employees.csv`.
 - `--load`: auto-descubre ficheros de sales orders por periodo/fecha. Formatos:
   - `DD/MM/YYYY`
   - `MM/YYYY`
@@ -424,14 +430,22 @@ Flags CLI (`sync_sales_orders_api.py`):
   - Mantiene el modo estricto por defecto si no se pasa este flag.
   - Permite equivalencias de calle tipo `#`/`SUITE`/`STE`.
   - Aplica paridad simple de estado (ej. `TX` <-> `Texas`, `ON` <-> `Ontario`).
-- `--create-shipping-address`: cuando falla el match de shipping, crea una dirección `delivery` en Odoo bajo el customer (`res.partner`) y la usa en la SO.
-  - Usa paridades de `state/country` (`_master/_parity_state.csv`, `_master/_parity_country.csv`) para mapear correctamente.
+- Auto-create shipping está controlado por tag de customer en Odoo:
+  - si el customer tiene tag `dropshipper`, cuando no hay match exacto de shipping se crea dirección `delivery` on-the-fly.
+  - si no tiene ese tag, el mismatch de shipping sigue siendo `ERROR`.
 - `--freight-variant-id`: `product.product` ID para usar en líneas de `Freight Amount`/`Shipping` de Sage cuando vienen con `ItemRecordNumber=0`.
 - `--freight-product-name`: fallback por nombre para localizar el producto de freight si no se indica `--freight-variant-id`. Default: `Freight`.
 - `--content-verify`: verifica contenido de SO existentes en Odoo contra Sage sin crear/actualizar.
   - Valida: `SKU/qty`, `PO (client_order_ref)`, descripciones de línea, `pricelist_id`, `salesperson (user_id)`, `sales team (team_id)`, `date_order`, `validity_date`, `commitment_date`.
   - Si falta `salesperson` (para reps con `EmpRecordNumber != 0`), devuelve `ERROR`.
   - Si falta `sales team`, usa fallback automático al team genérico `Sales` (si existe).
+
+Resolución de salesperson/team (Proceso B, solo live Odoo):
+- El comercial se toma de `EmpRecordNumber` en SO Sage (no de `SalesRepID`, que suele venir vacío).
+- `EmpRecordNumber` -> `EmployeeID` en `employees.csv` Sage -> login esperado normalizado (ej. `SO - HA` -> `so_-_ha`).
+- Se consulta `res.users` en Odoo en vivo por login.
+- Si no existe usuario en Odoo o no tiene Sales Team (y no aplica fallback `Sales`), la SO queda en `ERROR`.
+- Caso real documentado: `HOUSE ACCOUNT` tenía histórico en Odoo con login `re_122`; en Sage quedó codificado como `SO - HA` (`so_-_ha`).
 - `--content-repair`: repara automáticamente diferencias detectadas por `--content-verify`:
   - reabre `ORDER` -> `CANCEL` -> `QUOTE`
   - actualiza `order_lines`, `pricelist_id`, `client_order_ref`, `user_id`, `team_id`, `date_order`, `validity_date`, `commitment_date`.

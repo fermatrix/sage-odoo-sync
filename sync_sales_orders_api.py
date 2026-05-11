@@ -100,7 +100,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=r"ENZO-Sage50\_master_odoo\items_odoo.csv",
         help="Deprecated/ignored. Odoo variants are read live from API.",
     )
-    p.add_argument("--employees-sync", default=r"ENZO-Sage50\_master\employees_sync.csv")
+    p.add_argument(
+        "--employees-sync",
+        default=r"ENZO-Sage50\_master\employees_sync.csv",
+        help="Deprecated/ignored. Sales rep resolution does not use employees_sync.",
+    )
+    p.add_argument("--employees-master", default=r"ENZO-Sage50\_master_sage\employees.csv")
     p.add_argument(
         "--limit",
         default="",
@@ -158,14 +163,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--create-shipping-address",
-        action="store_true",
-        help=(
-            "When shipping address does not match, create a delivery address under "
-            "the customer in Odoo (using state/country parity) and use it in the order."
-        ),
-    )
-    p.add_argument(
         "--freight-variant-id",
         type=int,
         default=0,
@@ -173,8 +170,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--freight-product-name",
-        default="Freight",
+        default="MISC SHIPPING",
         help="Fallback product name lookup for freight when --freight-variant-id is not provided.",
+    )
+    p.add_argument(
+        "--concept-variant-id",
+        type=int,
+        default=0,
+        help="Odoo product.product id to use for Sage concept rows (ItemRecordNumber=0 with qty/amount/description).",
+    )
+    p.add_argument(
+        "--concept-product-name",
+        default="MISC CHARGE",
+        help="Fallback product name lookup for concept rows when --concept-variant-id is not provided.",
     )
     p.add_argument(
         "--content-verify",
@@ -615,7 +623,27 @@ def build_order_lines(
     source_lines: List[Dict[str, str]],
     products_map: Dict[str, Dict[str, str]],
     freight_variant_id: int = 0,
+    concept_variant_id: int = 0,
 ) -> Dict[str, object]:
+    def _looks_like_misc_shipping(raw_desc: str) -> bool:
+        t = (raw_desc or "").strip().upper()
+        if not t:
+            return False
+        markers = [
+            "SHIPPING",
+            "FREIGHT",
+            "SHIP",
+            "UPS",
+            "US MAIL",
+            "USPS",
+            "AIRBORNE",
+            "COURIER",
+            "DELIVERY",
+            "CUSTOMS",
+            "EXPEDITION",
+        ]
+        return any(m in t for m in markers)
+
     def _format_sage_line_description(raw_desc: str) -> str:
         text = (raw_desc or "").strip()
         if not text:
@@ -660,16 +688,16 @@ def build_order_lines(
                     if code and code not in tax_authority_codes:
                         tax_authority_codes.append(code)
                 continue
-            # Non-tax technical rows can still carry freight amount.
+            # Non-tax technical rows can still carry misc shipping or concept amounts.
             amount = abs(parse_decimal(line.get("Amount") or ""))
-            is_freight_amount = amount > 0 and ("FREIGHT" in row_desc or "SHIPPING" in row_desc)
-            if is_freight_amount:
+            is_misc_shipping = amount > 0 and _looks_like_misc_shipping(row_desc_raw)
+            if is_misc_shipping:
                 if freight_variant_id:
                     source_total += amount
                     source_product_row_count += 1
                     out.append({
                         "product_id": int(freight_variant_id),
-                        "name": (row_desc_formatted or "Freight"),
+                        "name": (row_desc_formatted or "MISC SHIPPING"),
                         "product_uom_qty": 1.0,
                         "price_unit": round(amount, 2),
                         "tax_ids": [(5, 0, 0)],
@@ -684,7 +712,33 @@ def build_order_lines(
                     shipping_line_indexes.append(len(out) - 1)
                 else:
                     skipped_reasons.append(
-                        f"Freight line ({row_desc_raw}): missing freight variant id configuration"
+                        f"Misc shipping line ({row_desc_raw}): missing freight variant id configuration"
+                    )
+            elif amount > 0 and row_desc_raw:
+                # Operational/business concept row from Sage (not a stock product).
+                # Replicate it in Odoo as a service concept line.
+                qty = parse_decimal(line.get("Quantity") or "")
+                if qty <= 0:
+                    qty = 1.0
+                if concept_variant_id:
+                    source_total += amount
+                    source_product_row_count += 1
+                    out.append({
+                        "product_id": int(concept_variant_id),
+                        "name": (row_desc_formatted or row_desc_raw),
+                        "product_uom_qty": qty,
+                        "price_unit": round(amount / qty if qty else amount, 2),
+                        "tax_ids": [(5, 0, 0)],
+                    })
+                    variant_debug_rows.append({
+                        "product_id": str(concept_variant_id),
+                        "item_record": "0",
+                        "item_id": "SAGE_CONCEPT",
+                        "row_desc": row_desc_raw,
+                    })
+                else:
+                    skipped_reasons.append(
+                        f"Concept line ({row_desc_raw}): missing concept variant id configuration"
                     )
             elif row_desc_raw:
                 # Preserve non-tax/non-amount operational text rows from Sage.
@@ -1075,6 +1129,33 @@ def to_login(employee_id: str) -> str:
     return (employee_id or "").strip().lower().replace(" ", "_")
 
 
+def _norm_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+
+
+def resolve_sales_user_live(
+    emp: Dict[str, str],
+    user_by_login: Dict[str, Dict[str, object]],
+    user_by_name_norm: Dict[str, Dict[str, object]],
+) -> Tuple[str, Optional[Dict[str, object]]]:
+    """Resolve salesperson using live Odoo users only (no local Odoo mappings)."""
+    emp_id = (emp.get("EmployeeID") or "").strip()
+    login_candidate = to_login(emp_id)
+    if login_candidate:
+        u = user_by_login.get(login_candidate)
+        if u:
+            return login_candidate, u
+
+    # Fallback: exact name match against current Odoo users (live truth)
+    emp_name = (emp.get("EmployeeName") or "").strip()
+    if emp_name:
+        u = user_by_name_norm.get(_norm_text(emp_name))
+        if u:
+            return (u.get("login") or "").strip().lower(), u
+
+    return login_candidate, None
+
+
 def append_log(path: str, rows: List[Dict[str, str]]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fieldnames = [
@@ -1298,6 +1379,11 @@ def _print_order_progress(entry: Dict[str, str], index: int) -> None:
                 details_for_parts = details_for_parts.strip(" ;")
         parts = [p.strip() for p in details_for_parts.split(";") if p.strip() and p.strip().lower() != "no sales rep"]
         for part in parts:
+            pretty_rows = _pretty_sage_source_rows(part)
+            if pretty_rows:
+                for ln in pretty_rows:
+                    print(ln)
+                continue
             wrapped = textwrap.fill(
                 part,
                 width=120,
@@ -1632,6 +1718,33 @@ def _existing_order_skus(client: OdooClient, order_id: int) -> Dict[str, float]:
     return out
 
 
+def _pretty_sage_source_rows(part: str) -> Optional[List[str]]:
+    marker = "Sage source rows:"
+    if marker not in part:
+        return None
+    raw = part.split(marker, 1)[1].strip()
+    if not raw:
+        return None
+    chunks = [c.strip() for c in raw.split("__ROWSEP__") if c.strip()]
+    if not chunks:
+        return None
+    out = ["        - Sage source rows:"]
+    for chunk in chunks:
+        m = re.match(
+            r"^(?P<idx>\d+)\s*\|\s*(?P<desc>.*?)\s*x(?P<qty>[^|]+)\s*\|\s*(?P<amount>.+)$",
+            chunk,
+        )
+        if m:
+            idx = m.group("idx").strip()
+            desc = m.group("desc").strip()
+            qty = m.group("qty").strip()
+            amount = m.group("amount").strip()
+            out.append(f"          #{idx}  {desc} x{qty} = {amount}")
+        else:
+            out.append(f"          {chunk}")
+    return out
+
+
 def run(args: argparse.Namespace) -> int:
     if args.content_repair and not args.content_verify:
         # Repair logic is implemented inside content-verify mode.
@@ -1665,7 +1778,9 @@ def run(args: argparse.Namespace) -> int:
     else:
         print("ERROR: products mapping source is empty (items.csv + items_odoo.csv required)")
         return 2
-    employees_map = load_employees_map(args.employees_sync)
+    if (args.employees_sync or "").strip():
+        print("INFO: --employees-sync is ignored by design")
+    employees_map = load_employees_map(args.employees_master)
     if (args.load or "").strip():
         headers, lines_by_postorder = load_order_data_auto(args.root_dir, args.load)
     else:
@@ -1731,6 +1846,11 @@ def run(args: argparse.Namespace) -> int:
         for u in users_all
         if (u.get("login") or "").strip()
     }
+    user_by_name_norm = {
+        _norm_text(u.get("name") or ""): u
+        for u in users_all
+        if (u.get("name") or "").strip()
+    }
     team_members_all = client.models.execute_kw(
         client.db,
         client.uid,
@@ -1783,6 +1903,29 @@ def run(args: argparse.Namespace) -> int:
                 active = [c for c in candidates if bool(c.get("active", True))]
                 pick = active[0] if active else candidates[0]
                 freight_variant_id = int(pick.get("id") or 0)
+    concept_variant_id = int(args.concept_variant_id or 0)
+    if concept_variant_id <= 0:
+        concept_name = (args.concept_product_name or "MISC CHARGE").strip()
+        if concept_name:
+            candidates = client.search_read(
+                "product.product",
+                [("name", "=", concept_name)],
+                ["id", "name", "active"],
+                limit=20,
+                offset=0,
+            )
+            if not candidates:
+                candidates = client.search_read(
+                    "product.product",
+                    [("name", "ilike", concept_name)],
+                    ["id", "name", "active"],
+                    limit=20,
+                    offset=0,
+                )
+            if candidates:
+                active = [c for c in candidates if bool(c.get("active", True))]
+                pick = active[0] if active else candidates[0]
+                concept_variant_id = int(pick.get("id") or 0)
     address_parity_maps = load_address_parity_maps(args.root_dir)
     country_state_indexes = fetch_country_state_indexes(client)
 
@@ -1796,6 +1939,44 @@ def run(args: argparse.Namespace) -> int:
     invoice_partner_cache: Dict[int, int] = {}
     shipping_partner_cache: Dict[Tuple[int, str, str, str, str, str, str, bool], Tuple[int, bool, str]] = {}
     product_variant_exists_cache: Dict[int, bool] = {}
+    dropshipper_cache: Dict[int, bool] = {}
+    category_name_cache: Dict[int, str] = {}
+
+    def _customer_has_dropshipper_tag(partner_id: int) -> bool:
+        if partner_id in dropshipper_cache:
+            return dropshipper_cache[partner_id]
+        rows = client.search_read(
+            "res.partner",
+            [("id", "=", int(partner_id))],
+            ["id", "category_id"],
+            limit=1,
+            offset=0,
+        )
+        has_tag = False
+        if rows:
+            category_ids = rows[0].get("category_id") or []
+            for cat_id in category_ids:
+                try:
+                    cid = int(cat_id)
+                except Exception:
+                    continue
+                if cid in category_name_cache:
+                    cat_name = category_name_cache[cid]
+                else:
+                    cat_rows = client.search_read(
+                        "res.partner.category",
+                        [("id", "=", cid)],
+                        ["id", "name"],
+                        limit=1,
+                        offset=0,
+                    )
+                    cat_name = str(cat_rows[0].get("name") or "").strip().lower() if cat_rows else ""
+                    category_name_cache[cid] = cat_name
+                if cat_name == "dropshipper":
+                    has_tag = True
+                    break
+        dropshipper_cache[partner_id] = has_tag
+        return has_tag
 
     def push_log(entry: Dict[str, str]) -> None:
         nonlocal processed_index, processed_count, current_no_sales_rep
@@ -1805,6 +1986,32 @@ def run(args: argparse.Namespace) -> int:
         processed_count += 1
         processed_index += 1
         _print_order_progress(entry, processed_index)
+
+    def _sage_rows_preview(rows: List[Dict[str, str]], limit: int = 8) -> str:
+        parts: List[str] = []
+        shown = 0
+        visible_total = 0
+        for i, row in enumerate(rows, start=1):
+            rec = str(row.get("ItemRecordNumber") or "").strip()
+            qty = str(row.get("Quantity") or "").strip()
+            amount = str(row.get("Amount") or "").strip()
+            desc = str(row.get("RowDescription") or "").strip()
+            # Sage sometimes stores a hidden summary/header row (item=0, qty=0) that
+            # does not appear on the visible sales order UI. Skip it in logs.
+            if rec in {"", "0"} and qty in {"", "0", "0.0", "0,0"}:
+                continue
+            visible_total += 1
+            if shown >= limit:
+                continue
+            qty_out = qty or "-"
+            amount_out = amount or "-"
+            desc_out = desc or "''"
+            parts.append(f"{i} | {desc_out} x{qty_out} | {amount_out}")
+            shown += 1
+        extra = max(0, visible_total - shown)
+        if extra > 0:
+            parts.append(f"... (+{extra} more)")
+        return " __ROWSEP__ ".join(parts)
 
     for header_index, h in enumerate(headers):
         if max_orders is not None and processed_count >= max_orders:
@@ -1830,9 +2037,14 @@ def run(args: argparse.Namespace) -> int:
         transaction_date = (h.get("TransactionDate") or "").strip()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        source_lines = lines_by_postorder.get(post_order, [])
-        source_lines = filter_non_importable_sage_rows(source_lines, h)
-        prepared_info = build_order_lines(source_lines, products_map, freight_variant_id=freight_variant_id)
+        source_lines_raw = lines_by_postorder.get(post_order, [])
+        source_lines = filter_non_importable_sage_rows(source_lines_raw, h)
+        prepared_info = build_order_lines(
+            source_lines,
+            products_map,
+            freight_variant_id=freight_variant_id,
+            concept_variant_id=concept_variant_id,
+        )
         prepared_lines = prepared_info["lines"]
         source_row_count = int(prepared_info.get("source_row_count") or 0)
         source_product_row_count = int(prepared_info.get("source_product_row_count") or 0)
@@ -1863,6 +2075,7 @@ def run(args: argparse.Namespace) -> int:
                     "name": f"Shipping Method: {ship_via}",
                 })
         if not has_product_lines:
+            source_preview = _sage_rows_preview(source_lines_raw)
             push_log({
                 "Timestamp": now,
                 "Status": "ERROR",
@@ -1878,6 +2091,7 @@ def run(args: argparse.Namespace) -> int:
                     "No valid order lines after product mapping "
                     f"(source_rows={source_row_count}, source_product_rows={source_product_row_count}, "
                     f"skipped_rows={len(prepared_info.get('skipped_reasons') or [])})"
+                    + (f"; Sage source rows: {source_preview}" if source_preview else "")
                 ),
             })
             if not continue_on_error:
@@ -1970,9 +2184,11 @@ def run(args: argparse.Namespace) -> int:
                 existing_shipping_id = raw_existing_shipping
         emp_record_for_verify = (h.get("EmpRecordNumber") or "").strip()
         emp_for_verify = employees_map.get(emp_record_for_verify) or {}
-        emp_id_for_verify = (emp_for_verify.get("EmployeeID") or "").strip()
-        sales_login_for_verify = to_login(emp_id_for_verify)
-        sales_user_for_verify = user_by_login.get(sales_login_for_verify) if sales_login_for_verify else None
+        sales_login_for_verify, sales_user_for_verify = resolve_sales_user_live(
+            emp_for_verify,
+            user_by_login,
+            user_by_name_norm,
+        )
         desired_user_id_for_verify = int(sales_user_for_verify["id"]) if sales_user_for_verify else 0
         desired_team_id_for_verify = int(team_by_user_id.get(desired_user_id_for_verify) or 0) if desired_user_id_for_verify else 0
         if desired_user_id_for_verify and not desired_team_id_for_verify and generic_sales_team_id:
@@ -2013,7 +2229,7 @@ def run(args: argparse.Namespace) -> int:
             if not emp_record_for_verify:
                 identity_errors.append("Missing EmpRecordNumber in Sage order")
             elif emp_record_for_verify != "0":
-                if not emp_id_for_verify:
+                if not (emp_for_verify and (emp_for_verify.get("EmployeeID") or "").strip()):
                     identity_errors.append(f"Missing employee mapping for EmpRecordNumber {emp_record_for_verify}")
                 elif not sales_user_for_verify:
                     identity_errors.append(f"Missing Odoo user for employee login {sales_login_for_verify}")
@@ -2549,9 +2765,11 @@ def run(args: argparse.Namespace) -> int:
         term_id = resolve_term_id(terms_map, term_name)
         emp_record = (h.get("EmpRecordNumber") or "").strip()
         emp = employees_map.get(emp_record) or {}
-        emp_id = (emp.get("EmployeeID") or "").strip()
-        sales_login = to_login(emp_id)
-        sales_user = user_by_login.get(sales_login) if sales_login else None
+        sales_login, sales_user = resolve_sales_user_live(
+            emp,
+            user_by_login,
+            user_by_name_norm,
+        )
         sales_team_id = int(team_by_user_id.get(int(sales_user["id"])) or 0) if sales_user else 0
         if sales_user and not sales_team_id and generic_sales_team_id:
             sales_team_id = generic_sales_team_id
@@ -2611,7 +2829,7 @@ def run(args: argparse.Namespace) -> int:
         if not emp_record:
             critical_errors.append("Missing EmpRecordNumber in Sage order")
         elif emp_record != "0":
-            if not emp_id:
+            if not (emp and (emp.get("EmployeeID") or "").strip()):
                 critical_errors.append(f"Missing employee mapping for EmpRecordNumber {emp_record}")
             elif not sales_user:
                 critical_errors.append(f"Missing Odoo user for employee login {sales_login}")
@@ -2628,38 +2846,43 @@ def run(args: argparse.Namespace) -> int:
             if exists and existing_shipping_id and existing_shipping_id != partner_id_int and not args.shipping_relaxed:
                 shipping_partner_id = existing_shipping_id
                 shipping_preserved_from_existing = True
-            elif args.create_shipping_address:
-                try:
-                    new_shipping_id, created_detail = create_shipping_address_on_the_fly(
-                        client=client,
-                        parent_id=partner_id_int,
-                        ship_to_name=ship_key[1],
-                        ship_to_address1=ship_key[2],
-                        ship_to_address2=ship_key[3],
-                        ship_to_city=ship_key[4],
-                        ship_to_state=ship_key[5],
-                        ship_to_zip=ship_key[6],
-                        ship_to_country=ship_to_country,
-                        parity_maps=address_parity_maps,
-                        indexes=country_state_indexes,
-                    )
-                    if new_shipping_id:
-                        shipping_partner_id = int(new_shipping_id)
-                        shipping_exact = True
-                        shipping_created_on_the_fly = True
-                        shipping_created_detail = created_detail
-                except Exception as exc:
-                    critical_errors.append(f"Failed to create shipping address on the fly: {exc}")
             else:
-                customer_name_part = f"customer_name='{customer_odoo_name}'; " if customer_odoo_name else ""
-                critical_errors.append(
-                    "Missing exact shipping address match in Odoo "
-                    f"(customer_odoo_id={partner_id_int}; "
-                    f"{customer_name_part}"
-                    f"sage_ship_to=name='{ship_key[1]}', street='{ship_key[2]}', street2='{ship_key[3]}', "
-                    f"city='{ship_key[4]}', state='{ship_key[5]}', zip='{ship_key[6]}'; "
-                    f"best_candidate={shipping_debug})"
-                )
+                has_dropshipper_tag = _customer_has_dropshipper_tag(partner_id_int)
+                should_auto_create_shipping = has_dropshipper_tag
+                if should_auto_create_shipping:
+                    try:
+                        new_shipping_id, created_detail = create_shipping_address_on_the_fly(
+                            client=client,
+                            parent_id=partner_id_int,
+                            ship_to_name=ship_key[1],
+                            ship_to_address1=ship_key[2],
+                            ship_to_address2=ship_key[3],
+                            ship_to_city=ship_key[4],
+                            ship_to_state=ship_key[5],
+                            ship_to_zip=ship_key[6],
+                            ship_to_country=ship_to_country,
+                            parity_maps=address_parity_maps,
+                            indexes=country_state_indexes,
+                        )
+                        if new_shipping_id:
+                            shipping_partner_id = int(new_shipping_id)
+                            shipping_exact = True
+                            shipping_created_on_the_fly = True
+                            shipping_created_detail = created_detail
+                            if has_dropshipper_tag:
+                                info_parts.append("Shipping auto-create enabled by customer tag: dropshipper")
+                    except Exception as exc:
+                        critical_errors.append(f"Failed to create shipping address on the fly: {exc}")
+                else:
+                    customer_name_part = f"customer_name='{customer_odoo_name}'; " if customer_odoo_name else ""
+                    critical_errors.append(
+                        "Missing exact shipping address match in Odoo "
+                        f"(customer_odoo_id={partner_id_int}; "
+                        f"{customer_name_part}"
+                        f"sage_ship_to=name='{ship_key[1]}', street='{ship_key[2]}', street2='{ship_key[3]}', "
+                        f"city='{ship_key[4]}', state='{ship_key[5]}', zip='{ship_key[6]}'; "
+                        f"best_candidate={shipping_debug})"
+                    )
         if shipping_preserved_from_existing:
             warning_parts.append("Shipping preserved from existing Odoo order (strict mode)")
         if shipping_created_on_the_fly:
