@@ -45,13 +45,13 @@ def filter_non_importable_sage_rows(
     """
     out: List[Dict[str, str]] = []
     header_desc = (header.get("Description") or "").strip().upper()
-    header_amount = abs(parse_decimal(header.get("MainAmount") or ""))
+    header_amount = parse_decimal(header.get("MainAmount") or "")
     for line in source_lines:
         item_record = (line.get("ItemRecordNumber") or "").strip()
         row_number = (line.get("RowNumber") or "").strip()
         qty = parse_decimal(line.get("Quantity") or "")
         row_desc = (line.get("RowDescription") or "").strip().upper()
-        row_amount = abs(parse_decimal(line.get("Amount") or ""))
+        row_amount = parse_decimal(line.get("Amount") or "")
         looks_like_header_technical_row = (
             item_record == "0"
             and row_number == "0"
@@ -126,6 +126,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference",
         default="",
         help="Process one or many Sage references separated by comma (example: 357702 or 357702,357703)",
+    )
+    p.add_argument(
+        "--ignore-references",
+        default="",
+        help=(
+            "Comma-separated Sage references to ignore. "
+            "If empty, loaded from env SALES_ORDER_IGNORE_REFERENCES "
+            "(or profile key <PROFILE>_IGNORE_REFERENCES)."
+        ),
     )
     p.add_argument(
         "--load",
@@ -624,6 +633,7 @@ def build_order_lines(
     products_map: Dict[str, Dict[str, str]],
     freight_variant_id: int = 0,
     concept_variant_id: int = 0,
+    header_main_amount: float = 0.0,
 ) -> Dict[str, object]:
     def _looks_like_misc_shipping(raw_desc: str) -> bool:
         t = (raw_desc or "").strip().upper()
@@ -689,17 +699,23 @@ def build_order_lines(
                         tax_authority_codes.append(code)
                 continue
             # Non-tax technical rows can still carry misc shipping or concept amounts.
-            amount = abs(parse_decimal(line.get("Amount") or ""))
-            is_misc_shipping = amount > 0 and _looks_like_misc_shipping(row_desc_raw)
+            amount_signed = parse_decimal(line.get("Amount") or "")
+            # For free-text concept-only SOs, Sage may store detail rows as
+            # positive while header MainAmount is negative (credit style).
+            # Preserve accounting sign by aligning technical item=0 amounts
+            # with header sign when needed.
+            if header_main_amount < 0 and amount_signed > 0:
+                amount_signed = -amount_signed
+            is_misc_shipping = abs(amount_signed) > 0 and _looks_like_misc_shipping(row_desc_raw)
             if is_misc_shipping:
                 if freight_variant_id:
-                    source_total += amount
+                    source_total += amount_signed
                     source_product_row_count += 1
                     out.append({
                         "product_id": int(freight_variant_id),
                         "name": (row_desc_formatted or "MISC SHIPPING"),
                         "product_uom_qty": 1.0,
-                        "price_unit": round(amount, 2),
+                        "price_unit": round(amount_signed, 2),
                         "tax_ids": [(5, 0, 0)],
                     })
                     variant_debug_rows.append({
@@ -714,31 +730,33 @@ def build_order_lines(
                     skipped_reasons.append(
                         f"Misc shipping line ({row_desc_raw}): missing freight variant id configuration"
                     )
-            elif amount > 0 and row_desc_raw:
+            elif abs(amount_signed) > 0:
                 # Operational/business concept row from Sage (not a stock product).
-                # Replicate it in Odoo as a service concept line.
+                # Replicate it in Odoo as a service concept line. If description is
+                # empty, keep explicit placeholder requested by business.
                 qty = parse_decimal(line.get("Quantity") or "")
                 if qty <= 0:
                     qty = 1.0
+                concept_name = (row_desc_formatted or row_desc_raw or "<empty description>")
                 if concept_variant_id:
-                    source_total += amount
+                    source_total += amount_signed
                     source_product_row_count += 1
                     out.append({
                         "product_id": int(concept_variant_id),
-                        "name": (row_desc_formatted or row_desc_raw),
+                        "name": concept_name,
                         "product_uom_qty": qty,
-                        "price_unit": round(amount / qty if qty else amount, 2),
+                        "price_unit": round(amount_signed / qty if qty else amount_signed, 2),
                         "tax_ids": [(5, 0, 0)],
                     })
                     variant_debug_rows.append({
                         "product_id": str(concept_variant_id),
                         "item_record": "0",
                         "item_id": "SAGE_CONCEPT",
-                        "row_desc": row_desc_raw,
+                        "row_desc": concept_name,
                     })
                 else:
                     skipped_reasons.append(
-                        f"Concept line ({row_desc_raw}): missing concept variant id configuration"
+                        f"Concept line ({concept_name}): missing concept variant id configuration"
                     )
             elif row_desc_raw:
                 # Preserve non-tax/non-amount operational text rows from Sage.
@@ -748,16 +766,24 @@ def build_order_lines(
                     "name": row_desc_raw,
                 })
             else:
-                # Strict rule requested by business:
-                # if this technical/comment-like row has no recognizable content,
-                # stop the process to avoid silent information loss.
-                skipped_reasons.append(
-                    "ItemRecordNumber 0 row without transferable description "
-                    f"(RowNumber={line.get('RowNumber') or ''}, PostOrder={line.get('PostOrder') or ''})"
-                )
+                row_number = (line.get("RowNumber") or "").strip()
+                amount_raw = (line.get("Amount") or "").strip()
+                # Accept/ignore the common Sage technical header row:
+                # RowNumber=0, ItemRecordNumber=0, Description empty, Amount=0.
+                # This row is not a business line and should not block processing.
+                if row_number == "0" and parse_decimal(amount_raw or "0") == 0:
+                    pass
+                else:
+                    # Strict rule requested by business:
+                    # if this technical/comment-like row has no recognizable content,
+                    # stop the process to avoid silent information loss.
+                    skipped_reasons.append(
+                        "ItemRecordNumber 0 row without transferable description "
+                        f"(RowNumber={line.get('RowNumber') or ''}, PostOrder={line.get('PostOrder') or ''})"
+                    )
             continue
-        source_amount = abs(parse_decimal(line.get("Amount") or ""))
-        if source_amount > 0:
+        source_amount = parse_decimal(line.get("Amount") or "")
+        if abs(source_amount) > 0:
             source_total += source_amount
         source_product_row_count += 1
         product_sync = products_map.get(item_record)
@@ -777,12 +803,17 @@ def build_order_lines(
             continue
         qty = parse_decimal(line.get("Quantity") or "")
         if qty <= 0:
+            # Accept explicit zero-quantity rows in Sage SO as non-billable
+            # technical lines (do not block order creation/repair).
+            amount_signed = parse_decimal(line.get("Amount") or "")
+            if qty == 0 and abs(amount_signed) <= 0.000001:
+                continue
             skipped_reasons.append(f"ItemRecordNumber {item_record}: invalid quantity {line.get('Quantity')}")
             continue
         price_unit = parse_decimal(line.get("UnitCost") or "")
         if price_unit == 0:
-            amount = abs(parse_decimal(line.get("Amount") or ""))
-            price_unit = amount / qty if qty else 0
+            amount_signed = parse_decimal(line.get("Amount") or "")
+            price_unit = amount_signed / qty if qty else 0
         item_id = (product_sync.get("ItemID") or "").strip().upper()
         item_desc = (product_sync.get("ItemDescription") or "").strip().upper()
         row_desc = row_desc_upper
@@ -969,7 +1000,23 @@ def resolve_shipping_partner_id(
         f"zip='{(best.get('zip') or '').strip()}'"
     )
     # Require strong address match; otherwise keep parent customer address.
-    threshold = 8 if relaxed else 9
+    # Special strict-mode case: when Sage ship-to has no city/state/zip/street2,
+    # allow an exact (street + name) match to pass.
+    strict_sparse_geo = (
+        not relaxed
+        and bool(tgt_street)
+        and not tgt_city
+        and not tgt_state
+        and not tgt_zip
+    )
+    if relaxed:
+        threshold = 8
+    elif strict_sparse_geo:
+        # Without geo keys in Sage (city/state/zip empty), accept strong
+        # textual match (street + name, and optionally street2).
+        threshold = 8
+    else:
+        threshold = 9
     if best_score >= threshold:
         return int(best["id"]), True, best_summary
     return partner_id, False, best_summary
@@ -1935,6 +1982,14 @@ def run(args: argparse.Namespace) -> int:
     processed_index = start_offset
     processed_count = 0
     references_filter = _parse_reference_filter(args.reference)
+    ignore_raw = (args.ignore_references or "").strip()
+    if not ignore_raw:
+        ignore_raw = (
+            get_env_value(env, f"{args.profile}_IGNORE_REFERENCES")
+            or get_env_value(env, "SALES_ORDER_IGNORE_REFERENCES")
+            or "363903"
+        )
+    ignored_references = _parse_reference_filter(ignore_raw)
     current_no_sales_rep = False
     invoice_partner_cache: Dict[int, int] = {}
     shipping_partner_cache: Dict[Tuple[int, str, str, str, str, str, str, bool], Tuple[int, bool, str]] = {}
@@ -2018,6 +2073,8 @@ def run(args: argparse.Namespace) -> int:
             break
         post_order = (h.get("PostOrder") or "").strip()
         reference = (h.get("Reference") or "").strip()
+        if reference and reference in ignored_references:
+            continue
         if references_filter and reference not in references_filter:
             continue
         if args.gaps:
@@ -2039,11 +2096,13 @@ def run(args: argparse.Namespace) -> int:
 
         source_lines_raw = lines_by_postorder.get(post_order, [])
         source_lines = filter_non_importable_sage_rows(source_lines_raw, h)
+        header_main_amount = parse_decimal(h.get("MainAmount") or "")
         prepared_info = build_order_lines(
             source_lines,
             products_map,
             freight_variant_id=freight_variant_id,
             concept_variant_id=concept_variant_id,
+            header_main_amount=header_main_amount,
         )
         prepared_lines = prepared_info["lines"]
         source_row_count = int(prepared_info.get("source_row_count") or 0)
@@ -2074,7 +2133,8 @@ def run(args: argparse.Namespace) -> int:
                     "display_type": "line_note",
                     "name": f"Shipping Method: {ship_via}",
                 })
-        if not has_product_lines:
+        allow_note_only_zero_total = (not has_product_lines) and (abs(header_main_amount) <= 0.02) and bool(prepared_lines)
+        if not has_product_lines and not allow_note_only_zero_total:
             source_preview = _sage_rows_preview(source_lines_raw)
             push_log({
                 "Timestamp": now,
@@ -2147,7 +2207,7 @@ def run(args: argparse.Namespace) -> int:
         if seen_candidates <= start_offset:
             continue
 
-        header_total = round(abs(parse_decimal(h.get("MainAmount") or "")), 2)
+        header_total = round(parse_decimal(h.get("MainAmount") or ""), 2)
         source_total = prepared_info["source_total"]
         prepared_total = prepared_info["prepared_total"]
         prepared_total_with_tax = round(prepared_total + tax_total_source, 2)

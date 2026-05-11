@@ -414,6 +414,10 @@ Flags CLI (`sync_sales_orders_api.py`):
   - `YYYY` (año fiscal Sage: Febrero -> Enero siguiente)
   - rango `inicio-fin` (ej: `02/02/2026-03/02/2026`, `02/2026-03/02/2026`)
 - `--reference`: procesa una o varias SO de Sage separadas por coma (ej: `357702` o `357702,357703`).
+- `--ignore-references`: referencias de Sage a excluir (coma-separadas). Si se omite, se leen desde `.env` en este orden:
+  - `<PROFILE>_IGNORE_REFERENCES` (ej. `STUDIOOPTYX_IGNORE_REFERENCES`)
+  - `SALES_ORDER_IGNORE_REFERENCES`
+  - fallback actual: `363903` (pedido de test eliminado en Sage)
 - `--limit`: límite de procesado:
   - `N` = primeras `N` candidatas
   - `start,count` = empieza en ordinal `start` y procesa `count` (ej: `12,1`)
