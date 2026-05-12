@@ -164,6 +164,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--gaps-quotes",
+        action="store_true",
+        help=(
+            "Process only Sage sales orders that already exist in Odoo "
+            "and are in quotation state (draft/sent)."
+        ),
+    )
+    p.add_argument(
         "--shipping-relaxed",
         action="store_true",
         help=(
@@ -548,12 +556,27 @@ def load_products_map_from_masters(
             rows = active
         return rows[0]
 
+    def _item_code_candidates(item_id: str) -> List[str]:
+        code = (item_id or "").strip().upper()
+        if not code:
+            return []
+        candidates = [code]
+        # BA&SH patch agreed with business:
+        # Sage may export BA*...N061 while Odoo keeps BA*...NO61 (letter O).
+        if code.startswith("BA") and code.endswith("N061"):
+            candidates.append(code[:-4] + "NO61")
+        return candidates
+
     out: Dict[str, Dict[str, str]] = {}
     for rec, sage in sage_by_record.items():
         item_id = (sage.get("ItemID") or "").strip().upper()
         if not item_id:
             continue
-        picked = _pick_variant(odoo_by_code.get(item_id, []))
+        picked = None
+        for candidate in _item_code_candidates(item_id):
+            picked = _pick_variant(odoo_by_code.get(candidate, []))
+            if picked:
+                break
         if not picked:
             continue
         out[rec] = {
@@ -699,23 +722,28 @@ def build_order_lines(
                         tax_authority_codes.append(code)
                 continue
             # Non-tax technical rows can still carry misc shipping or concept amounts.
-            amount_signed = parse_decimal(line.get("Amount") or "")
+            raw_amount_signed = parse_decimal(line.get("Amount") or "")
+            amount_signed = raw_amount_signed
             # For free-text concept-only SOs, Sage may store detail rows as
             # positive while header MainAmount is negative (credit style).
             # Preserve accounting sign by aligning technical item=0 amounts
             # with header sign when needed.
-            if header_main_amount < 0 and amount_signed > 0:
+            if header_main_amount < 0 and amount_signed > 0 and not _looks_like_misc_shipping(row_desc_raw):
                 amount_signed = -amount_signed
             is_misc_shipping = abs(amount_signed) > 0 and _looks_like_misc_shipping(row_desc_raw)
             if is_misc_shipping:
+                # Sage stores freight/shipping with inverse sign vs commercial
+                # line semantics. Normalize to Odoo commercial sign:
+                # Sage -X (charge) -> Odoo +X, Sage +X (refund) -> Odoo -X.
+                shipping_amount = -raw_amount_signed
                 if freight_variant_id:
-                    source_total += amount_signed
+                    source_total += raw_amount_signed
                     source_product_row_count += 1
                     out.append({
                         "product_id": int(freight_variant_id),
                         "name": (row_desc_formatted or "MISC SHIPPING"),
                         "product_uom_qty": 1.0,
-                        "price_unit": round(amount_signed, 2),
+                        "price_unit": round(shipping_amount, 2),
                         "tax_ids": [(5, 0, 0)],
                     })
                     variant_debug_rows.append({
@@ -1846,10 +1874,14 @@ def run(args: argparse.Namespace) -> int:
         return (dt, ref_num, post_num)
 
     headers.sort(key=_header_sort_key)
+    if args.gaps and args.gaps_quotes:
+        print("ERROR: --gaps and --gaps-quotes cannot be used together")
+        return 2
     existing_orders_by_ref: Dict[str, Dict[str, object]] = {}
     gap_missing_flags: List[bool] = [False] * len(headers)
+    gap_quote_flags: List[bool] = [False] * len(headers)
     gap_cut_index: Optional[int] = None
-    if args.gaps:
+    if args.gaps or args.gaps_quotes:
         refs_for_gap = [
             (h.get("Reference") or "").strip()
             for h in headers
@@ -1859,23 +1891,34 @@ def run(args: argparse.Namespace) -> int:
         for idx, h in enumerate(headers):
             ref = (h.get("Reference") or "").strip()
             gap_missing_flags[idx] = bool(ref and ref not in existing_orders_by_ref)
+            if ref and ref in existing_orders_by_ref:
+                state = str(existing_orders_by_ref[ref].get("state") or "").strip().lower()
+                gap_quote_flags[idx] = state in {"draft", "sent"}
 
-        suffix_all_missing: List[bool] = [False] * len(headers)
-        all_missing = True
-        for idx in range(len(headers) - 1, -1, -1):
-            all_missing = all_missing and gap_missing_flags[idx]
-            suffix_all_missing[idx] = all_missing
-        for idx, is_missing in enumerate(gap_missing_flags):
-            if is_missing and suffix_all_missing[idx]:
-                gap_cut_index = idx
-                break
+        if args.gaps:
+            suffix_all_missing: List[bool] = [False] * len(headers)
+            all_missing = True
+            for idx in range(len(headers) - 1, -1, -1):
+                all_missing = all_missing and gap_missing_flags[idx]
+                suffix_all_missing[idx] = all_missing
+            for idx, is_missing in enumerate(gap_missing_flags):
+                if is_missing and suffix_all_missing[idx]:
+                    gap_cut_index = idx
+                    break
 
-        missing_total = sum(1 for v in gap_missing_flags if v)
-        print(
-            "INFO: gaps mode "
-            f"(headers={len(headers)}, missing_in_odoo={missing_total}, "
-            f"cut_index={'none' if gap_cut_index is None else gap_cut_index + 1})"
-        )
+        if args.gaps:
+            missing_total = sum(1 for v in gap_missing_flags if v)
+            print(
+                "INFO: gaps mode "
+                f"(headers={len(headers)}, missing_in_odoo={missing_total}, "
+                f"cut_index={'none' if gap_cut_index is None else gap_cut_index + 1})"
+            )
+        else:
+            quotes_total = sum(1 for v in gap_quote_flags if v)
+            print(
+                "INFO: gaps-quotes mode "
+                f"(headers={len(headers)}, quotes_in_odoo={quotes_total})"
+            )
 
     terms_map = find_payment_terms(client)
     sales_taxes_by_code = find_sales_taxes_by_code(client)
@@ -2090,6 +2133,13 @@ def run(args: argparse.Namespace) -> int:
                     break
                 if not gap_missing_flags[header_index]:
                     continue
+        if args.gaps_quotes:
+            if args.reference:
+                # If a specific reference is requested, honor it even in gaps-quotes mode.
+                pass
+            else:
+                if not gap_quote_flags[header_index]:
+                    continue
         customer_record = (h.get("CustVendId") or "").strip()
         transaction_date = (h.get("TransactionDate") or "").strip()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2223,7 +2273,7 @@ def run(args: argparse.Namespace) -> int:
         if skipped_reasons:
             warning_parts.append("Skipped lines: " + " | ".join(skipped_reasons[:5]))
 
-        if args.gaps and not args.reference:
+        if (args.gaps or args.gaps_quotes) and not args.reference:
             existing = existing_orders_by_ref.get(reference)
             exists = [existing] if existing else []
         else:
@@ -3254,7 +3304,7 @@ def run(args: argparse.Namespace) -> int:
                     if not continue_on_error:
                         break
 
-        if warning_parts and not args.dry_run:
+        if warning_parts and not args.dry_run and not continue_on_error:
             print("STOP: warning detected. Order left in draft and process halted.")
             break
 

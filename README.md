@@ -430,6 +430,9 @@ Flags CLI (`sync_sales_orders_api.py`):
 - `--gaps`: procesa solo SO de Sage que faltan en Odoo (`sale.order.name` no existe).
   - Además, se detiene automáticamente al llegar al primer bloque final de órdenes nunca importadas (trailing block).
   - Útil para reintentar “huecos” sin meterse en un intervalo completo pendiente.
+- `--gaps-quotes`: procesa solo SO de Sage que ya existen en Odoo y están en `draft/sent` (quotations).
+  - Útil para re-procesar únicamente quotes sin recorrer todo el histórico.
+  - No combinar con `--gaps` (mutuamente excluyentes).
 - `--shipping-relaxed`: relaja ligeramente el match de shipping address.
   - Mantiene el modo estricto por defecto si no se pasa este flag.
   - Permite equivalencias de calle tipo `#`/`SUITE`/`STE`.
@@ -439,6 +442,10 @@ Flags CLI (`sync_sales_orders_api.py`):
   - si no tiene ese tag, el mismatch de shipping sigue siendo `ERROR`.
 - `--freight-variant-id`: `product.product` ID para usar en líneas de `Freight Amount`/`Shipping` de Sage cuando vienen con `ItemRecordNumber=0`.
 - `--freight-product-name`: fallback por nombre para localizar el producto de freight si no se indica `--freight-variant-id`. Default: `Freight`.
+  - Normalización de signo aplicada en SO:
+    - Sage `Freight Amount` negativo => cargo en Odoo positivo.
+    - Sage `Freight Amount` positivo => abono en Odoo negativo.
+  - La validación de total (`header` vs `prepared`) sigue siendo el control final de seguridad.
 - `--content-verify`: verifica contenido de SO existentes en Odoo contra Sage sin crear/actualizar.
   - Valida: `SKU/qty`, `PO (client_order_ref)`, descripciones de línea, `pricelist_id`, `salesperson (user_id)`, `sales team (team_id)`, `date_order`, `validity_date`, `commitment_date`.
   - Si falta `salesperson` (para reps con `EmpRecordNumber != 0`), devuelve `ERROR`.
@@ -468,6 +475,7 @@ Notas operativas de flags:
 - `sync_sales_orders_api.py` no usa `products_sync.csv` ni `items_odoo.csv` para mapear líneas.
   - Mapea por `items.csv` (Sage) + consulta live de productos en Odoo (`default_code`).
 - `--gaps --skip` = reintenta huecos y continúa aunque haya errores, para revisar todos en una pasada.
+- Con `--skip`/`--allow-partial`, el proceso también continúa en warnings (no se detiene en `NO_CHANGES_WARN` / `OK_WARN`).
 - `--content-repair` no necesita `--skip` para funcionar; `--skip` solo controla si continúa tras un error.
 - Consistencia esperada:
   - Si una SO ya quedó correcta en `QUOTE` tras `--content-repair`, ejecutar después el proceso normal (sin `--content-verify`) sobre ese mismo lote debe dar `NO_CHANGES` (mismo contenido funcional).
