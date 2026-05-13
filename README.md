@@ -599,6 +599,12 @@ Flujo actual:
 - Cuando la invoice ya está vinculada por note:
   - sin `--validate`: `NO_CHANGES`.
   - con `--validate`: valida la misma picking si está pendiente (incluye contexto `skip_sms` para evitar wizard SMS).
+- Limpieza de `note` en pickings abiertos (`waiting/confirmed/assigned/partially_available`):
+  - Si tienen `Sage Invoice: ...` heredado de una validación anterior/backorder, se elimina para evitar trazabilidad falsa.
+  - En el log, esa limpieza se refleja en la **misma línea** de la picking (`... | waiting (Note removed)`), sin duplicar líneas.
+- Cabecera de log por documento:
+  - Formato: `[NNN] - YYYY-MM-DD - [STATUS] DO <SAGE_INVOICE_REF> (SO <SAGE_SO_REF> - OdooId <sale.order.id>)`
+  - Ejemplo: `[011] - 2026-02-05 - [OK] DO 357968-A (SO 357968 - OdooId 228)`
 - Log de delivery muestra estado legible:
   - `Already linked to picking WHMO/OUT/xxxxx delivered|not delivered (SAGE <invoice>)`
 

@@ -318,24 +318,35 @@ def refresh_sage(args: argparse.Namespace) -> int:
     customers_new_min_xlsx = os.path.join(master_root, "customers_NEW.xlsx")
     template_path = os.path.join(master_root, "odoo_templates", "NEW_customers.xlsx")
     if not os.path.exists(template_path):
-        template_path = os.path.join(master_root, "odoo_templates", "customers.xlsx")
+        template_path = os.path.join(master_root, "odoo_templates", "NEW_customers.xlsx")
 
-    # Filter: active in Sage + no OdooId + optional date thresholds
+    # Filter: active in Sage + no OdooId + optional date thresholds.
+    # One-off business override:
+    # - CustomerRecordNumber 5554 (CustomerID 98052OCEAN) must be included even
+    #   when LastSalesOrderDate/LastInvoiceDate are blank in customers.csv.
+    forced_new_customer_records = {"5554"}
+    forced_new_customer_ids = {"98052OCEAN"}
     new_customers = [
         c for c in out_customers
         if (c.get("CustomerIsInactive") or "").strip() != "1"
         and not c.get("OdooId")
         and (
-            not min_customer_since_date
-            or (parse_date(c.get("CustomerSince")) or datetime.min.date()) >= min_customer_since_date
-        )
-        and (
-            not min_last_salesorder_date
+            (c.get("CustomerRecordNumber") or "").strip() in forced_new_customer_records
+            or (c.get("CustomerID") or "").strip() in forced_new_customer_ids
             or (
-                parse_date(c.get("LastSalesOrderDate"))
-                or parse_date(c.get("LastInvoiceDate"))
-                or datetime.min.date()
-            ) >= min_last_salesorder_date
+                (
+                    not min_customer_since_date
+                    or (parse_date(c.get("CustomerSince")) or datetime.min.date()) >= min_customer_since_date
+                )
+                and (
+                    not min_last_salesorder_date
+                    or (
+                        parse_date(c.get("LastSalesOrderDate"))
+                        or parse_date(c.get("LastInvoiceDate"))
+                        or datetime.min.date()
+                    ) >= min_last_salesorder_date
+                )
+            )
         )
     ]
 
@@ -3628,7 +3639,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p5.add_argument(
         "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\customer_contacts.xlsx",
+        default=r"ENZO-Sage50\_master\odoo_templates\NEW_customer_contacts.xlsx",
     )
     p5.set_defaults(func=build_contacts_import)
 
@@ -3674,7 +3685,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p5c.add_argument(
         "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\customer_delivery_address.xlsx",
+        default=r"ENZO-Sage50\_master\odoo_templates\NEW_customer_delivery_address.xlsx",
     )
     p5c.set_defaults(func=build_delivery_import)
 
@@ -3970,7 +3981,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p7c.add_argument(
         "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx",
+        default=r"ENZO-Sage50\_master\odoo_templates\NEW_products.xlsx",
     )
     p7c.set_defaults(func=build_products_import)
 
@@ -3981,7 +3992,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p7d.add_argument(
         "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\products.xlsx",
+        default=r"ENZO-Sage50\_master\odoo_templates\NEW_products.xlsx",
     )
     p7d.set_defaults(func=build_products_nobarcode_import)
 
@@ -4022,7 +4033,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p7g.add_argument(
         "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\pricelist.csv",
+        default=r"ENZO-Sage50\_master\odoo_templates\NEW_pricelist.csv",
     )
     p7g.add_argument(
         "--template-xlsx",
@@ -4046,7 +4057,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p7h.add_argument(
         "--template-path",
-        default=r"ENZO-Sage50\_master\odoo_templates\pricelist.csv",
+        default=r"ENZO-Sage50\_master\odoo_templates\NEW_pricelist.csv",
     )
     p7h.add_argument(
         "--lines-path",
