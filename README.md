@@ -561,6 +561,8 @@ Importante (modelo Odoo):
 ### Delivery Orders API Sync (draft)
 Script nuevo:
 - `sync_delivery_orders_api.py`
+- `audit_delivery_notes.py` (audita Notes de `stock.picking` para detectar duplicados de `Sage Invoice:` por SO)
+- `repair_delivery_notes.py` (repara Notes heredadas/duplicadas y deja una sola referencia correcta por DO done)
 
 Objetivo:
 - Generar/validar `stock.picking` (delivery orders) en Odoo a partir de `invoice.csv` + `invoice_lines.csv` de Sage.
@@ -619,6 +621,19 @@ Freight Amount (líneas técnicas de Sage):
 
 Limitación conocida:
 - Sin un `AddressRecordNumber` explícito en la Order de Sage, shipping/billing se resuelven por la mejor coincidencia disponible (no perfecto, pero actualmente es el mejor criterio operativo).
+
+Auditoría/reparación de Notes en Delivery Orders:
+- Auditoría:
+  - `python audit_delivery_notes.py --profile STUDIOOPTYX`
+  - Genera:
+    - `ENZO-Sage50\_master_odoo\pickings_notes_all.csv`
+    - `ENZO-Sage50\_master_odoo\pickings_notes_duplicates.csv`
+- Reparación (dry-run):
+  - `python repair_delivery_notes.py --profile STUDIOOPTYX`
+- Reparación (apply):
+  - `python repair_delivery_notes.py --profile STUDIOOPTYX --apply`
+- La reparación con `--apply` solo escribe `stock.picking.note` (no cambia estado, cantidades, carrier ni fechas).
+- `repair_delivery_notes.py` limita por defecto el scope a las SO presentes en `pickings_notes_duplicates.csv`.
 
 ### Invoice API Sync (draft)
 Script nuevo:

@@ -741,6 +741,20 @@ def _merge_cleanup_messages(detail_lines: List[str], cleanup_messages: List[str]
     return out
 
 
+def _cleanup_lines_for_emit(cleanup_messages: List[str], current_picking_name: str) -> List[str]:
+    out: List[str] = []
+    current = (current_picking_name or "").strip()
+    for msg in cleanup_messages or []:
+        m = (msg or "").strip()
+        if not m:
+            continue
+        if current and m.startswith(current + " "):
+            out.append("WHMO/OUT/?????? (SAGE ????????????) | waiting (Note removed)")
+        else:
+            out.append(m)
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Create/validate Odoo Delivery Orders from Sage invoices",
@@ -1350,16 +1364,21 @@ def run(args: argparse.Namespace) -> int:
 
                 processed += 1
                 status_counts["OK"] += 1
+                ok_lines = [
+                    f"{str(candidate.get('name') or '').strip()}"
+                    + (f"; {carrier_info}" if carrier_info else "")
+                    + ("; validated" if args.validate else "; prepared (not validated)")
+                ]
+                ok_lines.extend(
+                    _cleanup_lines_for_emit(so_cleanup_messages, str(candidate.get("name") or "").strip())
+                )
                 emit(
                     processed,
                     inv_date,
                     "OK",
                     so_ref,
                     inv_ref,
-                    detail
-                    + (f"; {carrier_info}" if carrier_info else "")
-                    + ("; validated" if args.validate else "; prepared (not validated)")
-                    + (f"; {' | '.join(so_cleanup_messages)}" if so_cleanup_messages else ""),
+                    "\n".join([ln for ln in ok_lines if ln.strip()]),
                 )
                 so_cleanup_messages = []
                 used_picking_ids.add(picking_id)
