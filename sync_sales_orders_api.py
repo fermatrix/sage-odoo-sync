@@ -172,6 +172,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--news",
+        action="store_true",
+        help=(
+            "Process only trailing never-imported Sage sales orders within the selected --load scope "
+            "(new block at the end, without rechecking previously imported orders)."
+        ),
+    )
+    p.add_argument(
         "--shipping-relaxed",
         action="store_true",
         help=(
@@ -1877,11 +1885,16 @@ def run(args: argparse.Namespace) -> int:
     if args.gaps and args.gaps_quotes:
         print("ERROR: --gaps and --gaps-quotes cannot be used together")
         return 2
+    if args.news and (args.gaps or args.gaps_quotes):
+        print("ERROR: --news cannot be combined with --gaps or --gaps-quotes")
+        return 2
+
     existing_orders_by_ref: Dict[str, Dict[str, object]] = {}
     gap_missing_flags: List[bool] = [False] * len(headers)
     gap_quote_flags: List[bool] = [False] * len(headers)
+    news_flags: List[bool] = [False] * len(headers)
     gap_cut_index: Optional[int] = None
-    if args.gaps or args.gaps_quotes:
+    if args.gaps or args.gaps_quotes or args.news:
         refs_for_gap = [
             (h.get("Reference") or "").strip()
             for h in headers
@@ -1895,7 +1908,7 @@ def run(args: argparse.Namespace) -> int:
                 state = str(existing_orders_by_ref[ref].get("state") or "").strip().lower()
                 gap_quote_flags[idx] = state in {"draft", "sent"}
 
-        if args.gaps:
+        if args.gaps or args.news:
             suffix_all_missing: List[bool] = [False] * len(headers)
             all_missing = True
             for idx in range(len(headers) - 1, -1, -1):
@@ -1905,12 +1918,23 @@ def run(args: argparse.Namespace) -> int:
                 if is_missing and suffix_all_missing[idx]:
                     gap_cut_index = idx
                     break
+            if gap_cut_index is not None:
+                for idx in range(gap_cut_index, len(headers)):
+                    if gap_missing_flags[idx]:
+                        news_flags[idx] = True
 
         if args.gaps:
             missing_total = sum(1 for v in gap_missing_flags if v)
             print(
                 "INFO: gaps mode "
                 f"(headers={len(headers)}, missing_in_odoo={missing_total}, "
+                f"cut_index={'none' if gap_cut_index is None else gap_cut_index + 1})"
+            )
+        elif args.news:
+            news_total = sum(1 for v in news_flags if v)
+            print(
+                "INFO: news mode "
+                f"(headers={len(headers)}, trailing_new={news_total}, "
                 f"cut_index={'none' if gap_cut_index is None else gap_cut_index + 1})"
             )
         else:
@@ -2132,6 +2156,17 @@ def run(args: argparse.Namespace) -> int:
                     )
                     break
                 if not gap_missing_flags[header_index]:
+                    continue
+        if args.news:
+            if args.reference:
+                # If a specific reference is requested, honor it even in news mode.
+                pass
+            else:
+                if gap_cut_index is None:
+                    if header_index == 0:
+                        print("INFO: news mode: no trailing never-imported block detected in this --load scope.")
+                    break
+                if not news_flags[header_index]:
                     continue
         if args.gaps_quotes:
             if args.reference:

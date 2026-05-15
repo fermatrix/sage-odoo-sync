@@ -433,6 +433,9 @@ Flags CLI (`sync_sales_orders_api.py`):
 - `--gaps-quotes`: procesa solo SO de Sage que ya existen en Odoo y están en `draft/sent` (quotations).
   - Útil para re-procesar únicamente quotes sin recorrer todo el histórico.
   - No combinar con `--gaps` (mutuamente excluyentes).
+- `--news`: procesa solo el bloque final de SO nunca importadas (trailing never-imported block) dentro del scope de `--load`.
+  - Útil para “cargar solo lo nuevo” sin repasar todo lo ya importado.
+  - No combinar con `--gaps` ni `--gaps-quotes`.
 - `--shipping-relaxed`: relaja ligeramente el match de shipping address.
   - Mantiene el modo estricto por defecto si no se pasa este flag.
   - Permite equivalencias de calle tipo `#`/`SUITE`/`STE`.
@@ -634,6 +637,15 @@ Auditoría/reparación de Notes en Delivery Orders:
   - `python repair_delivery_notes.py --profile STUDIOOPTYX --apply`
 - La reparación con `--apply` solo escribe `stock.picking.note` (no cambia estado, cantidades, carrier ni fechas).
 - `repair_delivery_notes.py` limita por defecto el scope a las SO presentes en `pickings_notes_duplicates.csv`.
+
+### Customers UPDATE (Notes from Sage CreditStatusMsg)
+- `build_customers_update` ahora incorpora `Notes` usando `CreditStatusMsg` de `ENZO-Sage50\_master_sage\customers.csv`.
+- Regla aplicada:
+  - si `CreditStatusMsg` es distinto de `You have requested to be notified when a transaction is created for this customer.`, se traslada a `Notes`.
+  - si coincide con ese mensaje por defecto, `Notes` se deja vacío.
+- El generador de UPDATE incluye:
+  - clientes con `CustomerSyncStatus=UPDATE`, y
+  - clientes sin mismatch técnico pero con `CreditStatusMsg` válido para backfill de `Notes`.
 
 ### Invoice API Sync (draft)
 Script nuevo:

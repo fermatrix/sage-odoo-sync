@@ -2876,12 +2876,16 @@ def build_customers_update(args: argparse.Namespace) -> int:
         return 2
 
     sync_path = args.customers_sync
+    customers_master_path = args.customers_master
     template_path = args.template_path
     master_out = args.master_out
     out_path = args.out_path
 
     if not os.path.exists(sync_path):
         print(f"ERROR: customers sync not found: {sync_path}")
+        return 2
+    if not os.path.exists(customers_master_path):
+        print(f"ERROR: customers master not found: {customers_master_path}")
         return 2
     if not os.path.exists(template_path):
         print(f"ERROR: template not found: {template_path}")
@@ -2906,10 +2910,19 @@ def build_customers_update(args: argparse.Namespace) -> int:
         return state_name
 
     headers_sync, rows = read_csv(sync_path)
+    _, customers_master_rows = read_csv(customers_master_path)
+    credit_msg_by_record: Dict[str, str] = {}
+    default_credit_msg = "You have requested to be notified when a transaction is created for this customer."
+    for r in customers_master_rows:
+        rec = (r.get("CustomerRecordNumber") or "").strip()
+        if not rec:
+            continue
+        msg = (r.get("CreditStatusMsg") or "").strip()
+        if msg and msg != default_credit_msg:
+            credit_msg_by_record[rec] = msg
     update_rows = [
         r for r in rows
-        if (r.get("CustomerSyncStatus") or "").strip().upper() == "UPDATE"
-        and not truthy(r.get("Exclude"))
+        if not truthy(r.get("Exclude"))
         and (r.get("CustomerIsInactive") or "").strip() != "1"
     ]
 
@@ -2935,12 +2948,20 @@ def build_customers_update(args: argparse.Namespace) -> int:
         if not ext_id:
             skipped_blank_external_id += 1
             continue
+        rec = (r.get("CustomerRecordNumber") or "").strip()
+        credit_msg = credit_msg_by_record.get(rec, "")
+        sync_status = (r.get("CustomerSyncStatus") or "").strip().upper()
+        # Include normal UPDATE mismatches plus rows that need Notes backfill from CreditStatusMsg.
+        if sync_status != "UPDATE" and not credit_msg:
+            continue
         prepared_rows.append((r, name, ext_id, odoo_id))
 
     def build_workbook(target_path: str) -> None:
         wb = load_workbook(template_path)
         ws = wb["Partners"] if "Partners" in wb.sheetnames else wb.active
         headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        if "Notes" not in headers:
+            headers.append("Notes")
         for c, h in enumerate(headers, start=1):
             ws.cell(row=1, column=c).value = h
         if ws.max_row > 1:
@@ -2962,7 +2983,7 @@ def build_customers_update(args: argparse.Namespace) -> int:
                 "email": r.get("Email", ""),
                 "Reference": r.get("CustomerID", ""),
                 "Pricelist": r.get("ExpectedOdooPricelist", ""),
-                "Notes": "",
+                "Notes": credit_msg_by_record.get((r.get("CustomerRecordNumber") or "").strip(), ""),
                 "Language": "en_US",
             }
             ws.append([out.get(h, "") for h in headers])
@@ -3774,6 +3795,10 @@ def build_parser() -> argparse.ArgumentParser:
     p5g.add_argument(
         "--customers-sync",
         default=r"ENZO-Sage50\_master\customers_sync.csv",
+    )
+    p5g.add_argument(
+        "--customers-master",
+        default=r"ENZO-Sage50\_master_sage\customers.csv",
     )
     p5g.add_argument(
         "--template-path",
