@@ -719,9 +719,14 @@ Descripción de líneas (`account.move.line.name`):
 Formato de log:
 - Header compacto: `SO/Invoice <ref>` cuando SO e invoice comparten referencia.
 - En detalle, una línea por delivery de la SO para visibilidad de parciales/backorders.
+- En detalle se etiqueta explícitamente el estado logístico:
+  - `... | DO - done | Invoice <ref> - draft|confirmed|posted`
+  - Esto separa claramente estado de delivery (DO) vs estado de factura.
 
 Orden de procesado:
 - Cronológico real: `TransactionDate` ascendente (y desempate por `Reference`, `PostOrder`).
+- `--limit start,count` en `sync_invoice_api.py` se aplica por **invoice** (no por SO),
+  para que los reintentos por ordinal sean estables incluso cuando una SO tiene múltiples invoices.
 
 Fecha de creación vs fecha de pedido:
 - `create_date` **no se puede** forzar por import estándar ni por API ORM estándar.
