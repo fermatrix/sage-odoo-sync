@@ -10,6 +10,7 @@ from sync_delivery_orders_api import (
     _invoice_tag,
     _load_by_load,
     _load_item_record_to_sku,
+    _parse_load_spec,
     _parse_limit_offset,
     _parse_reference_filter,
     _picking_line,
@@ -32,7 +33,7 @@ def _load_sku_to_product_info(client: OdooClient) -> Dict[str, Dict[str, object]
             "search_read",
             [[]],
             {
-                "fields": ["id", "default_code", "type"],
+                "fields": ["id", "default_code", "type", "categ_id", "name"],
                 "limit": 2000,
                 "offset": offset,
                 "context": {"active_test": False},
@@ -46,6 +47,8 @@ def _load_sku_to_product_info(client: OdooClient) -> Dict[str, Dict[str, object]
                 out[sku] = {
                     "id": int(r.get("id") or 0),
                     "type": str(r.get("type") or "").strip(),
+                    "categ_id": r.get("categ_id"),
+                    "name": str(r.get("name") or "").strip(),
                 }
         offset += len(rows)
     return out
@@ -71,6 +74,35 @@ def _resolve_freight_product_id(client: OdooClient) -> int:
         offset=0,
     )
     return int(rows[0].get("id") or 0) if rows else 0
+
+
+def _parse_tx_date(raw: str) -> Optional[date]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            from datetime import datetime
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _tx_date_in_load(tx_raw: str, load_spec: str) -> bool:
+    kind, payload = _parse_load_spec(load_spec)
+    tx = _parse_tx_date(tx_raw)
+    if tx is None:
+        return False
+    if kind == "day":
+        return tx == payload
+    if kind == "month":
+        y, m = payload
+        return tx.year == y and tx.month == m
+    if kind in {"fiscal_year", "range"}:
+        start, end = payload
+        return start <= tx < end
+    return True
 
 
 def _invoice_ref_sort_key(invoice_ref: str) -> Tuple[str, int, str]:
@@ -243,10 +275,50 @@ def _build_invoice_line_commands(
         if pid <= 0:
             errors.append(f"SKU {sku}: invalid Odoo product id")
             continue
+        ptype = str(pinfo.get("type") or "").strip().lower()
+        pcateg = pinfo.get("categ_id") or []
+        has_category = bool(isinstance(pcateg, list) and pcateg)
+        if ptype == "service" and not has_category:
+            pname = str(pinfo.get("name") or sku).strip()
+            errors.append(f"SKU {sku}: service product '{pname}' has no category in Odoo")
+            continue
 
         candidates = so_by_product.get(pid, [])
         if not candidates:
             errors.append(f"SKU {sku}: no matching sale.order.line in Odoo SO")
+            continue
+
+        # Services (e.g., discounts/freight-like commercial lines) should not
+        # depend on stock delivery progression. Invoice them directly from the
+        # SO line by requested Sage quantity.
+        if ptype == "service":
+            sol = candidates[0]
+            tax_ids = sol.get("tax_ids") or []
+            raw_desc = str(r.get("RowDescription") or sol.get("name") or "").strip()
+            paren_parts = re.findall(r"\([^()]*\)", raw_desc)
+            second_line = " | ".join([p.strip() for p in paren_parts if p.strip()])
+            line1 = raw_desc
+            for part in paren_parts:
+                line1 = line1.replace(part, " ")
+            line1 = re.sub(r"\s{2,}", " ", line1).strip()
+            line_desc = line1 or raw_desc
+            if second_line:
+                line_desc = f"{line_desc}\n{second_line}"
+            commands.append(
+                (
+                    0,
+                    0,
+                    {
+                        "product_id": pid,
+                        "name": line_desc,
+                        "quantity": float(qty),
+                        "price_unit": float(sol.get("price_unit") or 0.0),
+                        "sale_line_ids": [(4, int(sol.get("id") or 0))],
+                        "tax_ids": [(6, 0, list(tax_ids))] if tax_ids else [],
+                    },
+                )
+            )
+            sage_descriptions.append(line_desc)
             continue
 
         remaining = qty
@@ -443,8 +515,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--skip", action="store_true", help="Continue after errors")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--confirm", action="store_true", help="Post invoices after successful create/update (skip already posted)")
+    p.add_argument("--gaps", action="store_true", help="Process only unresolved Sage invoices (missing in Odoo or still draft)")
     p.add_argument("--items-master", default=r"ENZO-Sage50\_master_sage\items.csv")
     return p
+
+
+def _chunks(seq: List[str], size: int) -> List[List[str]]:
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
 def run(args: argparse.Namespace) -> int:
@@ -473,6 +551,8 @@ def run(args: argparse.Namespace) -> int:
 
     invoices_by_so: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     for h in invoice_headers:
+        if not _tx_date_in_load((h.get("TransactionDate") or "").strip(), args.load):
+            continue
         if (h.get("JournalEx") or "").strip() != "8":
             continue
         so_ref = (h.get("INV_POSOOrderNumber") or "").strip()
@@ -490,6 +570,42 @@ def run(args: argparse.Namespace) -> int:
                 (r.get("PostOrder") or "").strip(),
             )
         )
+
+    if args.gaps:
+        # Keep only unresolved Sage invoices:
+        # - missing in Odoo, or
+        # - existing but still in draft.
+        flat: List[Tuple[str, str, Dict[str, str]]] = []
+        for so_ref, invs in invoices_by_so.items():
+            for inv in invs:
+                inv_ref = (inv.get("Reference") or "").strip()
+                if so_ref and inv_ref:
+                    flat.append((so_ref, inv_ref, inv))
+
+        existing_by_key: Dict[Tuple[str, str], Dict[str, object]] = {}
+        all_inv_refs = sorted({inv_ref for _, inv_ref, _ in flat})
+        for name_chunk in _chunks(all_inv_refs, 200):
+            rows = client.search_read(
+                "account.move",
+                [("move_type", "=", "out_invoice"), ("name", "in", name_chunk)],
+                ["id", "name", "state", "invoice_origin", "ref"],
+                limit=2000,
+                offset=0,
+            )
+            for r in rows:
+                key = (str(r.get("invoice_origin") or "").strip(), str(r.get("name") or "").strip())
+                if key[0] and key[1]:
+                    existing_by_key[key] = r
+
+        filtered: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+        unresolved = 0
+        for so_ref, inv_ref, inv in flat:
+            r = existing_by_key.get((so_ref, inv_ref))
+            if (r is None) or (str(r.get("state") or "") == "draft"):
+                filtered[so_ref].append(inv)
+                unresolved += 1
+        invoices_by_so = filtered
+        print(f"INFO: gaps mode (sage_invoices={len(flat)}, unresolved={unresolved})")
 
     so_sequence = sorted(
         invoices_by_so.keys(),
@@ -566,6 +682,17 @@ def run(args: argparse.Namespace) -> int:
 
             existing_inv = _existing_invoice_for_sage(client, so_ref, inv_ref)
             if existing_inv:
+                existing_state = str(existing_inv.get("state") or "")
+                if existing_state != "draft":
+                    processed += 1
+                    status_counts["NO_CHANGES"] += 1
+                    pid = int(target_picking.get("id") or 0)
+                    other = [p for p in sorted(pickings, key=lambda x: int(x.get("id") or 0)) if int(p.get("id") or 0) != pid]
+                    detail_lines = [_picking_line(target_picking, ship_via, inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
+                    detail_lines = _attach_invoice_status(detail_lines, f"### Invoice {inv_ref} - {existing_state}")
+                    detail_lines.append("already confirmed/posted, skipped")
+                    emit(processed, inv_date, "NO_CHANGES", so_ref, inv_ref, "\n".join(detail_lines))
+                    continue
                 changed = False
                 changed_user_team = False
                 changed_freight_label = False
@@ -752,7 +879,18 @@ def run(args: argparse.Namespace) -> int:
                             detail_lines.append("invoice salesperson/team updated")
                         if changed_freight_label:
                             detail_lines.append("freight label normalized")
-                    else:
+                    if args.confirm and str(existing_inv.get("state") or "") == "draft":
+                        client.models.execute_kw(
+                            client.db,
+                            client.uid,
+                            client.apikey,
+                            "account.move",
+                            "action_post",
+                            [[int(existing_inv["id"])]],
+                        )
+                        changed = True
+                        detail_lines.append("invoice confirmed")
+                    if not changed:
                         status_counts["NO_CHANGES"] += 1
                     emit(processed, inv_date, "UPDATED" if changed else "NO_CHANGES", so_ref, inv_ref, "\n".join(detail_lines))
                     continue
@@ -836,19 +974,11 @@ def run(args: argparse.Namespace) -> int:
             created_total = round(float(created[0].get("amount_total") or 0.0), 2) if created else 0.0
             sage_total = _sage_invoice_total(inv)
             if abs(created_total - sage_total) > 0.01:
-                client.models.execute_kw(
-                    client.db,
-                    client.uid,
-                    client.apikey,
-                    "account.move",
-                    "unlink",
-                    [[int(inv_id)]],
-                )
                 processed += 1
                 status_counts["ERROR"] += 1
                 detail_lines = _attach_invoice_status(base_lines, f"### Invoice {inv_ref} - draft")
                 detail_lines.append(f"invoice total mismatch: Sage={sage_total:.2f} Odoo={created_total:.2f}")
-                detail_lines.append("draft removed")
+                detail_lines.append("draft kept for manual review")
                 emit(processed, inv_date, "ERROR", so_ref, inv_ref, "\n".join(detail_lines))
                 if not continue_on_error:
                     break
@@ -856,6 +986,16 @@ def run(args: argparse.Namespace) -> int:
             processed += 1
             status_counts["OK"] += 1
             detail_lines = _attach_invoice_status(base_lines, f"### Invoice {inv_ref} - draft")
+            if args.confirm:
+                client.models.execute_kw(
+                    client.db,
+                    client.uid,
+                    client.apikey,
+                    "account.move",
+                    "action_post",
+                    [[int(inv_id)]],
+                )
+                detail_lines.append("invoice confirmed")
             emit(processed, inv_date, "UPDATED", so_ref, inv_ref, "\n".join(detail_lines))
 
         if max_orders is not None and processed >= max_orders:

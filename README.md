@@ -654,20 +654,32 @@ Script nuevo:
 Objetivo:
 - Crear/actualizar facturas de cliente (`account.move`, `move_type=out_invoice`) en Odoo a partir de invoices de Sage.
 - Regla operativa: **una invoice de Sage = una invoice de Odoo**, ligada a su delivery correspondiente.
-- Las facturas se dejan en **draft** (no se confirman/postean).
+- Por defecto las facturas se dejan en **draft**; con `--confirm` se postean automáticamente.
 
 Comando base:
 ```
 python sync_invoice_api.py --load 02/2026 --limit 10
 ```
 
+Confirmar al vuelo:
+```
+python sync_invoice_api.py --load 02/2026 --limit 10 --confirm
+```
+
+Reintentar solo pendientes/errores históricos:
+```
+python sync_invoice_api.py --load 02/2026 --gaps --skip
+```
+
 Flujo actual:
 - Recorre invoices de Sage por `--load`, con `--reference`, `--limit`, `--offset`.
+- `--load` en formato día (`DD/MM/YYYY`) filtra por fecha real de `TransactionDate` (no solo por fichero mensual).
 - Verifica SO en Odoo y que esté confirmada (`sale/done`).
 - Verifica que exista delivery vinculada por `Sage Invoice: <ref>` y que esté `done`.
 - Crea líneas de factura con vínculo real a `sale.order.line` (`sale_line_ids`) y `product_id` real (no texto libre).
 - En creación normal factura cantidades disponibles: `qty_delivered - qty_invoiced`.
 - En resync de facturas `draft`, permite reconstrucción de líneas aunque la SO line ya figure como invoiced.
+- Si la factura ya está `posted`, se salta sin tocar (`NO_CHANGES`).
 - Replica notas operativas de SO en invoice como `line_note`:
   - `Shipping Method: ...`
   - `BOGO ...`
@@ -679,11 +691,18 @@ Validaciones y autocorrección:
 - Si hay mismatch:
   - factura existente `draft`: se repara en sitio (reconstruye líneas), no se borra.
   - factura existente `posted`: error (no se toca automáticamente).
-  - factura nueva creada con mismatch: error (no se confirma y se informa en log).
+  - factura nueva creada con mismatch: error, **se mantiene draft** para revisión manual (no se elimina).
 - En facturas existentes, sincroniza también:
   - `invoice_user_id` (Sales Person)
   - `team_id` (Sales Team)
 - `ref` (Customer Reference) con `PurchOrder` de Sage.
+
+Modo `--gaps`:
+- Optimización para reintentos: procesa solo invoices de Sage no resueltas.
+- Criterio actual:
+  - invoice Sage sin `account.move` correspondiente en Odoo, o
+  - invoice existente todavía en `draft`.
+- Las invoices ya `posted` no se reprocesan.
 
 Campos relevantes:
 - Número Sage preservado en factura Odoo:
