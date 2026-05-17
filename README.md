@@ -704,6 +704,11 @@ Modo `--gaps`:
   - invoice existente todavía en `draft`.
 - Las invoices ya `posted` no se reprocesan.
 
+Estados de resultado (`sync_invoice_api.py`):
+- `NEW`: factura creada en Odoo.
+- `UPDATED`: factura existente modificada (resync/repair/confirm).
+- `NO_CHANGES`: factura ya correcta o ya `posted` (se salta sin tocar).
+
 Campos relevantes:
 - Número Sage preservado en factura Odoo:
   - `name = <Sage Invoice Ref>`
@@ -722,6 +727,7 @@ Formato de log:
 - En detalle se etiqueta explícitamente el estado logístico:
   - `... | DO - done | Invoice <ref> - draft|confirmed|posted`
   - Esto separa claramente estado de delivery (DO) vs estado de factura.
+- En `sync_invoice_api.py` se omite `ShipVia` en estas líneas para evitar ambigüedad.
 
 Orden de procesado:
 - Cronológico real: `TransactionDate` ascendente (y desempate por `Reference`, `PostOrder`).

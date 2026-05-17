@@ -146,9 +146,12 @@ def _attach_invoice_status(detail_lines: List[str], invoice_status_text: str) ->
 def _replace_invoice_status(detail_lines: List[str], inv_ref: str, new_state: str) -> List[str]:
     if not detail_lines:
         return detail_lines
-    old = f"### Invoice {inv_ref} - draft"
-    new = f"### Invoice {inv_ref} - {new_state}"
-    detail_lines[0] = detail_lines[0].replace(old, new)
+    detail_lines[0] = re.sub(
+        rf"(Invoice\s+{re.escape(inv_ref)}\s+-\s+)[^|]+",
+        rf"\1{new_state}",
+        detail_lines[0],
+        count=1,
+    )
     return detail_lines
 
 
@@ -713,7 +716,7 @@ def run(args: argparse.Namespace) -> int:
                     pid = int(target_picking.get("id") or 0)
                     other = [p for p in sorted(pickings, key=lambda x: int(x.get("id") or 0)) if int(p.get("id") or 0) != pid]
                     detail_lines = _format_do_lines_for_invoice_log(
-                        [_picking_line(target_picking, ship_via, inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
+                        [_picking_line(target_picking, "", inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
                     )
                     detail_lines = _attach_invoice_status(detail_lines, f"### Invoice {inv_ref} - {existing_state}")
                     detail_lines.append("already confirmed/posted, skipped")
@@ -769,7 +772,7 @@ def run(args: argparse.Namespace) -> int:
                         pid = int(target_picking.get("id") or 0)
                         other = [p for p in sorted(pickings, key=lambda x: int(x.get("id") or 0)) if int(p.get("id") or 0) != pid]
                         detail_lines = _format_do_lines_for_invoice_log(
-                            [_picking_line(target_picking, ship_via, inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
+                            [_picking_line(target_picking, "", inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
                         )
                         detail_lines = _attach_invoice_status(detail_lines, f"### Invoice {inv_ref} - {existing_inv.get('state')}")
                         detail_lines.append("unable to sync draft invoice lines from Sage")
@@ -821,7 +824,7 @@ def run(args: argparse.Namespace) -> int:
                 pid = int(target_picking.get("id") or 0)
                 other = [p for p in sorted(pickings, key=lambda x: int(x.get("id") or 0)) if int(p.get("id") or 0) != pid]
                 detail_lines = _format_do_lines_for_invoice_log(
-                    [_picking_line(target_picking, ship_via, inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
+                    [_picking_line(target_picking, "", inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
                 )
                 detail_lines = _attach_invoice_status(detail_lines, f"### Invoice {inv_ref} - {existing_inv.get('state')}")
                 if abs(existing_total - sage_total) > 0.01:
@@ -890,7 +893,7 @@ def run(args: argparse.Namespace) -> int:
                             if not continue_on_error:
                                 break
                         else:
-                            status_counts["OK"] += 1
+                            status_counts["UPDATED"] += 1
                             detail_lines.append("draft invoice repaired in place")
                             emit(processed, inv_date, "UPDATED", so_ref, inv_ref, "\n".join(detail_lines))
                         continue
@@ -904,7 +907,7 @@ def run(args: argparse.Namespace) -> int:
                 else:
                     processed += 1
                     if changed:
-                        status_counts["OK"] += 1
+                        status_counts["UPDATED"] += 1
                         if changed_user_team:
                             detail_lines.append("invoice salesperson/team updated")
                         if changed_freight_label:
@@ -944,7 +947,7 @@ def run(args: argparse.Namespace) -> int:
             pid = int(target_picking.get("id") or 0)
             other = [p for p in sorted(pickings, key=lambda x: int(x.get("id") or 0)) if int(p.get("id") or 0) != pid]
             base_lines = _format_do_lines_for_invoice_log(
-                [_picking_line(target_picking, ship_via, inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
+                [_picking_line(target_picking, "", inv_ref, True)] + [_picking_line(p, "", inv_ref, False) for p in other]
             )
 
             if args.dry_run:
@@ -1016,7 +1019,7 @@ def run(args: argparse.Namespace) -> int:
                     break
                 continue
             processed += 1
-            status_counts["OK"] += 1
+            status_counts["NEW"] += 1
             detail_lines = _attach_invoice_status(base_lines, f"### Invoice {inv_ref} - draft")
             if args.confirm:
                 client.models.execute_kw(
@@ -1036,8 +1039,9 @@ def run(args: argparse.Namespace) -> int:
     print(f"Processed {processed}/{max_orders if max_orders is not None else 'all'}.")
     print(
         "Summary: "
+        f"{status_counts.get('NEW', 0)} New | "
+        f"{status_counts.get('UPDATED', 0)} Updated | "
         f"{status_counts.get('NO_CHANGES', 0)} No changes | "
-        f"{status_counts.get('OK', 0)} Updated | "
         f"{status_counts.get('SKIP', 0)} Skip | "
         f"{status_counts.get('DRY_RUN', 0)} Dry run | "
         f"{status_counts.get('ERROR', 0)} Error"

@@ -527,8 +527,12 @@ def _picking_line(p: Dict[str, object], ship_via: str = "", current_invoice_ref:
     state = _picking_state_label(str(p.get("state") or ""))
     # For open/non-done pickings, inherited notes are not reliable for invoice linkage.
     if state != "done":
-        note_ref = "????????????"
+        note_ref = "??????"
     ship = (ship_via or "").strip()
+    if not ship:
+        raw_carrier = p.get("carrier_id")
+        if isinstance(raw_carrier, list) and len(raw_carrier) >= 2:
+            ship = str(raw_carrier[1] or "").strip()
     if ship:
         return f"{name} (SAGE {note_ref}) {ship} | {state}"
     return f"{name} (SAGE {note_ref}) | {state}"
